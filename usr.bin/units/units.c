@@ -33,7 +33,7 @@ static const char rcsid[] =
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/capsicum.h>
+#include <capsicum_helpers.h>
 
 #ifndef UNITSFILE
 #define UNITSFILE "/usr/share/misc/definitions.units"
@@ -156,8 +156,7 @@ readunits(const char *userfile)
 		}
 	}
 	cap_rights_init(&unitfilerights, CAP_READ, CAP_FSTAT);
-	if (cap_rights_limit(fileno(unitfile), &unitfilerights) < 0
-		&& errno != ENOSYS)
+	if (caph_rights_limit(fileno(unitfile), &unitfilerights) < 0)
 		err(1, "cap_rights_limit() failed");
 	while (!feof(unitfile)) {
 		if (!fgets(line, sizeof(line), unitfile))
@@ -625,8 +624,10 @@ compareproducts(char **one, char **two)
 			two++;
 		else if (strcmp(*one, *two))
 			return 1;
-		else
-			one++, two++;
+		else {
+			one++;
+			two++;
+		}
 	}
 	return 0;
 }
@@ -726,25 +727,25 @@ showanswer(struct unittype * have, struct unittype * want)
 }
 
 
-static void 
+static void __dead2
 usage(void)
 {
 	fprintf(stderr,
-		"usage: units [-f unitsfile] [-H historyfile] [-UVq] [from-unit to-unit]\n");
+	    "usage: units [-ehqtUVv] [-f unitsfile] [-o format] [from to]\n");
 	exit(3);
 }
 
 static struct option longopts[] = {
-	{"help", no_argument, NULL, 'h'},
 	{"exponential", no_argument, NULL, 'e'},
 	{"file", required_argument, NULL, 'f'},
 	{"history", required_argument, NULL, 'H'},
+	{"help", no_argument, NULL, 'h'},
 	{"output-format", required_argument, NULL, 'o'},
 	{"quiet", no_argument, NULL, 'q'},
 	{"terse", no_argument, NULL, 't'},
 	{"unitsfile", no_argument, NULL, 'U'},
-	{"verbose", no_argument, NULL, 'v'},
 	{"version", no_argument, NULL, 'V'},
+	{"verbose", no_argument, NULL, 'v'},
 	{ 0, 0, 0, 0 }
 };
 
@@ -805,7 +806,6 @@ main(int argc, char **argv)
 			else
 				printf("Units data file not found");
 			exit(0);
-			break;
 		case 'h':
 			/* FALLTHROUGH */
 
@@ -818,7 +818,7 @@ main(int argc, char **argv)
 		readunits(NULL);
 
 	if (optind == argc - 2) {
-		if (cap_enter() < 0 && errno != ENOSYS)
+		if (caph_enter() < 0)
 			err(1, "unable to enter capability mode");
 
 		havestr = argv[optind];
@@ -842,7 +842,7 @@ main(int argc, char **argv)
 		if (inhistory == 0)
 			err(1, "Could not initialize history");
 
-		if (cap_enter() < 0 && errno != ENOSYS)
+		if (caph_enter() < 0)
 			err(1, "unable to enter capability mode");
 
 		if (!quiet)

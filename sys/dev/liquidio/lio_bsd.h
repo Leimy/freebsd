@@ -36,6 +36,8 @@
 #define __LIO_BSD_H__
 
 #include <sys/param.h>
+#include <sys/gsb_crc32.h>
+#include <sys/eventhandler.h>
 #include <sys/socket.h>
 #include <sys/kernel.h>
 #include <sys/module.h>
@@ -52,6 +54,7 @@
 #include <net/if_vlan_var.h>
 #include <net/if_gif.h>
 
+#include <netinet/in.h>
 #include <netinet/tcp_lro.h>
 
 #include <sys/bus.h>

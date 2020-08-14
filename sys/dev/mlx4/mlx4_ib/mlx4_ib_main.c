@@ -64,9 +64,9 @@
 
 #define DRV_NAME	MLX4_IB_DRV_NAME
 #ifndef DRV_VERSION
-#define DRV_VERSION	"3.4.1"
+#define DRV_VERSION	"3.5.1"
 #endif
-#define DRV_RELDATE	"February 2018"
+#define DRV_RELDATE	"April 2019"
 
 #define MLX4_IB_FLOW_MAX_PRIO 0xFFF
 #define MLX4_IB_FLOW_QPN_MASK 0xFFFFFF
@@ -3319,8 +3319,8 @@ static void __exit mlx4_ib_cleanup(void)
 	destroy_workqueue(wq);
 }
 
-module_init_order(mlx4_ib_init, SI_ORDER_THIRD);
-module_exit(mlx4_ib_cleanup);
+module_init_order(mlx4_ib_init, SI_ORDER_SEVENTH);
+module_exit_order(mlx4_ib_cleanup, SI_ORDER_SEVENTH);
 
 static int
 mlx4ib_evhand(module_t mod, int event, void *arg)

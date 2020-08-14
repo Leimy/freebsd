@@ -42,8 +42,10 @@ __FBSDID("$FreeBSD$");
 #include <sys/consio.h>
 #include <sys/fcntl.h>
 #include <sys/filio.h>
+#include <sys/lock.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
+#include <sys/mutex.h>
 #include <sys/poll.h>
 #include <sys/random.h>
 #include <sys/selinfo.h>
@@ -214,7 +216,7 @@ sysmouse_process_event(mouse_info_t *mi)
 	unsigned char buf[MOUSE_SYS_PACKETSIZE];
 	int x, y, iy, z;
 
-	random_harvest_queue(mi, sizeof *mi, 2, RANDOM_MOUSE);
+	random_harvest_queue(mi, sizeof *mi, RANDOM_MOUSE);
 
 	mtx_lock(&sysmouse_lock);
 	switch (mi->operation) {

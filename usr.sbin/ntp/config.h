@@ -287,7 +287,7 @@
 #define DEFAULT_HZ 100
 
 /* Default number of megabytes for RLIMIT_MEMLOCK */
-#define DFLT_RLIMIT_MEMLOCK 32
+#define DFLT_RLIMIT_MEMLOCK -1
 
 /* Default number of 4k pages for RLIMIT_STACK */
 #define DFLT_RLIMIT_STACK 50
@@ -312,6 +312,9 @@
 
 /* Provide the explicit 127.0.0.0/8 martian filter? */
 #define ENABLE_BUG3020_FIX 1
+
+/* Enable CMAC support? */
+#define ENABLE_CMAC 1
 
 /* nls support in libopts */
 /* #undef ENABLE_NLS */
@@ -374,6 +377,14 @@
 /* Define to 1 if you have the `daemon' function. */
 #define HAVE_DAEMON 1
 
+/* Define to 1 if you have the declaration of `siglongjmp', and to 0 if you
+   don't. */
+#define HAVE_DECL_SIGLONGJMP 1
+
+/* Define to 1 if you have the declaration of `sigsetjmp', and to 0 if you
+   don't. */
+#define HAVE_DECL_SIGSETJMP 1
+
 /* Define to 1 if you have the declaration of `strerror_r', and to 0 if you
    don't. */
 #define HAVE_DECL_STRERROR_R 1
@@ -392,7 +403,7 @@
 /* #undef HAVE_DOPRNT */
 
 /* Can we drop root privileges? */
-/* #undef HAVE_DROPROOT */
+#define HAVE_DROPROOT
 
 /* Define to 1 if you have the <errno.h> header file. */
 #define HAVE_ERRNO_H 1
@@ -654,6 +665,12 @@
 
 /* if you have NT Threads */
 /* #undef HAVE_NT_THREADS */
+
+/* Define to 1 if you have the <openssl/cmac.h> header file. */
+#define HAVE_OPENSSL_CMAC_H 1
+
+/* Define to 1 if you have the <openssl/hmac.h> header file. */
+#define HAVE_OPENSSL_HMAC_H 1
 
 /* Define to 1 if the system has the type `pid_t'. */
 #define HAVE_PID_T 1
@@ -959,6 +976,9 @@
 /* Define to 1 if you have the <sys/lock.h> header file. */
 #define HAVE_SYS_LOCK_H 1
 
+/* Define to 1 if you have the <sys/mac.h> header file. */
+#define HAVE_SYS_MAC_H 1
+
 /* Define to 1 if you have the <sys/mman.h> header file. */
 #define HAVE_SYS_MMAN_H 1
 
@@ -1118,6 +1138,9 @@
 
 /* Do we have the TIO serial stuff? */
 /* #undef HAVE_TIO_SERIAL_STUFF */
+
+/* Are TrustedBSD MAC policy privileges available? */
+#define HAVE_TRUSTEDBSD_MAC 1
 
 /* Define to 1 if the system has the type `uint16_t'. */
 #define HAVE_UINT16_T 1
@@ -1445,7 +1468,7 @@
 #define PACKAGE_NAME "ntp"
 
 /* Define to the full name and version of this package. */
-#define PACKAGE_STRING "ntp 4.2.8p11"
+#define PACKAGE_STRING "ntp 4.2.8p15"
 
 /* Define to the one symbol short name of this package. */
 #define PACKAGE_TARNAME "ntp"
@@ -1454,7 +1477,7 @@
 #define PACKAGE_URL "http://www.ntp.org./"
 
 /* Define to the version of this package. */
-#define PACKAGE_VERSION "4.2.8p11"
+#define PACKAGE_VERSION "4.2.8p15"
 
 /* data dir */
 #define PERLLIBDIR "/usr/share/ntp/lib"
@@ -1555,11 +1578,7 @@
 /* #undef STRERROR_R_CHAR_P */
 
 /* canonical system (cpu-vendor-os) of where we should run */
-#if defined(__alpha__)
-#define STR_SYSTEM "alpha-undermydesk-freebsd"
-#elif defined(__sparc64__)
-#define STR_SYSTEM "sparc64-undermydesk-freebsd"
-#elif defined(__amd64__)
+#if defined(__amd64__)
 #define STR_SYSTEM "amd64-undermydesk-freebsd"
 #elif defined(__powerpc64__)
 #define STR_SYSTEM "powerpc64-undermydesk-freebsd"
@@ -1573,12 +1592,8 @@
 #define STR_SYSTEM "arm64-undermydesk-freebsd"
 #elif defined(__arm__)
 #define STR_SYSTEM "arm-undermydesk-freebsd"
-#elif defined(__sparc64__)
-#define STR_SYSTEM "sparc64-undermydesk-freebsd"
-#elif defined(__sparc__)
-#define STR_SYSTEM "sparc-undermydesk-freebsd"
-#elif defined(__ia64__)
-#define STR_SYSTEM "ia64-undermydesk-freebsd"
+#elif defined(__riscv)
+#define STR_SYSTEM "riscv64-undermydesk-freebsd"
 #else
 #define STR_SYSTEM "i386-undermydesk-freebsd"
 #endif
@@ -1635,10 +1650,10 @@ typedef unsigned int	uintptr_t;
 /* #undef USE_UDP_SIGPOLL */
 
 /* Version number of package */
-#define VERSION "4.2.8p11"
+#define VERSION "4.2.8p15"
 
 /* vsnprintf expands "%m" to strerror(errno) */
-/* #undef VSNPRINTF_PERCENT_M */
+#define VSNPRINTF_PERCENT_M 1
 
 /* configure --enable-ipv6 */
 #define WANT_IPV6 1
@@ -1646,7 +1661,7 @@ typedef unsigned int	uintptr_t;
 /* Define WORDS_BIGENDIAN to 1 if your processor stores words with the most
    significant byte first (like Motorola and SPARC, unlike Intel). */
 #if defined(__ARMEB__) || defined(__MIPSEB__) || defined(__powerpc__) || \
-    defined(__powerpc64__) || defined(__sparc64__)
+    defined(__powerpc64__)
 #define WORDS_BIGENDIAN 1
 #endif
 
@@ -1812,5 +1827,5 @@ typedef union mpinfou {
 /*
  * FreeBSD specific: Explicitly specify date/time for reproducible build.
  */
-#define	MKREPRO_DATE "Feb 28 2018"
-#define	MKREPRO_TIME "06:33:03"
+#define	MKREPRO_DATE "Aug 19 2018"
+#define	MKREPRO_TIME "01:24:29"

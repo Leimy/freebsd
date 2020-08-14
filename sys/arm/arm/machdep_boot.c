@@ -36,6 +36,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <sys/ctype.h>
 #include <sys/linker.h>
+#include <sys/physmem.h>
 #include <sys/reboot.h>
 #include <sys/sysctl.h>
 #if defined(LINUX_BOOT_ABI)
@@ -46,7 +47,6 @@ __FBSDID("$FreeBSD$");
 #include <machine/cpu.h>
 #include <machine/machdep.h>
 #include <machine/metadata.h>
-#include <machine/physmem.h>
 #include <machine/vmparam.h>	/* For KERNVIRTADDR */
 
 #ifdef FDT
@@ -68,6 +68,10 @@ __FBSDID("$FreeBSD$");
 #define	debugf(fmt, args...)
 #endif
 
+#ifdef LINUX_BOOT_ABI
+static char static_kenv[4096];
+#endif
+
 extern int *end;
 
 static uint32_t board_revision;
@@ -84,7 +88,8 @@ static char linux_command_line[LBABI_MAX_COMMAND_LINE + 1];
 static char atags[LBABI_MAX_COMMAND_LINE * 2];
 #endif /* defined(LINUX_BOOT_ABI) */
 
-SYSCTL_NODE(_hw, OID_AUTO, board, CTLFLAG_RD, 0, "Board attributes");
+SYSCTL_NODE(_hw, OID_AUTO, board, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Board attributes");
 SYSCTL_UINT(_hw_board, OID_AUTO, revision, CTLFLAG_RD,
     &board_revision, 0, "Board revision");
 SYSCTL_STRING(_hw_board, OID_AUTO, serial, CTLFLAG_RD,
@@ -146,14 +151,11 @@ arm_print_kenv(void)
 static void
 cmdline_set_env(char *cmdline, const char *guard)
 {
-	char *cmdline_next, *env;
-	size_t size, guard_len;
-	int i;
+	size_t guard_len;
 
-	size = strlen(cmdline);
 	/* Skip leading spaces. */
-	for (; isspace(*cmdline) && (size > 0); cmdline++)
-		size--;
+	while (isspace(*cmdline))
+		cmdline++;
 
 	/* Test and remove guard. */
 	if (guard != NULL && guard[0] != '\0') {
@@ -161,40 +163,29 @@ cmdline_set_env(char *cmdline, const char *guard)
 		if (strncasecmp(cmdline, guard, guard_len) != 0)
 			return;
 		cmdline += guard_len;
-		size -= guard_len;
 	}
 
-	/* Skip leading spaces. */
-	for (; isspace(*cmdline) && (size > 0); cmdline++)
-		size--;
-
-	/* Replace ',' with '\0'. */
-	/* TODO: implement escaping for ',' character. */
-	cmdline_next = cmdline;
-	while(strsep(&cmdline_next, ",") != NULL)
-		;
-	init_static_kenv(cmdline, 0);
-	/* Parse boothowto. */
-	for (i = 0; howto_names[i].ev != NULL; i++) {
-		env = kern_getenv(howto_names[i].ev);
-		if (env != NULL) {
-			if (strtoul(env, NULL, 10) != 0)
-				boothowto |= howto_names[i].mask;
-			freeenv(env);
-		}
-	}
+	boothowto |= boot_parse_cmdline(cmdline);
 }
 
+/*
+ * Called for armv6 and newer.
+ */
 void arm_parse_fdt_bootargs(void)
 {
 
 #ifdef FDT
 	if (loader_envp == NULL && fdt_get_chosen_bootargs(linux_command_line,
-	    LBABI_MAX_COMMAND_LINE) == 0)
+	    LBABI_MAX_COMMAND_LINE) == 0) {
+		init_static_kenv(static_kenv, sizeof(static_kenv));
 		cmdline_set_env(linux_command_line, CMDLINE_GUARD);
+	}
 #endif
 }
 
+/*
+ * Called for armv[45].
+ */
 static vm_offset_t
 linux_parse_boot_param(struct arm_boot_params *abp)
 {
@@ -237,7 +228,7 @@ linux_parse_boot_param(struct arm_boot_params *abp)
 		case ATAG_CORE:
 			break;
 		case ATAG_MEM:
-			arm_physmem_hardware_region(walker->u.tag_mem.start,
+			physmem_hardware_region(walker->u.tag_mem.start,
 			    walker->u.tag_mem.size);
 			break;
 		case ATAG_INITRD2:
@@ -271,6 +262,7 @@ linux_parse_boot_param(struct arm_boot_params *abp)
 	    (char *)walker - (char *)atag_list + ATAG_SIZE(walker));
 
 	lastaddr = fake_preload_metadata(abp, NULL, 0);
+	init_static_kenv(static_kenv, sizeof(static_kenv));
 	cmdline_set_env(linux_command_line, CMDLINE_GUARD);
 	return lastaddr;
 }
@@ -310,7 +302,7 @@ freebsd_parse_boot_param(struct arm_boot_params *abp)
 #ifdef DDB
 	ksym_start = MD_FETCH(kmdp, MODINFOMD_SSYM, uintptr_t);
 	ksym_end = MD_FETCH(kmdp, MODINFOMD_ESYM, uintptr_t);
-	db_fetch_ksymtab(ksym_start, ksym_end);
+	db_fetch_ksymtab(ksym_start, ksym_end, 0);
 #endif
 	return lastaddr;
 }
@@ -360,12 +352,11 @@ vm_offset_t
 fake_preload_metadata(struct arm_boot_params *abp __unused, void *dtb_ptr,
     size_t dtb_size)
 {
-#ifdef DDB
-	vm_offset_t zstart = 0, zend = 0;
-#endif
 	vm_offset_t lastaddr;
 	int i = 0;
 	static uint32_t fake_preload[35];
+
+	lastaddr = (vm_offset_t)&end;
 
 	fake_preload[i++] = MODINFO_NAME;
 	fake_preload[i++] = strlen("kernel") + 1;
@@ -381,21 +372,6 @@ fake_preload_metadata(struct arm_boot_params *abp __unused, void *dtb_ptr,
 	fake_preload[i++] = MODINFO_SIZE;
 	fake_preload[i++] = sizeof(uint32_t);
 	fake_preload[i++] = (uint32_t)&end - KERNVIRTADDR;
-#ifdef DDB
-	if (*(uint32_t *)KERNVIRTADDR == MAGIC_TRAMP_NUMBER) {
-		fake_preload[i++] = MODINFO_METADATA|MODINFOMD_SSYM;
-		fake_preload[i++] = sizeof(vm_offset_t);
-		fake_preload[i++] = *(uint32_t *)(KERNVIRTADDR + 4);
-		fake_preload[i++] = MODINFO_METADATA|MODINFOMD_ESYM;
-		fake_preload[i++] = sizeof(vm_offset_t);
-		fake_preload[i++] = *(uint32_t *)(KERNVIRTADDR + 8);
-		lastaddr = *(uint32_t *)(KERNVIRTADDR + 8);
-		zend = lastaddr;
-		zstart = *(uint32_t *)(KERNVIRTADDR + 4);
-		db_fetch_ksymtab(zstart, zend);
-	} else
-#endif
-		lastaddr = (vm_offset_t)&end;
 	if (dtb_ptr != NULL) {
 		/* Copy DTB to KVA space and insert it into module chain. */
 		lastaddr = roundup(lastaddr, sizeof(int));

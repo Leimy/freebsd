@@ -35,7 +35,12 @@
 #include <sys/lock.h>
 #include <sys/systm.h>
 #define	teken_assert(x)		MPASS(x)
-#else /* !(__FreeBSD__ && _KERNEL) */
+#elif defined(__FreeBSD__) && defined(_STANDALONE)
+#include <stand.h>
+#include <sys/limits.h>
+#include <assert.h>
+#define	teken_assert(x)		assert(x)
+#else /* !(__FreeBSD__ && _STANDALONE) */
 #include <sys/types.h>
 #include <assert.h>
 #include <limits.h>
@@ -43,7 +48,7 @@
 #include <stdio.h>
 #include <string.h>
 #define	teken_assert(x)		assert(x)
-#endif /* __FreeBSD__ && _KERNEL */
+#endif /* __FreeBSD__ && _STANDALONE */
 
 /* debug messages */
 #define	teken_printf(x,...)
@@ -58,6 +63,7 @@
 #define	TS_CONS25	0x0040	/* cons25 emulation. */
 #define	TS_INSTRING	0x0080	/* Inside string. */
 #define	TS_CURSORKEYS	0x0100	/* Cursor keys mode. */
+#define	TS_CONS25KEYS	0x0400	/* Fuller cons25 emul (fix function keys). */
 
 /* Character that blanks a cell. */
 #define	BLANK	' '
@@ -73,35 +79,38 @@ static teken_state_t	teken_state_init;
  */
 
 static inline void
-teken_funcs_bell(teken_t *t)
+teken_funcs_bell(const teken_t *t)
 {
 
+	teken_assert(t->t_funcs->tf_bell != NULL);
 	t->t_funcs->tf_bell(t->t_softc);
 }
 
 static inline void
-teken_funcs_cursor(teken_t *t)
+teken_funcs_cursor(const teken_t *t)
 {
 
 	teken_assert(t->t_cursor.tp_row < t->t_winsize.tp_row);
 	teken_assert(t->t_cursor.tp_col < t->t_winsize.tp_col);
 
+	teken_assert(t->t_funcs->tf_cursor != NULL);
 	t->t_funcs->tf_cursor(t->t_softc, &t->t_cursor);
 }
 
 static inline void
-teken_funcs_putchar(teken_t *t, const teken_pos_t *p, teken_char_t c,
+teken_funcs_putchar(const teken_t *t, const teken_pos_t *p, teken_char_t c,
     const teken_attr_t *a)
 {
 
 	teken_assert(p->tp_row < t->t_winsize.tp_row);
 	teken_assert(p->tp_col < t->t_winsize.tp_col);
 
+	teken_assert(t->t_funcs->tf_putchar != NULL);
 	t->t_funcs->tf_putchar(t->t_softc, p, c, a);
 }
 
 static inline void
-teken_funcs_fill(teken_t *t, const teken_rect_t *r,
+teken_funcs_fill(const teken_t *t, const teken_rect_t *r,
     const teken_char_t c, const teken_attr_t *a)
 {
 
@@ -110,11 +119,12 @@ teken_funcs_fill(teken_t *t, const teken_rect_t *r,
 	teken_assert(r->tr_end.tp_col > r->tr_begin.tp_col);
 	teken_assert(r->tr_end.tp_col <= t->t_winsize.tp_col);
 
+	teken_assert(t->t_funcs->tf_fill != NULL);
 	t->t_funcs->tf_fill(t->t_softc, r, c, a);
 }
 
 static inline void
-teken_funcs_copy(teken_t *t, const teken_rect_t *r, const teken_pos_t *p)
+teken_funcs_copy(const teken_t *t, const teken_rect_t *r, const teken_pos_t *p)
 {
 
 	teken_assert(r->tr_end.tp_row > r->tr_begin.tp_row);
@@ -124,20 +134,39 @@ teken_funcs_copy(teken_t *t, const teken_rect_t *r, const teken_pos_t *p)
 	teken_assert(p->tp_row + (r->tr_end.tp_row - r->tr_begin.tp_row) <= t->t_winsize.tp_row);
 	teken_assert(p->tp_col + (r->tr_end.tp_col - r->tr_begin.tp_col) <= t->t_winsize.tp_col);
 
+	teken_assert(t->t_funcs->tf_copy != NULL);
 	t->t_funcs->tf_copy(t->t_softc, r, p);
 }
 
 static inline void
-teken_funcs_param(teken_t *t, int cmd, unsigned int value)
+teken_funcs_pre_input(const teken_t *t)
 {
 
+	if (t->t_funcs->tf_pre_input != NULL)
+		t->t_funcs->tf_pre_input(t->t_softc);
+}
+
+static inline void
+teken_funcs_post_input(const teken_t *t)
+{
+
+	if (t->t_funcs->tf_post_input != NULL)
+		t->t_funcs->tf_post_input(t->t_softc);
+}
+
+static inline void
+teken_funcs_param(const teken_t *t, int cmd, unsigned int value)
+{
+
+	teken_assert(t->t_funcs->tf_param != NULL);
 	t->t_funcs->tf_param(t->t_softc, cmd, value);
 }
 
 static inline void
-teken_funcs_respond(teken_t *t, const void *buf, size_t len)
+teken_funcs_respond(const teken_t *t, const void *buf, size_t len)
 {
 
+	teken_assert(t->t_funcs->tf_respond != NULL);
 	t->t_funcs->tf_respond(t->t_softc, buf, len);
 }
 
@@ -285,12 +314,14 @@ teken_input(teken_t *t, const void *buf, size_t len)
 {
 	const char *c = buf;
 
+	teken_funcs_pre_input(t);
 	while (len-- > 0)
 		teken_input_byte(t, *c++);
+	teken_funcs_post_input(t);
 }
 
 const teken_pos_t *
-teken_get_cursor(teken_t *t)
+teken_get_cursor(const teken_t *t)
 {
 
 	return (&t->t_cursor);
@@ -308,7 +339,7 @@ teken_set_cursor(teken_t *t, const teken_pos_t *p)
 }
 
 const teken_attr_t *
-teken_get_curattr(teken_t *t)
+teken_get_curattr(const teken_t *t)
 {
 
 	return (&t->t_curattr);
@@ -322,7 +353,7 @@ teken_set_curattr(teken_t *t, const teken_attr_t *a)
 }
 
 const teken_attr_t *
-teken_get_defattr(teken_t *t)
+teken_get_defattr(const teken_t *t)
 {
 
 	return (&t->t_defattr);
@@ -336,7 +367,7 @@ teken_set_defattr(teken_t *t, const teken_attr_t *a)
 }
 
 const teken_pos_t *
-teken_get_winsize(teken_t *t)
+teken_get_winsize(const teken_t *t)
 {
 
 	return (&t->t_winsize);
@@ -387,6 +418,13 @@ teken_set_cons25(teken_t *t)
 {
 
 	t->t_stateflags |= TS_CONS25;
+}
+
+void
+teken_set_cons25keys(teken_t *t)
+{
+
+	t->t_stateflags |= TS_CONS25KEYS;
 }
 
 /*
@@ -693,10 +731,13 @@ static const char * const special_strings_normal[] = {
 };
 
 const char *
-teken_get_sequence(teken_t *t, unsigned int k)
+teken_get_sequence(const teken_t *t, unsigned int k)
 {
 
 	/* Cons25 mode. */
+	if ((t->t_stateflags & (TS_CONS25 | TS_CONS25KEYS)) ==
+	    (TS_CONS25 | TS_CONS25KEYS))
+		return (NULL);	/* Don't override good kbd(4) strings. */
 	if (t->t_stateflags & TS_CONS25 &&
 	    k < sizeof special_strings_cons25 / sizeof(char *))
 		return (special_strings_cons25[k]);

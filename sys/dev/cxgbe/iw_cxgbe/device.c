@@ -122,23 +122,6 @@ c4iw_rdev_open(struct c4iw_rdev *rdev)
 	rdev->qpmask = udb_density - 1;
 	rdev->cqshift = PAGE_SHIFT - sp->iq_s_qpp;
 	rdev->cqmask = ucq_density - 1;
-	CTR5(KTR_IW_CXGBE, "%s dev %s stag start 0x%0x size 0x%0x num stags %d",
-		__func__, device_get_nameunit(sc->dev), sc->vres.stag.start,
-		sc->vres.stag.size, c4iw_num_stags(rdev));
-	CTR5(KTR_IW_CXGBE, "%s pbl start 0x%0x size 0x%0x"
-			" rq start 0x%0x size 0x%0x", __func__,
-			sc->vres.pbl.start, sc->vres.pbl.size,
-			sc->vres.rq.start, sc->vres.rq.size);
-	CTR5(KTR_IW_CXGBE, "%s:qp qid start %u size %u cq qid start %u size %u",
-			 __func__, sc->vres.qp.start, sc->vres.qp.size,
-			 sc->vres.cq.start, sc->vres.cq.size);
-	/*TODO
-	CTR5(KTR_IW_CXGBE, "%s udb %pR db_reg %p gts_reg %p"
-			"qpmask 0x%x cqmask 0x%x", __func__,
-			db_reg,gts_reg,rdev->qpmask, rdev->cqmask);
-			*/
-
-
 
 	if (c4iw_num_stags(rdev) == 0) {
 		rc = -EINVAL;
@@ -235,11 +218,6 @@ c4iw_alloc(struct adapter *sc)
 	iwsc->rdev.adap = sc;
 
 	/* init various hw-queue params based on lld info */
-	CTR3(KTR_IW_CXGBE, "%s: Ing. padding boundary is %d, "
-			"egrsstatuspagesize = %d", __func__,
-			sc->params.sge.pad_boundary,
-			sc->params.sge.spg_len);
-
 	iwsc->rdev.hw_queue.t4_eq_status_entries =
 		sc->params.sge.spg_len / EQ_ESIZE;
 	iwsc->rdev.hw_queue.t4_max_eq_size = 65520;
@@ -283,11 +261,13 @@ static int c4iw_mod_load(void);
 static int c4iw_mod_unload(void);
 static int c4iw_activate(struct adapter *);
 static int c4iw_deactivate(struct adapter *);
+static void c4iw_async_event(struct adapter *);
 
 static struct uld_info c4iw_uld_info = {
 	.uld_id = ULD_IWARP,
 	.activate = c4iw_activate,
 	.deactivate = c4iw_deactivate,
+	.async_event = c4iw_async_event,
 };
 
 static int
@@ -346,6 +326,23 @@ c4iw_deactivate(struct adapter *sc)
 	sc->iwarp_softc = NULL;
 
 	return (0);
+}
+
+static void
+c4iw_async_event(struct adapter *sc)
+{
+	struct c4iw_dev *iwsc = sc->iwarp_softc;
+
+	if (iwsc) {
+		struct ib_event event = {0};
+
+		device_printf(sc->dev,
+			      "iWARP driver received FATAL ERROR event.\n");
+		iwsc->rdev.flags |= T4_FATAL_ERROR;
+		event.event  = IB_EVENT_DEVICE_FATAL;
+		event.device = &iwsc->ibdev;
+		ib_dispatch_event(&event);
+	}
 }
 
 static void

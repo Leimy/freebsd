@@ -307,14 +307,15 @@ armv7_release_pmc(int cpu, int ri, struct pmc *pmc)
 }
 
 static int
-armv7_intr(int cpu, struct trapframe *tf)
+armv7_intr(struct trapframe *tf)
 {
 	struct armv7_cpu *pc;
 	int retval, ri;
 	struct pmc *pm;
 	int error;
-	int reg;
+	int reg, cpu;
 
+	cpu = curcpu;
 	KASSERT(cpu >= 0 && cpu < pmc_cpu_max(),
 	    ("[armv7,%d] CPU %d out of range", __LINE__, cpu));
 
@@ -348,8 +349,7 @@ armv7_intr(int cpu, struct trapframe *tf)
 		if (pm->pm_state != PMC_STATE_RUNNING)
 			continue;
 
-		error = pmc_process_interrupt(cpu, PMC_HR, pm, tf,
-		    TRAPF_USERMODE(tf));
+		error = pmc_process_interrupt(PMC_HR, pm, tf);
 		if (error)
 			armv7_stop_pmc(cpu, ri);
 

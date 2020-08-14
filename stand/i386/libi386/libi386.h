@@ -29,11 +29,9 @@
 
 /*
  * i386 fully-qualified device descriptor.
- * Note, this must match struct zfs_devdesc for zfs support.
  */
-/* Note: Must match the 'struct devdesc' in stand.h */
 struct i386_devdesc {
-    struct devdesc	dd;
+    struct devdesc	dd;		/* Must be first. */
     union 
     {
 	struct 
@@ -91,24 +89,24 @@ extern struct devdesc	currdev;	/* our current device */
 #define MAXDEV		31		/* maximum number of distinct devices */
 #define MAXBDDEV	MAXDEV
 
+#include <readin.h>
+
 /* exported devices XXX rename? */
 extern struct devsw bioscd;
-extern struct devsw biosdisk;
+extern struct devsw biosfd;
+extern struct devsw bioshd;
 extern struct devsw pxedisk;
 extern struct fs_ops pxe_fsops;
 
 int	bc_add(int biosdev);		/* Register CD booted from. */
-int	bc_getdev(struct i386_devdesc *dev);	/* return dev_t for (dev) */
-int	bc_bios2unit(int biosdev);	/* xlate BIOS device -> bioscd unit */
-int	bc_unit2bios(int unit);		/* xlate bioscd unit -> BIOS device */
 uint32_t bd_getbigeom(int bunit);	/* return geometry in bootinfo format */
 int	bd_bios2unit(int biosdev);	/* xlate BIOS device -> biosdisk unit */
-int	bd_unit2bios(int unit);		/* xlate biosdisk unit -> BIOS device */
+int	bd_unit2bios(struct i386_devdesc *); /* xlate biosdisk -> BIOS device */
 int	bd_getdev(struct i386_devdesc *dev);	/* return dev_t for (dev) */
 
 ssize_t	i386_copyin(const void *src, vm_offset_t dest, const size_t len);
 ssize_t	i386_copyout(const vm_offset_t src, void *dest, const size_t len);
-ssize_t	i386_readin(const int fd, vm_offset_t dest, const size_t len);
+ssize_t	i386_readin(readin_handle_t fd, vm_offset_t dest, const size_t len);
 
 struct preloaded_file;
 void	bios_addsmapdata(struct preloaded_file *);
@@ -124,6 +122,11 @@ extern vm_offset_t	memtop_copyin;	/* memtop less heap size for the cases */
 					/*  just the same as memtop            */
 extern uint32_t		high_heap_size;	/* extended memory region available */
 extern vm_offset_t	high_heap_base;	/* for use as the heap */
+
+/* 16KB buffer space for real mode data transfers. */
+#define	BIO_BUFFER_SIZE 0x4000
+void *bio_alloc(size_t size);
+void bio_free(void *ptr, size_t size);
 
 /*
  * Values for width parameter to biospci_{read,write}_config

@@ -36,13 +36,19 @@
 #define	ALT_STACK_SIZE	128
 
 typedef int (*pcpu_bp_harden)(void);
+typedef int (*pcpu_ssbd)(int);
+struct debug_monitor_state;
 
 #define	PCPU_MD_FIELDS							\
-	u_int	pc_acpi_id;	/* ACPI CPU id */		\
-	u_int	pc_midr;	/* stored MIDR value */	\
+	u_int	pc_acpi_id;	/* ACPI CPU id */			\
+	u_int	pc_midr;	/* stored MIDR value */			\
 	uint64_t pc_clock;						\
 	pcpu_bp_harden pc_bp_harden;					\
-	char __pad[233]
+	pcpu_ssbd pc_ssbd;						\
+	struct pmap *pc_curpmap;					\
+	struct pmap *pc_curvmpmap;					\
+	u_int	pc_bcast_tlbi_workaround;				\
+	char __pad[205]
 
 #ifdef _KERNEL
 

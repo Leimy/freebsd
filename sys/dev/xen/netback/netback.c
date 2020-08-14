@@ -46,8 +46,6 @@ __FBSDID("$FreeBSD$");
 #include "opt_inet.h"
 #include "opt_inet6.h"
 
-#include "opt_sctp.h"
-
 #include <sys/param.h>
 #include <sys/kernel.h>
 
@@ -69,9 +67,7 @@ __FBSDID("$FreeBSD$");
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/if_ether.h>
-#if __FreeBSD_version >= 700000
 #include <netinet/tcp.h>
-#endif
 #include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
 #include <machine/in_cksum.h>
@@ -662,6 +658,7 @@ xnb_disconnect(struct xnb_softc *xnb)
 	mtx_lock(&xnb->rx_lock);
 	mtx_unlock(&xnb->rx_lock);
 
+	mtx_lock(&xnb->sc_lock);
 	/* Free malloc'd softc member variables */
 	if (xnb->bridge != NULL) {
 		free(xnb->bridge, M_XENSTORE);
@@ -689,6 +686,8 @@ xnb_disconnect(struct xnb_softc *xnb)
 	    sizeof(struct xnb_ring_config));
 
 	xnb->flags &= ~XNBF_RING_CONNECTED;
+	mtx_unlock(&xnb->sc_lock);
+
 	return (0);
 }
 
@@ -779,7 +778,7 @@ xnb_connect_comms(struct xnb_softc *xnb)
 					  xnb->evtchn,
 					  /*filter*/NULL,
 					  xnb_intr, /*arg*/xnb,
-					  INTR_TYPE_BIO | INTR_MPSAFE,
+					  INTR_TYPE_NET | INTR_MPSAFE,
 					  &xnb->xen_intr_handle);
 	if (error != 0) {
 		(void)xnb_disconnect(xnb);
@@ -1066,17 +1065,14 @@ xnb_shutdown(struct xnb_softc *xnb)
 		if_free(xnb->xnb_ifp);
 		xnb->xnb_ifp = NULL;
 	}
-	mtx_lock(&xnb->sc_lock);
 
 	xnb_disconnect(xnb);
 
-	mtx_unlock(&xnb->sc_lock);
 	if (xenbus_get_state(xnb->dev) < XenbusStateClosing)
 		xenbus_set_state(xnb->dev, XenbusStateClosing);
 	mtx_lock(&xnb->sc_lock);
 
 	xnb->flags &= ~XNBF_IN_SHUTDOWN;
-
 
 	/* Indicate to xnb_detach() that is it safe to proceed. */
 	wakeup(xnb);
@@ -1159,7 +1155,7 @@ xnb_setup_sysctl(struct xnb_softc *xnb)
 			SYSCTL_CHILDREN(sysctl_tree),
 			OID_AUTO,
 			"unit_test_results",
-			CTLTYPE_STRING | CTLFLAG_RD,
+			CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT,
 			xnb,
 			0,
 			xnb_unit_test_main,
@@ -1170,7 +1166,7 @@ xnb_setup_sysctl(struct xnb_softc *xnb)
 			SYSCTL_CHILDREN(sysctl_tree),
 			OID_AUTO,
 			"dump_rings",
-			CTLTYPE_STRING | CTLFLAG_RD,
+			CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT,
 			xnb,
 			0,
 			xnb_dump_rings,

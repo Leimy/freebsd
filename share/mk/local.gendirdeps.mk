@@ -7,12 +7,13 @@ GENDIRDEPS_HEADER= echo '\# ${FreeBSD:L:@v@$$$v$$ @:M*F*}';
 # local.dirdeps.mk will put them in if necessary
 GENDIRDEPS_FILTER+= \
 	Nbin/cat.host \
-	Ngnu/lib/libssp/libssp_nonshared \
+	Nlib/libssp_nonshared \
 	Ncddl/usr.bin/ctf* \
 	Nlib/libc_nonshared \
-	Ngnu/lib/libgcc \
 	Nlib/libgcc_eh \
 	Nlib/libgcc_s \
+	Nstand/libsa/* \
+	Nstand/libsa32/* \
 	Ntargets/pseudo/stage* \
 	Ntools/*
 

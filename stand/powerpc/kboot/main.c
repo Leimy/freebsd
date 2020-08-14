@@ -31,21 +31,18 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <fdt_platform.h>
 
-#define _KERNEL
 #include <machine/cpufunc.h>
-#include "bootstrap.h"
+#include <bootstrap.h>
 #include "host_syscall.h"
 
 
 struct arch_switch	archsw;
 extern void *_end;
 
-extern char bootprog_info[];
-
 int kboot_getdev(void **vdev, const char *devspec, const char **path);
 ssize_t kboot_copyin(const void *src, vm_offset_t dest, const size_t len);
 ssize_t kboot_copyout(vm_offset_t src, void *dest, const size_t len);
-ssize_t kboot_readin(const int fd, vm_offset_t dest, const size_t len);
+ssize_t kboot_readin(readin_handle_t fd, vm_offset_t dest, const size_t len);
 int kboot_autoload(void);
 uint64_t kboot_loadaddr(u_int type, void *data, uint64_t addr);
 int kboot_setcurrdev(struct env_var *ev, int flags, const void *value);
@@ -413,7 +410,7 @@ kboot_copyout(vm_offset_t src, void *dest, const size_t len)
 }
 
 ssize_t
-kboot_readin(const int fd, vm_offset_t dest, const size_t len)
+kboot_readin(readin_handle_t fd, vm_offset_t dest, const size_t len)
 {
 	void            *buf;
 	size_t          resid, chunk, get;
@@ -431,7 +428,7 @@ kboot_readin(const int fd, vm_offset_t dest, const size_t len)
 
 	for (resid = len; resid > 0; resid -= got, p += got) {
 		get = min(chunk, resid);
-		got = read(fd, buf, get);
+		got = VECTX_READ(fd, buf, get);
 		if (got <= 0) {
 			if (got < 0)
 				printf("kboot_readin: read failed\n");
@@ -486,8 +483,18 @@ kboot_kseg_get(int *nseg, void **ptr)
 void
 _start(int argc, const char **argv, char **env)
 {
+// This makes error "variable 'sp' is uninitialized" be just a warning on clang.
+// Initializing 'sp' is not desired here as it would overwrite "r1" original value
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic warning "-Wuninitialized"
+#endif
 	register volatile void **sp asm("r1");
 	main((int)sp[0], (const char **)&sp[1]);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
 }
 
 /*

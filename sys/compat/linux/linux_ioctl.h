@@ -1,5 +1,5 @@
 /*-
- * SPDX-License-Identifier: BSD-3-Clause
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 1999 Marcel Moolenaar
  * All rights reserved.
@@ -8,24 +8,22 @@
  * modification, are permitted provided that the following conditions
  * are met:
  * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer 
- *    in this position and unchanged.
+ *    notice, this list of conditions and the following disclaimer.
  * 2. Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in the
  *    documentation and/or other materials provided with the distribution.
- * 3. The name of the author may not be used to endorse or promote products
- *    derived from this software without specific prior written permission.
  *
- * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
- * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
- * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
  *
  * $FreeBSD$
  */
@@ -59,9 +57,11 @@
 #define	LINUX_BLKSECTSET	0x1266
 #define	LINUX_BLKSECTGET	0x1267
 #define	LINUX_BLKSSZGET		0x1268
+#define	LINUX_BLKGETSIZE64	0x1272
+#define	LINUX_BLKPBSZGET	0x127b
 
 #define LINUX_IOCTL_DISK_MIN    LINUX_BLKROSET
-#define LINUX_IOCTL_DISK_MAX    LINUX_BLKSSZGET
+#define LINUX_IOCTL_DISK_MAX    LINUX_BLKPBSZGET
 
 /*
  * hdio
@@ -437,6 +437,7 @@
 #define	LINUX_VWERASE		14
 #define	LINUX_VLNEXT		15
 #define	LINUX_VEOL2		16
+#define	LINUX_VSTATUS		18
 #define	LINUX_NCCS		19
 
 #define	LINUX_POSIX_VDISABLE	'\0'
@@ -743,14 +744,16 @@
 #define	FBSD_LUSB_FS_OPEN_STREAM	0xffdf
 #define	FBSD_LUSB_GET_DEV_PORT_PATH	0xffde
 #define	FBSD_LUSB_GET_POWER_USAGE	0xffdd
+#define	FBSD_LUSB_DEVICESTATS		0xffdc
 
 #define	FBSD_LUSB_MAX			0xffff
-#define	FBSD_LUSB_MIN			0xffdd
+#define	FBSD_LUSB_MIN			0xffdc
 
 /*
  * Linux btrfs clone operation
  */
 #define LINUX_BTRFS_IOC_CLONE		0x9409 /* 0x40049409 */
+#define LINUX_FS_IOC_FIEMAP		0x660b
 
 /*
  * Linux evdev ioctl min and max
@@ -772,7 +775,18 @@ struct linux_ioctl_handler {
 	int	low, high;
 };
 
+struct linux_ioctl_handler_element
+{
+	TAILQ_ENTRY(linux_ioctl_handler_element) list;
+	int	(*func)(struct thread *, struct linux_ioctl_args *);
+	int	low, high, span;
+};
+
 int	linux_ioctl_register_handler(struct linux_ioctl_handler *h);
 int	linux_ioctl_unregister_handler(struct linux_ioctl_handler *h);
+#ifdef COMPAT_LINUX32
+int	linux32_ioctl_register_handler(struct linux_ioctl_handler *h);
+int	linux32_ioctl_unregister_handler(struct linux_ioctl_handler *h);
+#endif
 
 #endif /* !_LINUX_IOCTL_H_ */

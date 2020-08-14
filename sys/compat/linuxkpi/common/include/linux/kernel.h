@@ -49,8 +49,10 @@
 #include <linux/sched.h>
 #include <linux/types.h>
 #include <linux/jiffies.h>
-#include <linux/log2.h> 
+#include <linux/log2.h>
+
 #include <asm/byteorder.h>
+#include <asm/uaccess.h>
 
 #include <machine/stdarg.h>
 
@@ -92,6 +94,9 @@
 #define	BUILD_BUG_ON_NOT_POWER_OF_2(x)	BUILD_BUG_ON(!powerof2(x))
 #define	BUILD_BUG_ON_INVALID(expr)	while (0) { (void)(expr); }
 
+extern const volatile int lkpi_build_bug_on_zero;
+#define	BUILD_BUG_ON_ZERO(x)	((x) ? lkpi_build_bug_on_zero : 0)
+
 #define	BUG()			panic("BUG at %s:%d", __FILE__, __LINE__)
 #define	BUG_ON(cond)		do {				\
 	if (cond) {						\
@@ -105,6 +110,7 @@
       if (__ret) {						\
 		printf("WARNING %s failed at %s:%d\n",		\
 		    __stringify(cond), __FILE__, __LINE__);	\
+		linux_dump_stack();				\
       }								\
       unlikely(__ret);						\
 })
@@ -118,6 +124,7 @@
 		__warn_on_once = 1;				\
 		printf("WARNING %s failed at %s:%d\n",		\
 		    __stringify(cond), __FILE__, __LINE__);	\
+		linux_dump_stack();				\
       }								\
       unlikely(__ret);						\
 })
@@ -128,12 +135,23 @@
 #define	ALIGN(x, y)		roundup2((x), (y))
 #undef PTR_ALIGN
 #define	PTR_ALIGN(p, a)		((__typeof(p))ALIGN((uintptr_t)(p), (a)))
+#if defined(LINUXKPI_VERSION) && LINUXKPI_VERSION >= 50000
+/* Moved from linuxkpi_gplv2 */
+#define	IS_ALIGNED(x, a)	(((x) & ((__typeof(x))(a) - 1)) == 0)
+#endif
 #define	DIV_ROUND_UP(x, n)	howmany(x, n)
+#define	__KERNEL_DIV_ROUND_UP(x, n)	howmany(x, n)
 #define	DIV_ROUND_UP_ULL(x, n)	DIV_ROUND_UP((unsigned long long)(x), (n))
+#define	DIV_ROUND_DOWN_ULL(x, n) (((unsigned long long)(x) / (n)) * (n))
 #define	FIELD_SIZEOF(t, f)	sizeof(((t *)0)->f)
 
 #define	printk(...)		printf(__VA_ARGS__)
 #define	vprintk(f, a)		vprintf(f, a)
+
+#define	asm			__asm
+
+extern void linux_dump_stack(void);
+#define	dump_stack()		linux_dump_stack()
 
 struct va_format {
 	const char *fmt;
@@ -169,13 +187,17 @@ scnprintf(char *buf, size_t size, const char *fmt, ...)
  * unless DEBUG is defined:
  */
 #ifdef DEBUG
-#define pr_debug(fmt, ...) \
-        log(LOG_DEBUG, fmt, ##__VA_ARGS__)
+extern int linuxkpi_debug;
+#define pr_debug(fmt, ...)					\
+	do {							\
+		if (linuxkpi_debug)				\
+			log(LOG_DEBUG, fmt, ##__VA_ARGS__);	\
+	} while (0)
 #define pr_devel(fmt, ...) \
 	log(LOG_DEBUG, pr_fmt(fmt), ##__VA_ARGS__)
 #else
 #define pr_debug(fmt, ...) \
-        ({ if (0) log(LOG_DEBUG, fmt, ##__VA_ARGS__); 0; })
+	({ if (0) log(LOG_DEBUG, fmt, ##__VA_ARGS__); 0; })
 #define pr_devel(fmt, ...) \
 	({ if (0) log(LOG_DEBUG, pr_fmt(fmt), ##__VA_ARGS__); 0; })
 #endif
@@ -238,19 +260,19 @@ scnprintf(char *buf, size_t size, const char *fmt, ...)
 
 #ifndef WARN
 #define	WARN(condition, ...) ({			\
-        bool __ret_warn_on = (condition);	\
-        if (unlikely(__ret_warn_on))		\
-                pr_warning(__VA_ARGS__);	\
-        unlikely(__ret_warn_on);		\
+	bool __ret_warn_on = (condition);	\
+	if (unlikely(__ret_warn_on))		\
+		pr_warning(__VA_ARGS__);	\
+	unlikely(__ret_warn_on);		\
 })
 #endif
 
 #ifndef WARN_ONCE
 #define	WARN_ONCE(condition, ...) ({		\
-        bool __ret_warn_on = (condition);	\
-        if (unlikely(__ret_warn_on))		\
-                pr_warn_once(__VA_ARGS__);	\
-        unlikely(__ret_warn_on);		\
+	bool __ret_warn_on = (condition);	\
+	if (unlikely(__ret_warn_on))		\
+		pr_warn_once(__VA_ARGS__);	\
+	unlikely(__ret_warn_on);		\
 })
 #endif
 
@@ -259,7 +281,7 @@ scnprintf(char *buf, size_t size, const char *fmt, ...)
 	const __typeof(((type *)0)->member) *__p = (ptr);	\
 	(type *)((uintptr_t)__p - offsetof(type, member));	\
 })
-  
+
 #define	ARRAY_SIZE(x)	(sizeof(x) / sizeof((x)[0]))
 
 #define	u64_to_user_ptr(val)	((void *)(uintptr_t)(val))
@@ -355,6 +377,24 @@ kstrtouint(const char *cp, unsigned int base, unsigned int *res)
 }
 
 static inline int
+kstrtou16(const char *cp, unsigned int base, u16 *res)
+{
+	char *end;
+	unsigned long temp;
+
+	*res = temp = strtoul(cp, &end, base);
+
+	/* skip newline character, if any */
+	if (*end == '\n')
+		end++;
+	if (*cp == 0 || *end != 0)
+		return (-EINVAL);
+	if (temp != (u16)temp)
+		return (-ERANGE);
+	return (0);
+}
+
+static inline int
 kstrtou32(const char *cp, unsigned int base, u32 *res)
 {
 	char *end;
@@ -372,6 +412,61 @@ kstrtou32(const char *cp, unsigned int base, u32 *res)
 	return (0);
 }
 
+static inline int
+kstrtou64(const char *cp, unsigned int base, u64 *res)
+{
+       char *end;
+
+       *res = strtouq(cp, &end, base);
+
+       /* skip newline character, if any */
+       if (*end == '\n')
+               end++;
+       if (*cp == 0 || *end != 0)
+               return (-EINVAL);
+       return (0);
+}
+
+static inline int
+kstrtobool(const char *s, bool *res)
+{
+	int len;
+
+	if (s == NULL || (len = strlen(s)) == 0 || res == NULL)
+		return (-EINVAL);
+
+	/* skip newline character, if any */
+	if (s[len - 1] == '\n')
+		len--;
+
+	if (len == 1 && strchr("yY1", s[0]) != NULL)
+		*res = true;
+	else if (len == 1 && strchr("nN0", s[0]) != NULL)
+		*res = false;
+	else if (strncasecmp("on", s, len) == 0)
+		*res = true;
+	else if (strncasecmp("off", s, len) == 0)
+		*res = false;
+	else
+		return (-EINVAL);
+
+	return (0);
+}
+
+static inline int
+kstrtobool_from_user(const char __user *s, size_t count, bool *res)
+{
+	char buf[8] = {};
+
+	if (count > (sizeof(buf) - 1))
+		count = (sizeof(buf) - 1);
+
+	if (copy_from_user(buf, s, count))
+		return (-EFAULT);
+
+	return (kstrtobool(buf, res));
+}
+
 #define min(x, y)	((x) < (y) ? (x) : (y))
 #define max(x, y)	((x) > (y) ? (x) : (y))
 
@@ -387,6 +482,9 @@ kstrtou32(const char *cp, unsigned int base, u32 *res)
 	type __max1 = (x);			\
 	type __max2 = (y);			\
 	__max1 > __max2 ? __max1 : __max2; })
+
+#define offsetofend(t, m)	\
+        (offsetof(t, m) + sizeof((((t *)0)->m)))
 
 #define clamp_t(type, _x, min, max)	min_t(type, max_t(type, _x, min), max)
 #define clamp(x, lo, hi)		min( max(x,lo), hi)
@@ -412,7 +510,7 @@ extern bool linux_cpu_has_clflush;
 #endif
 
 typedef struct pm_message {
-        int event;
+	int event;
 } pm_message_t;
 
 /* Swap values of a and b */
@@ -456,5 +554,46 @@ linux_ratelimited(linux_ratelimit_t *rl)
 {
 	return (ppsratecheck(&rl->lasttime, &rl->counter, 1));
 }
+
+#define	struct_size(ptr, field, num) ({ \
+	const size_t __size = offsetof(__typeof(*(ptr)), field); \
+	const size_t __max = (SIZE_MAX - __size) / sizeof((ptr)->field[0]); \
+	((num) > __max) ? SIZE_MAX : (__size + sizeof((ptr)->field[0]) * (num)); \
+})
+
+#define	__is_constexpr(x) \
+	__builtin_constant_p(x)
+
+/*
+ * The is_signed() macro below returns true if the passed data type is
+ * signed. Else false is returned.
+ */
+#define	is_signed(datatype) (((datatype)-1 / (datatype)2) == (datatype)0)
+
+/*
+ * The type_max() macro below returns the maxium positive value the
+ * passed data type can hold.
+ */
+#define	type_max(datatype) ( \
+  (sizeof(datatype) >= 8) ? (is_signed(datatype) ? INT64_MAX : UINT64_MAX) : \
+  (sizeof(datatype) >= 4) ? (is_signed(datatype) ? INT32_MAX : UINT32_MAX) : \
+  (sizeof(datatype) >= 2) ? (is_signed(datatype) ? INT16_MAX : UINT16_MAX) : \
+			    (is_signed(datatype) ? INT8_MAX : UINT8_MAX) \
+)
+
+/*
+ * The type_min() macro below returns the minimum value the passed
+ * data type can hold. For unsigned types the minimum value is always
+ * zero. For signed types it may vary.
+ */
+#define	type_min(datatype) ( \
+  (sizeof(datatype) >= 8) ? (is_signed(datatype) ? INT64_MIN : 0) : \
+  (sizeof(datatype) >= 4) ? (is_signed(datatype) ? INT32_MIN : 0) : \
+  (sizeof(datatype) >= 2) ? (is_signed(datatype) ? INT16_MIN : 0) : \
+			    (is_signed(datatype) ? INT8_MIN : 0) \
+)
+
+#define	TAINT_WARN	0
+#define	test_taint(x)	(0)
 
 #endif	/* _LINUX_KERNEL_H_ */

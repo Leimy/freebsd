@@ -26,13 +26,10 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * from:
- * $FreeBSD$
+ * From: @(#)scandir.c	8.3 (Berkeley) 1/2/94
+ * From: FreeBSD: head/lib/libc/gen/scandir.c 317372 2017-04-24 14:56:41Z pfg
  */
 
-#if defined(LIBC_SCCS) && !defined(lint)
-static char sccsid[] = "@(#)scandir.c	8.3 (Berkeley) 1/2/94";
-#endif /* LIBC_SCCS and not lint */
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
@@ -52,32 +49,25 @@ __FBSDID("$FreeBSD$");
 
 #include "gen-compat.h"
 
-#ifdef	I_AM_SCANDIR_B
-#include "block_abi.h"
-#define	SELECT(x)	CALL_BLOCK(select, x)
-#ifndef __BLOCKS__
-void
-qsort_b(void *, size_t, size_t, void*);
-#endif
-#else
+/*
+ * scandir_b@FBSD_1.4 was never exported from libc.so.7 due to a
+ * mistake, so there is no use of exporting it now with some earlier
+ * symbol version.  As result, we do not need to implement compat
+ * function freebsd11_scandir_b().
+ */
+
 #define	SELECT(x)	select(x)
-#endif
+
+void qsort_b(void *, size_t, size_t, void *);
 
 static int freebsd11_alphasort_thunk(void *thunk, const void *p1,
     const void *p2);
 
 int
-#ifdef I_AM_SCANDIR_B
-freebsd11_scandir_b(const char *dirname, struct freebsd11_dirent ***namelist,
-    DECLARE_BLOCK(int, select, const struct freebsd11_dirent *),
-    DECLARE_BLOCK(int, dcomp, const struct freebsd11_dirent **,
-    const struct freebsd11_dirent **))
-#else
 freebsd11_scandir(const char *dirname, struct freebsd11_dirent ***namelist,
     int (*select)(const struct freebsd11_dirent *),
     int (*dcomp)(const struct freebsd11_dirent **,
 	const struct freebsd11_dirent **))
-#endif
 {
 	struct freebsd11_dirent *d, *p, **names = NULL;
 	size_t arraysz, numitems;
@@ -127,13 +117,8 @@ freebsd11_scandir(const char *dirname, struct freebsd11_dirent ***namelist,
 	}
 	closedir(dirp);
 	if (numitems && dcomp != NULL)
-#ifdef I_AM_SCANDIR_B
-		qsort_b(names, numitems, sizeof(struct freebsd11_dirent *),
-		    (void*)dcomp);
-#else
 		qsort_r(names, numitems, sizeof(struct freebsd11_dirent *),
 		    &dcomp, freebsd11_alphasort_thunk);
-#endif
 	*namelist = names;
 	return (numitems);
 
@@ -171,4 +156,3 @@ freebsd11_alphasort_thunk(void *thunk, const void *p1, const void *p2)
 
 __sym_compat(alphasort, freebsd11_alphasort, FBSD_1.0);
 __sym_compat(scandir, freebsd11_scandir, FBSD_1.0);
-__sym_compat(scandir_b, freebsd11_scandir_b, FBSD_1.4);

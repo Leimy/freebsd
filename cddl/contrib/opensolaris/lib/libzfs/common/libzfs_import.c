@@ -21,7 +21,7 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2017 by Delphix. All rights reserved.
  * Copyright 2015 RackTop Systems.
  * Copyright 2016 Nexenta Systems, Inc.
  */
@@ -33,7 +33,7 @@
  * ZFS label of each device.  If we successfully read the label, then we
  * organize the configuration information in the following hierarchy:
  *
- * 	pool guid -> toplevel vdev guid -> label txg
+ *	pool guid -> toplevel vdev guid -> label txg
  *
  * Duplicate entries matching this same tuple will be discarded.  Once we have
  * examined every device, we pick the best label txg config for each toplevel
@@ -245,7 +245,6 @@ add_config(libzfs_handle_t *hdl, pool_list_t *pl, const char *path,
 		ne->ne_next = pl->names;
 		pl->names = ne;
 
-		nvlist_free(config);
 		return (0);
 	}
 
@@ -265,7 +264,6 @@ add_config(libzfs_handle_t *hdl, pool_list_t *pl, const char *path,
 	    &top_guid) != 0 ||
 	    nvlist_lookup_uint64(config, ZPOOL_CONFIG_POOL_TXG,
 	    &txg) != 0 || txg == 0) {
-		nvlist_free(config);
 		return (0);
 	}
 
@@ -280,7 +278,6 @@ add_config(libzfs_handle_t *hdl, pool_list_t *pl, const char *path,
 
 	if (pe == NULL) {
 		if ((pe = zfs_alloc(hdl, sizeof (pool_entry_t))) == NULL) {
-			nvlist_free(config);
 			return (-1);
 		}
 		pe->pe_guid = pool_guid;
@@ -299,7 +296,6 @@ add_config(libzfs_handle_t *hdl, pool_list_t *pl, const char *path,
 
 	if (ve == NULL) {
 		if ((ve = zfs_alloc(hdl, sizeof (vdev_entry_t))) == NULL) {
-			nvlist_free(config);
 			return (-1);
 		}
 		ve->ve_guid = top_guid;
@@ -319,15 +315,12 @@ add_config(libzfs_handle_t *hdl, pool_list_t *pl, const char *path,
 
 	if (ce == NULL) {
 		if ((ce = zfs_alloc(hdl, sizeof (config_entry_t))) == NULL) {
-			nvlist_free(config);
 			return (-1);
 		}
 		ce->ce_txg = txg;
-		ce->ce_config = config;
+		ce->ce_config = fnvlist_dup(config);
 		ce->ce_next = ve->ve_configs;
 		ve->ve_configs = ce;
-	} else {
-		nvlist_free(config);
 	}
 
 	/*
@@ -776,7 +769,7 @@ get_configs(libzfs_handle_t *hdl, pool_list_t *pl, boolean_t active_ok,
 		}
 
 		if (policy != NULL) {
-			if (nvlist_add_nvlist(config, ZPOOL_REWIND_POLICY,
+			if (nvlist_add_nvlist(config, ZPOOL_LOAD_POLICY,
 			    policy) != 0)
 				goto nomem;
 		}
@@ -1251,10 +1244,18 @@ zpool_find_import_impl(libzfs_handle_t *hdl, importargs_t *iarg)
 	avl_tree_t slice_cache;
 	rdsk_node_t *slice;
 	void *cookie;
+	boolean_t skip_zvols = B_FALSE;
+	int value;
+	size_t size = sizeof(value);
 
 	if (dirs == 0) {
 		dirs = 1;
 		dir = &default_dir;
+	}
+
+	if (sysctlbyname("vfs.zfs.vol.recursive", &value, &size, NULL, 0) == 0
+	    && value == 0) {
+		skip_zvols = B_TRUE;
 	}
 
 	/*
@@ -1321,6 +1322,10 @@ zpool_find_import_impl(libzfs_handle_t *hdl, importargs_t *iarg)
 			}
 
 			LIST_FOREACH(mp, &mesh.lg_class, lg_class) {
+				if (skip_zvols &&
+				    strcmp(mp->lg_name, "ZFS::ZVOL") == 0) {
+					continue;
+				}
 		        	LIST_FOREACH(gp, &mp->lg_geom, lg_geom) {
 					LIST_FOREACH(pp, &gp->lg_provider, lg_provider) {
 						slice = zfs_alloc(hdl, sizeof (rdsk_node_t));
@@ -1396,9 +1401,7 @@ skipdir:
 					    &this_guid) == 0 &&
 					    iarg->guid == this_guid;
 				}
-				if (!matched) {
-					nvlist_free(config);
-				} else {
+				if (matched) {
 					/*
 					 * use the non-raw path for the config
 					 */
@@ -1408,6 +1411,7 @@ skipdir:
 					    config) != 0)
 						config_failed = B_TRUE;
 				}
+				nvlist_free(config);
 			}
 			free(slice->rn_name);
 			free(slice);
@@ -1607,16 +1611,87 @@ name_or_guid_exists(zpool_handle_t *zhp, void *data)
 nvlist_t *
 zpool_search_import(libzfs_handle_t *hdl, importargs_t *import)
 {
+	nvlist_t *pools = NULL;
+
 	verify(import->poolname == NULL || import->guid == 0);
 
 	if (import->unique)
 		import->exists = zpool_iter(hdl, name_or_guid_exists, import);
 
 	if (import->cachefile != NULL)
-		return (zpool_find_import_cached(hdl, import->cachefile,
-		    import->poolname, import->guid));
+		pools = zpool_find_import_cached(hdl, import->cachefile,
+		    import->poolname, import->guid);
+	else
+		pools = zpool_find_import_impl(hdl, import);
 
-	return (zpool_find_import_impl(hdl, import));
+	return (pools);
+}
+
+static boolean_t
+pool_match(nvlist_t *cfg, char *tgt)
+{
+	uint64_t v, guid = strtoull(tgt, NULL, 0);
+	char *s;
+
+	if (guid != 0) {
+		if (nvlist_lookup_uint64(cfg, ZPOOL_CONFIG_POOL_GUID, &v) == 0)
+			return (v == guid);
+	} else {
+		if (nvlist_lookup_string(cfg, ZPOOL_CONFIG_POOL_NAME, &s) == 0)
+			return (strcmp(s, tgt) == 0);
+	}
+	return (B_FALSE);
+}
+
+int
+zpool_tryimport(libzfs_handle_t *hdl, char *target, nvlist_t **configp,
+    importargs_t *args)
+{
+	nvlist_t *pools;
+	nvlist_t *match = NULL;
+	nvlist_t *config = NULL;
+	char *sepp = NULL;
+	int count = 0;
+	char *targetdup = strdup(target);
+
+	*configp = NULL;
+
+	if ((sepp = strpbrk(targetdup, "/@")) != NULL) {
+		*sepp = '\0';
+	}
+
+	pools = zpool_search_import(hdl, args);
+
+	if (pools != NULL) {
+		nvpair_t *elem = NULL;
+		while ((elem = nvlist_next_nvpair(pools, elem)) != NULL) {
+			VERIFY0(nvpair_value_nvlist(elem, &config));
+			if (pool_match(config, targetdup)) {
+				count++;
+				if (match != NULL) {
+					/* multiple matches found */
+					continue;
+				} else {
+					match = config;
+				}
+			}
+		}
+	}
+
+	if (count == 0) {
+		free(targetdup);
+		return (ENOENT);
+	}
+
+	if (count > 1) {
+		free(targetdup);
+		return (EINVAL);
+	}
+
+	*configp = match;
+	free(targetdup);
+
+	return (0);
 }
 
 boolean_t

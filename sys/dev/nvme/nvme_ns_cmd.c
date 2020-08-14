@@ -126,7 +126,7 @@ nvme_ns_cmd_deallocate(struct nvme_namespace *ns, void *payload,
 		return (ENOMEM);
 
 	cmd = &req->cmd;
-	cmd->opc_fuse = NVME_CMD_SET_OPC(NVME_OPC_DATASET_MANAGEMENT);
+	cmd->opc = NVME_OPC_DATASET_MANAGEMENT;
 	cmd->nsid = htole32(ns->id);
 
 	/* TODO: create a delete command data structure */
@@ -191,6 +191,14 @@ nvme_ns_dump(struct nvme_namespace *ns, void *virt, off_t offset, size_t len)
 		nvme_qpair_process_completions(req->qpair);
 	}
 
+	/*
+	 * Normally, when using the polling interface, we can't return a
+	 * timeout error because we don't know when the completion routines
+	 * will be called if the command later completes. However, in this
+	 * case we're running a system dump, so all interrupts are turned
+	 * off, the scheduler isn't running so there's nothing to complete
+	 * the transaction.
+	 */
 	if (status.done == FALSE)
 		return (ETIMEDOUT);
 

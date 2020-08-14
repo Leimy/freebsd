@@ -37,6 +37,7 @@
 #include <elf-hints.h>
 #include <link.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <setjmp.h>
 #include <stddef.h>
 
@@ -46,15 +47,10 @@
 #define NEW(type)	((type *) xmalloc(sizeof(type)))
 #define CNEW(type)	((type *) xcalloc(1, sizeof(type)))
 
-/* We might as well do booleans like C++. */
-typedef unsigned char bool;
-#define false	0
-#define true	1
-
 extern size_t tls_last_offset;
 extern size_t tls_last_size;
 extern size_t tls_static_space;
-extern int tls_dtv_generation;
+extern Elf_Addr tls_dtv_generation;
 extern int tls_max_index;
 
 extern int npagesizes;
@@ -151,7 +147,6 @@ typedef struct Struct_Obj_Entry {
     /* These items are computed by map_object() or by digest_phdr(). */
     caddr_t mapbase;		/* Base address of mapped region */
     size_t mapsize;		/* Size of mapped region in bytes */
-    size_t textsize;		/* Size of text segment in bytes */
     Elf_Addr vaddrbase;		/* Base address in shared object file */
     caddr_t relocbase;		/* Relocation constant = mapbase - vaddrbase */
     const Elf_Dyn *dynamic;	/* Dynamic section */
@@ -168,6 +163,7 @@ typedef struct Struct_Obj_Entry {
     size_t tlssize;		/* Size of TLS block for this module */
     size_t tlsoffset;		/* Offset of static TLS block for this module */
     size_t tlsalign;		/* Alignment of static TLS block */
+    size_t tlspoffset;		/* p_offset of the static TLS block */
 
     caddr_t relro_page;
     size_t relro_size;
@@ -191,8 +187,12 @@ typedef struct Struct_Obj_Entry {
     Elf_Word gotsym;		/* First dynamic symbol in GOT */
     Elf_Addr *mips_pltgot;	/* Second PLT GOT */
 #endif
+#ifdef __powerpc__
 #ifdef __powerpc64__
     Elf_Addr glink;		/* GLINK PLT call stub section */
+#else
+    Elf_Addr *gotptr;		/* GOT pointer (secure-plt only) */
+#endif
 #endif
 
     const Elf_Verneed *verneed; /* Required versions. */
@@ -211,12 +211,12 @@ typedef struct Struct_Obj_Entry {
     Elf32_Word maskwords_bm_gnu;  	/* Bloom filter words - 1 (bitmask) */
     Elf32_Word shift2_gnu;		/* Bloom filter shift count */
     Elf32_Word dynsymcount;		/* Total entries in dynsym table */
-    Elf_Addr *bloom_gnu;		/* Bloom filter used by GNU hash func */
+    const Elf_Addr *bloom_gnu;		/* Bloom filter used by GNU hash func */
     const Elf_Hashelt *buckets_gnu;	/* GNU hash table bucket array */
     const Elf_Hashelt *chain_zero_gnu;	/* GNU hash table value array (Zeroed) */
 
-    char *rpath;		/* Search path specified in object */
-    char *runpath;		/* Search path with different priority */
+    const char *rpath;		/* Search path specified in object */
+    const char *runpath;	/* Search path with different priority */
     Needed_Entry *needed;	/* Shared objects needed by this one (%) */
     Needed_Entry *needed_filtees;
     Needed_Entry *needed_aux_filtees;
@@ -236,6 +236,7 @@ typedef struct Struct_Obj_Entry {
     int fini_array_num; 	/* Number of entries in fini_array */
 
     int32_t osrel;		/* OSREL note value */
+    uint32_t fctl0;		/* FEATURE_CONTROL note desc[0] value */
 
     bool mainprog : 1;		/* True if this is the main program */
     bool rtld : 1;		/* True if this is the dynamic linker */
@@ -256,14 +257,19 @@ typedef struct Struct_Obj_Entry {
     bool z_interpose : 1;	/* Interpose all objects but main */
     bool z_nodeflib : 1;	/* Don't search default library path */
     bool z_global : 1;		/* Make the object global */
+    bool z_pie : 1;		/* Object proclaimed itself PIE executable */
+    bool static_tls : 1;	/* Needs static TLS allocation */
+    bool static_tls_copied : 1;	/* Needs static TLS copying */
     bool ref_nodel : 1;		/* Refcount increased to prevent dlclose */
     bool init_scanned: 1;	/* Object is already on init list. */
     bool on_fini_list: 1;	/* Object is already on fini list. */
     bool dag_inited : 1;	/* Object has its DAG initialized. */
     bool filtees_loaded : 1;	/* Filtees loaded */
     bool irelative : 1;		/* Object has R_MACHDEP_IRELATIVE relocs */
+    bool irelative_nonplt : 1;	/* Object has R_MACHDEP_IRELATIVE non-plt relocs */
     bool gnu_ifunc : 1;		/* Object has references to STT_GNU_IFUNC */
     bool non_plt_gnu_ifunc : 1;	/* Object has non-plt IFUNC references */
+    bool ifuncs_resolved : 1;	/* Object ifuncs were already resolved */
     bool crt_no_init : 1;	/* Object' crt does not call _init/_fini */
     bool valid_hash_sysv : 1;	/* A valid System V hash hash tag is available */
     bool valid_hash_gnu : 1;	/* A valid GNU hash tag is available */
@@ -303,6 +309,8 @@ TAILQ_HEAD(obj_entry_q, Struct_Obj_Entry);
 #define	RTLD_LO_FILTEES 0x10	/* Loading filtee. */
 #define	RTLD_LO_EARLY	0x20	/* Do not call ctors, postpone it to the
 				   initialization during the image start. */
+#define	RTLD_LO_IGNSTLS 0x40	/* Do not allocate static TLS */
+#define	RTLD_LO_DEEPBIND 0x80	/* Force symbolic for this object */
 
 /*
  * Symbol cache entry used during relocation to avoid multiple lookups
@@ -357,11 +365,12 @@ Obj_Entry *map_object(int, const char *, const struct stat *);
 void *xcalloc(size_t, size_t);
 void *xmalloc(size_t);
 char *xstrdup(const char *);
-void *malloc_aligned(size_t size, size_t align);
+void *malloc_aligned(size_t size, size_t align, size_t offset);
 void free_aligned(void *ptr);
 extern Elf_Addr _GLOBAL_OFFSET_TABLE_[];
 extern Elf_Sym sym_zero;	/* For resolving undefined weak refs. */
 extern bool ld_bind_not;
+extern bool ld_fast_sigblock;
 
 void dump_relocations(Obj_Entry *);
 void dump_obj_relocations(Obj_Entry *);
@@ -399,13 +408,19 @@ int convert_prot(int elfflags);
 int do_copy_relocations(Obj_Entry *);
 int reloc_non_plt(Obj_Entry *, Obj_Entry *, int flags,
     struct Struct_RtldLockState *);
-int reloc_plt(Obj_Entry *);
+int reloc_plt(Obj_Entry *, int flags, struct Struct_RtldLockState *);
 int reloc_jmpslots(Obj_Entry *, int flags, struct Struct_RtldLockState *);
 int reloc_iresolve(Obj_Entry *, struct Struct_RtldLockState *);
+int reloc_iresolve_nonplt(Obj_Entry *, struct Struct_RtldLockState *);
 int reloc_gnu_ifunc(Obj_Entry *, int flags, struct Struct_RtldLockState *);
 void ifunc_init(Elf_Auxinfo[__min_size(AT_COUNT)]);
 void pre_init(void);
 void init_pltgot(Obj_Entry *);
 void allocate_initial_tls(Obj_Entry *);
+
+void *__crt_calloc(size_t num, size_t size);
+void __crt_free(void *cp);
+void *__crt_malloc(size_t nbytes);
+void *__crt_realloc(void *cp, size_t nbytes);
 
 #endif /* } */

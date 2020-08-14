@@ -63,7 +63,6 @@ __FBSDID("$FreeBSD$");
 #include "usb_if.h"
 
 static device_probe_t xhci_pci_probe;
-static device_attach_t xhci_pci_attach;
 static device_detach_t xhci_pci_detach;
 static usb_take_controller_t xhci_pci_take_controller;
 
@@ -80,15 +79,12 @@ static device_method_t xhci_device_methods[] = {
 	DEVMETHOD_END
 };
 
-static driver_t xhci_driver = {
-	.name = "xhci",
-	.methods = xhci_device_methods,
-	.size = sizeof(struct xhci_softc),
-};
+DEFINE_CLASS_0(xhci, xhci_pci_driver, xhci_device_methods,
+    sizeof(struct xhci_softc));
 
 static devclass_t xhci_devclass;
 
-DRIVER_MODULE(xhci, pci, xhci_driver, xhci_devclass, NULL, NULL);
+DRIVER_MODULE(xhci, pci, xhci_pci_driver, xhci_devclass, NULL, NULL);
 MODULE_DEPEND(xhci, usb, 1, 1, 1);
 
 static const char *
@@ -101,10 +97,14 @@ xhci_pci_match(device_t self)
 		return ("AMD KERNCZ USB 3.0 controller");
 	case 0x43ba1022:
 		return ("AMD X399 USB 3.0 controller");
-	case 0x43bb1022:
+	case 0x43b91022: /* X370 */
+	case 0x43bb1022: /* B350 */
 		return ("AMD 300 Series USB 3.0 controller");
 	case 0x78141022:
 		return ("AMD FCH USB 3.0 controller");
+
+	case 0x145f1d94:
+		return ("Hygon USB 3.0 controller");
 
 	case 0x01941033:
 		return ("NEC uPD720200 USB 3.0 controller");
@@ -113,6 +113,8 @@ xhci_pci_match(device_t self)
 
 	case 0x10001b73:
 		return ("Fresco Logic FL1000G USB 3.0 controller");
+	case 0x11001b73:
+		return ("Fresco Logic FL1100 USB 3.0 controller");
 
 	case 0x10421b21:
 		return ("ASMedia ASM1042 USB 3.0 controller");
@@ -146,6 +148,8 @@ xhci_pci_match(device_t self)
 		return ("Intel Lewisburg USB 3.0 controller");
 	case 0xa2af8086:
 		return ("Intel Union Point USB 3.0 controller");
+	case 0xa36d8086:
+		return ("Intel Cannon Lake USB 3.1 controller");
 
 	case 0xa01b177d:
 		return ("Cavium ThunderX USB 3.0 controller");
@@ -215,7 +219,7 @@ xhci_pci_port_route(device_t self, uint32_t set, uint32_t clear)
 	return (0);
 }
 
-static int
+int
 xhci_pci_attach(device_t self)
 {
 	struct xhci_softc *sc = device_get_softc(self);
@@ -256,6 +260,7 @@ xhci_pci_attach(device_t self)
 		 */
 		sc->sc_port_route = &xhci_pci_port_route;
 		sc->sc_imod_default = XHCI_IMOD_DEFAULT_LP;
+		sc->sc_ctlstep = 1;
 		break;
 	}
 

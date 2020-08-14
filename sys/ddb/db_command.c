@@ -37,6 +37,7 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/eventhandler.h>
 #include <sys/linker_set.h>
 #include <sys/lock.h>
 #include <sys/kdb.h>
@@ -145,7 +146,7 @@ static struct command db_cmds[] = {
 	{ "reset",	db_reset,		0,	NULL },
 	{ "kill",	db_kill,		CS_OWN,	NULL },
 	{ "watchdog",	db_watchdog,		CS_OWN,	NULL },
-	{ "thread",	db_set_thread,		CS_OWN,	NULL },
+	{ "thread",	db_set_thread,		0,	NULL },
 	{ "run",	db_run_cmd,		CS_OWN,	NULL },
 	{ "script",	db_script_cmd,		CS_OWN,	NULL },
 	{ "scripts",	db_scripts_cmd,		0,	NULL },
@@ -812,6 +813,7 @@ db_stack_trace(db_expr_t tid, bool hastid, db_expr_t count, char *modif)
 		if (!db_expression(&count)) {
 			db_printf("Count missing\n");
 			db_flush_lex();
+			db_radix = radix;
 			return;
 		}
 	} else {

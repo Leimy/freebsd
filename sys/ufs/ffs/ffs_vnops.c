@@ -111,7 +111,11 @@ extern int	ffs_rawread(struct vnode *vp, struct uio *uio, int *workdone);
 static vop_fdatasync_t	ffs_fdatasync;
 static vop_fsync_t	ffs_fsync;
 static vop_getpages_t	ffs_getpages;
+static vop_getpages_async_t	ffs_getpages_async;
 static vop_lock1_t	ffs_lock;
+#ifdef INVARIANTS
+static vop_unlock_t	ffs_unlock_debug;
+#endif
 static vop_read_t	ffs_read;
 static vop_write_t	ffs_write;
 static int	ffs_extread(struct vnode *vp, struct uio *uio, int ioflag);
@@ -132,21 +136,29 @@ struct vop_vector ffs_vnodeops1 = {
 	.vop_fsync =		ffs_fsync,
 	.vop_fdatasync =	ffs_fdatasync,
 	.vop_getpages =		ffs_getpages,
-	.vop_getpages_async =	vnode_pager_local_getpages_async,
+	.vop_getpages_async =	ffs_getpages_async,
 	.vop_lock1 =		ffs_lock,
+#ifdef INVARIANTS
+	.vop_unlock =		ffs_unlock_debug,
+#endif
 	.vop_read =		ffs_read,
 	.vop_reallocblks =	ffs_reallocblks,
 	.vop_write =		ffs_write,
 	.vop_vptofh =		ffs_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(ffs_vnodeops1);
 
 struct vop_vector ffs_fifoops1 = {
 	.vop_default =		&ufs_fifoops,
 	.vop_fsync =		ffs_fsync,
 	.vop_fdatasync =	ffs_fdatasync,
-	.vop_reallocblks =	ffs_reallocblks, /* XXX: really ??? */
+	.vop_lock1 =		ffs_lock,
+#ifdef INVARIANTS
+	.vop_unlock =		ffs_unlock_debug,
+#endif
 	.vop_vptofh =		ffs_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(ffs_fifoops1);
 
 /* Global vfs data structures for ufs. */
 struct vop_vector ffs_vnodeops2 = {
@@ -154,8 +166,11 @@ struct vop_vector ffs_vnodeops2 = {
 	.vop_fsync =		ffs_fsync,
 	.vop_fdatasync =	ffs_fdatasync,
 	.vop_getpages =		ffs_getpages,
-	.vop_getpages_async =	vnode_pager_local_getpages_async,
+	.vop_getpages_async =	ffs_getpages_async,
 	.vop_lock1 =		ffs_lock,
+#ifdef INVARIANTS
+	.vop_unlock =		ffs_unlock_debug,
+#endif
 	.vop_read =		ffs_read,
 	.vop_reallocblks =	ffs_reallocblks,
 	.vop_write =		ffs_write,
@@ -167,12 +182,16 @@ struct vop_vector ffs_vnodeops2 = {
 	.vop_setextattr =	ffs_setextattr,
 	.vop_vptofh =		ffs_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(ffs_vnodeops2);
 
 struct vop_vector ffs_fifoops2 = {
 	.vop_default =		&ufs_fifoops,
 	.vop_fsync =		ffs_fsync,
 	.vop_fdatasync =	ffs_fdatasync,
 	.vop_lock1 =		ffs_lock,
+#ifdef INVARIANTS
+	.vop_unlock =		ffs_unlock_debug,
+#endif
 	.vop_reallocblks =	ffs_reallocblks,
 	.vop_strategy =		ffsext_strategy,
 	.vop_closeextattr =	ffs_closeextattr,
@@ -183,6 +202,7 @@ struct vop_vector ffs_fifoops2 = {
 	.vop_setextattr =	ffs_setextattr,
 	.vop_vptofh =		ffs_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(ffs_fifoops2);
 
 /*
  * Synch an open file.
@@ -219,6 +239,8 @@ retry:
 		}
 		BO_UNLOCK(bo);
 	}
+	if (ffs_fsfail_cleanup(VFSTOUFS(vp->v_mount), 0))
+		return (ENXIO);
 	return (0);
 }
 
@@ -227,6 +249,7 @@ ffs_syncvnode(struct vnode *vp, int waitfor, int flags)
 {
 	struct inode *ip;
 	struct bufobj *bo;
+	struct ufsmount *ump;
 	struct buf *bp, *nbp;
 	ufs_lbn_t lbn;
 	int error, passes;
@@ -235,14 +258,18 @@ ffs_syncvnode(struct vnode *vp, int waitfor, int flags)
 	ip = VTOI(vp);
 	ip->i_flag &= ~IN_NEEDSYNC;
 	bo = &vp->v_bufobj;
+	ump = VFSTOUFS(vp->v_mount);
 
 	/*
 	 * When doing MNT_WAIT we must first flush all dependencies
 	 * on the inode.
 	 */
 	if (DOINGSOFTDEP(vp) && waitfor == MNT_WAIT &&
-	    (error = softdep_sync_metadata(vp)) != 0)
+	    (error = softdep_sync_metadata(vp)) != 0) {
+		if (ffs_fsfail_cleanup(ump, error))
+			error = 0;
 		return (error);
+	}
 
 	/*
 	 * Flush all dirty buffers associated with a vnode.
@@ -312,7 +339,10 @@ loop:
 		}
 		if (wait) {
 			bremfree(bp);
-			if ((error = bwrite(bp)) != 0)
+			error = bwrite(bp);
+			if (ffs_fsfail_cleanup(ump, error))
+				error = 0;
+			if (error != 0)
 				return (error);
 		} else if ((bp->b_flags & B_CLUSTEROK)) {
 			(void) vfs_bio_awrite(bp);
@@ -377,10 +407,6 @@ next:
 			wait = !wait;
 			if (wait || ++passes < UFS_NIADDR + 2)
 				goto loop;
-#ifdef INVARIANTS
-			if (!vn_isdisk(vp, NULL))
-				vn_printf(vp, "ffs_fsync: dirty ");
-#endif
 		}
 	}
 	BO_UNLOCK(bo);
@@ -390,6 +416,8 @@ next:
 			error = ffs_update(vp, 1);
 		if (DOINGSUJ(vp))
 			softdep_journal_fsync(VTOI(vp));
+	} else if ((ip->i_flags & (IN_SIZEMOD | IN_IBLKDATA)) != 0) {
+		error = ffs_update(vp, 1);
 	}
 	return (error);
 }
@@ -417,6 +445,13 @@ ffs_lock(ap)
 	struct lock *lkp;
 	int result;
 
+	/*
+	 * Adaptive spinning mixed with SU leads to trouble. use a giant hammer
+	 * and only use it when LK_NODDLKTREAT is set. Currently this means it
+	 * is only used during path lookup.
+	 */
+	if ((ap->a_flags & LK_NODDLKTREAT) != 0)
+		ap->a_flags |= LK_ADAPTIVE;
 	switch (ap->a_flags & LK_TYPE_MASK) {
 	case LK_SHARED:
 	case LK_UPGRADE:
@@ -425,13 +460,11 @@ ffs_lock(ap)
 		flags = ap->a_flags;
 		for (;;) {
 #ifdef DEBUG_VFS_LOCKS
-			KASSERT(vp->v_holdcnt != 0,
-			    ("ffs_lock %p: zero hold count", vp));
+			VNPASS(vp->v_holdcnt != 0, vp);
 #endif
 			lkp = vp->v_vnlock;
-			result = _lockmgr_args(lkp, flags, VI_MTX(vp),
-			    LK_WMESG_DEFAULT, LK_PRIO_DEFAULT, LK_TIMO_DEFAULT,
-			    ap->a_file, ap->a_line);
+			result = lockmgr_lock_flags(lkp, flags,
+			    &VI_MTX(vp)->lock_object, ap->a_file, ap->a_line);
 			if (lkp == vp->v_vnlock || result != 0)
 				break;
 			/*
@@ -442,9 +475,7 @@ ffs_lock(ap)
 			 * right lock.  Release it, and try to get the
 			 * new lock.
 			 */
-			(void) _lockmgr_args(lkp, LK_RELEASE, NULL,
-			    LK_WMESG_DEFAULT, LK_PRIO_DEFAULT, LK_TIMO_DEFAULT,
-			    ap->a_file, ap->a_line);
+			lockmgr_unlock(lkp);
 			if ((flags & (LK_INTERLOCK | LK_NOWAIT)) ==
 			    (LK_INTERLOCK | LK_NOWAIT))
 				return (EBUSY);
@@ -458,8 +489,53 @@ ffs_lock(ap)
 	}
 	return (result);
 #else
+	/*
+	 * See above for an explanation.
+	 */
+	if ((ap->a_flags & LK_NODDLKTREAT) != 0)
+		ap->a_flags |= LK_ADAPTIVE;
 	return (VOP_LOCK1_APV(&ufs_vnodeops, ap));
 #endif
+}
+
+#ifdef INVARIANTS
+static int
+ffs_unlock_debug(struct vop_unlock_args *ap)
+{
+	struct vnode *vp = ap->a_vp;
+	struct inode *ip = VTOI(vp);
+
+	if (ip->i_flag & UFS_INODE_FLAG_LAZY_MASK_ASSERTABLE) {
+		if ((vp->v_mflag & VMP_LAZYLIST) == 0) {
+			VI_LOCK(vp);
+			VNASSERT((vp->v_mflag & VMP_LAZYLIST), vp,
+			    ("%s: modified vnode (%x) not on lazy list",
+			    __func__, ip->i_flag));
+			VI_UNLOCK(vp);
+		}
+	}
+	return (VOP_UNLOCK_APV(&ufs_vnodeops, ap));
+}
+#endif
+
+static int
+ffs_read_hole(struct uio *uio, long xfersize, long *size)
+{
+	ssize_t saved_resid, tlen;
+	int error;
+
+	while (xfersize > 0) {
+		tlen = min(xfersize, ZERO_REGION_SIZE);
+		saved_resid = uio->uio_resid;
+		error = vn_io_fault_uiomove(__DECONST(void *, zero_region),
+		    tlen, uio);
+		if (error != 0)
+			return (error);
+		tlen = saved_resid - uio->uio_resid;
+		xfersize -= tlen;
+		*size -= tlen;
+	}
+	return (0);
 }
 
 /*
@@ -483,9 +559,7 @@ ffs_read(ap)
 	off_t bytesinfile;
 	long size, xfersize, blkoffset;
 	ssize_t orig_resid;
-	int error;
-	int seqcount;
-	int ioflag;
+	int bflag, error, ioflag, seqcount;
 
 	vp = ap->a_vp;
 	uio = ap->a_uio;
@@ -529,6 +603,7 @@ ffs_read(ap)
 	    uio->uio_offset >= fs->fs_maxfilesize)
 		return (EOVERFLOW);
 
+	bflag = GB_UNMAPPED | (uio->uio_segflg == UIO_NOCOPY ? 0 : GB_NOSPARSE);
 	for (error = 0, bp = NULL; uio->uio_resid > 0; bp = NULL) {
 		if ((bytesinfile = ip->i_size - uio->uio_offset) <= 0)
 			break;
@@ -565,8 +640,7 @@ ffs_read(ap)
 			/*
 			 * Don't do readahead if this is the end of the file.
 			 */
-			error = bread_gb(vp, lbn, size, NOCRED,
-			    GB_UNMAPPED, &bp);
+			error = bread_gb(vp, lbn, size, NOCRED, bflag, &bp);
 		} else if ((vp->v_mount->mnt_flag & MNT_NOCLUSTERR) == 0) {
 			/*
 			 * Otherwise if we are allowed to cluster,
@@ -577,7 +651,7 @@ ffs_read(ap)
 			 */
 			error = cluster_read(vp, ip->i_size, lbn,
 			    size, NOCRED, blkoffset + uio->uio_resid,
-			    seqcount, GB_UNMAPPED, &bp);
+			    seqcount, bflag, &bp);
 		} else if (seqcount > 1) {
 			/*
 			 * If we are NOT allowed to cluster, then
@@ -588,18 +662,22 @@ ffs_read(ap)
 			 * the 6th argument.
 			 */
 			u_int nextsize = blksize(fs, ip, nextlbn);
-			error = breadn_flags(vp, lbn, size, &nextlbn,
-			    &nextsize, 1, NOCRED, GB_UNMAPPED, NULL, &bp);
+			error = breadn_flags(vp, lbn, lbn, size, &nextlbn,
+			    &nextsize, 1, NOCRED, bflag, NULL, &bp);
 		} else {
 			/*
 			 * Failing all of the above, just read what the
 			 * user asked for. Interestingly, the same as
 			 * the first option above.
 			 */
-			error = bread_gb(vp, lbn, size, NOCRED,
-			    GB_UNMAPPED, &bp);
+			error = bread_gb(vp, lbn, size, NOCRED, bflag, &bp);
 		}
-		if (error) {
+		if (error == EJUSTRETURN) {
+			error = ffs_read_hole(uio, xfersize, &size);
+			if (error == 0)
+				continue;
+		}
+		if (error != 0) {
 			brelse(bp);
 			bp = NULL;
 			break;
@@ -642,12 +720,8 @@ ffs_read(ap)
 		vfs_bio_brelse(bp, ioflag);
 
 	if ((error == 0 || uio->uio_resid != orig_resid) &&
-	    (vp->v_mount->mnt_flag & (MNT_NOATIME | MNT_RDONLY)) == 0 &&
-	    (ip->i_flag & IN_ACCESS) == 0) {
-		VI_LOCK(vp);
-		ip->i_flag |= IN_ACCESS;
-		VI_UNLOCK(vp);
-	}
+	    (vp->v_mount->mnt_flag & (MNT_NOATIME | MNT_RDONLY)) == 0)
+		UFS_INODE_SET_FLAG_SHARED(ip, IN_ACCESS);
 	return (error);
 }
 
@@ -763,6 +837,7 @@ ffs_write(ap)
 		if (uio->uio_offset + xfersize > ip->i_size) {
 			ip->i_size = uio->uio_offset + xfersize;
 			DIP_SET(ip, i_size, ip->i_size);
+			UFS_INODE_SET_FLAG(ip, IN_SIZEMOD | IN_CHANGE);
 		}
 
 		size = blksize(fs, ip, lbn) - bp->b_resid;
@@ -830,7 +905,7 @@ ffs_write(ap)
 		}
 		if (error || xfersize == 0)
 			break;
-		ip->i_flag |= IN_CHANGE | IN_UPDATE;
+		UFS_INODE_SET_FLAG(ip, IN_CHANGE | IN_UPDATE);
 	}
 	/*
 	 * If we successfully wrote any data, and we are not the superuser
@@ -839,9 +914,11 @@ ffs_write(ap)
 	 */
 	if ((ip->i_mode & (ISUID | ISGID)) && resid > uio->uio_resid &&
 	    ap->a_cred) {
-		if (priv_check_cred(ap->a_cred, PRIV_VFS_RETAINSUGID, 0)) {
-			ip->i_mode &= ~(ISUID | ISGID);
+		if (priv_check_cred(ap->a_cred, PRIV_VFS_RETAINSUGID)) {
+			vn_seqc_write_begin(vp);
+			UFS_INODE_SET_MODE(ip, ip->i_mode & ~(ISUID | ISGID));
 			DIP_SET(ip, i_mode, ip->i_mode);
+			vn_seqc_write_end(vp);
 		}
 	}
 	if (error) {
@@ -851,8 +928,11 @@ ffs_write(ap)
 			uio->uio_offset -= resid - uio->uio_resid;
 			uio->uio_resid = resid;
 		}
-	} else if (resid > uio->uio_resid && (ioflag & IO_SYNC))
+	} else if (resid > uio->uio_resid && (ioflag & IO_SYNC)) {
 		error = ffs_update(vp, 1);
+		if (ffs_fsfail_cleanup(VFSTOUFS(vp->v_mount), error))
+			error = ENXIO;
+	}
 	return (error);
 }
 
@@ -1043,8 +1123,10 @@ ffs_extwrite(struct vnode *vp, struct uio *uio, int ioflag, struct ucred *ucred)
 		if ((bp->b_flags & B_CACHE) == 0 && fs->fs_bsize <= xfersize)
 			vfs_bio_clrbuf(bp);
 
-		if (uio->uio_offset + xfersize > dp->di_extsize)
+		if (uio->uio_offset + xfersize > dp->di_extsize) {
 			dp->di_extsize = uio->uio_offset + xfersize;
+			UFS_INODE_SET_FLAG(ip, IN_SIZEMOD | IN_CHANGE);
+		}
 
 		size = sblksize(fs, dp->di_extsize, lbn) - bp->b_resid;
 		if (size < xfersize)
@@ -1073,7 +1155,7 @@ ffs_extwrite(struct vnode *vp, struct uio *uio, int ioflag, struct ucred *ucred)
 			bdwrite(bp);
 		if (error || xfersize == 0)
 			break;
-		ip->i_flag |= IN_CHANGE;
+		UFS_INODE_SET_FLAG(ip, IN_CHANGE);
 	}
 	/*
 	 * If we successfully wrote any data, and we are not the superuser
@@ -1081,9 +1163,11 @@ ffs_extwrite(struct vnode *vp, struct uio *uio, int ioflag, struct ucred *ucred)
 	 * tampering.
 	 */
 	if ((ip->i_mode & (ISUID | ISGID)) && resid > uio->uio_resid && ucred) {
-		if (priv_check_cred(ucred, PRIV_VFS_RETAINSUGID, 0)) {
-			ip->i_mode &= ~(ISUID | ISGID);
+		if (priv_check_cred(ucred, PRIV_VFS_RETAINSUGID)) {
+			vn_seqc_write_begin(vp);
+			UFS_INODE_SET_MODE(ip, ip->i_mode & ~(ISUID | ISGID));
 			dp->di_mode = ip->i_mode;
+			vn_seqc_write_end(vp);
 		}
 	}
 	if (error) {
@@ -1180,11 +1264,11 @@ ffs_lock_ea(struct vnode *vp)
 	ip = VTOI(vp);
 	VI_LOCK(vp);
 	while (ip->i_flag & IN_EA_LOCKED) {
-		ip->i_flag |= IN_EA_LOCKWAIT;
+		UFS_INODE_SET_FLAG(ip, IN_EA_LOCKWAIT);
 		msleep(&ip->i_ea_refs, &vp->v_interlock, PINOD + 2, "ufs_ea",
 		    0);
 	}
-	ip->i_flag |= IN_EA_LOCKED;
+	UFS_INODE_SET_FLAG(ip, IN_EA_LOCKED);
 	VI_UNLOCK(vp);
 }
 
@@ -1724,3 +1808,32 @@ ffs_getpages(struct vop_getpages_args *ap)
 	return (vfs_bio_getpages(vp, ap->a_m, ap->a_count, ap->a_rbehind,
 	    ap->a_rahead, ffs_gbp_getblkno, ffs_gbp_getblksz));
 }
+
+static int
+ffs_getpages_async(struct vop_getpages_async_args *ap)
+{
+	struct vnode *vp;
+	struct ufsmount *um;
+	bool do_iodone;
+	int error;
+
+	vp = ap->a_vp;
+	um = VFSTOUFS(vp->v_mount);
+	do_iodone = true;
+
+	if (um->um_devvp->v_bufobj.bo_bsize <= PAGE_SIZE) {
+		error = vnode_pager_generic_getpages(vp, ap->a_m, ap->a_count,
+		    ap->a_rbehind, ap->a_rahead, ap->a_iodone, ap->a_arg);
+		if (error == 0)
+			do_iodone = false;
+	} else {
+		error = vfs_bio_getpages(vp, ap->a_m, ap->a_count,
+		    ap->a_rbehind, ap->a_rahead, ffs_gbp_getblkno,
+		    ffs_gbp_getblksz);
+	}
+	if (do_iodone && ap->a_iodone != NULL)
+		ap->a_iodone(ap->a_arg, ap->a_m, ap->a_count, error);
+
+	return (error);
+}
+

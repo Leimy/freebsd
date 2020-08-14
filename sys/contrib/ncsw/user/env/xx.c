@@ -95,8 +95,6 @@ MTX_SYSINIT(XX_MallocTrackLockInit, &XX_MallocTrackLock,
 
 /* Interrupt info */
 #define XX_INTR_FLAG_PREALLOCATED	(1 << 0)
-#define XX_INTR_FLAG_BOUND		(1 << 1)
-#define XX_INTR_FLAG_FMAN_FIX		(1 << 2)
 
 struct XX_IntrInfo {
 	driver_intr_t	*handler;
@@ -288,33 +286,10 @@ XX_IsPortalIntr(uintptr_t irq)
 {
 	int cpu, type;
 	/* Check interrupt numbers of all available portals */
-	for (cpu = 0, type = 0; XX_PInfo.portal_intr[type][cpu] != 0; cpu++) {
-		if (irq == XX_PInfo.portal_intr[type][cpu]) {
-			/* Found it! */
-			return (1);
-		}
-		if (XX_PInfo.portal_intr[type][cpu + 1] == 0) {
-			type++;
-			cpu = 0;
-		}
-	}
-
-	return (0);
-}
-
-void
-XX_FmanFixIntr(int irq)
-{
-
-	XX_IntrInfo[irq].flags |= XX_INTR_FLAG_FMAN_FIX;
-}
-
-static bool
-XX_FmanNeedsIntrFix(int irq)
-{
-
-	if (XX_IntrInfo[irq].flags & XX_INTR_FLAG_FMAN_FIX)
-		return (1);
+	for (type = 0; type < 2; type++)
+		for (cpu = 0; cpu < MAXCPU; cpu++)
+			if (irq == XX_PInfo.portal_intr[type][cpu])
+				return (1);
 
 	return (0);
 }
@@ -326,16 +301,6 @@ XX_Dispatch(void *arg)
 
 	info = arg;
 
-	/* Bind this thread to proper CPU when SMP has been already started. */
-	if ((info->flags & XX_INTR_FLAG_BOUND) == 0 && smp_started &&
-	    info->cpu >= 0) {
-		thread_lock(curthread);
-		sched_bind(curthread, info->cpu);
-		thread_unlock(curthread);
-
-		info->flags |= XX_INTR_FLAG_BOUND;
-	}
-
 	if (info->handler == NULL) {
 		printf("%s(): IRQ handler is NULL!\n", __func__);
 		return;
@@ -345,7 +310,7 @@ XX_Dispatch(void *arg)
 }
 
 t_Error
-XX_PreallocAndBindIntr(uintptr_t irq, unsigned int cpu)
+XX_PreallocAndBindIntr(device_t dev, uintptr_t irq, unsigned int cpu)
 {
 	struct resource *r;
 	unsigned int inum;
@@ -355,6 +320,10 @@ XX_PreallocAndBindIntr(uintptr_t irq, unsigned int cpu)
 	inum = rman_get_start(r);
 
 	error = XX_SetIntr(irq, XX_Dispatch, &XX_IntrInfo[inum]);
+	if (error != 0)
+		return (error);
+
+	error = bus_bind_intr(dev, r, cpu);
 	if (error != 0)
 		return (error);
 
@@ -411,21 +380,7 @@ XX_SetIntr(uintptr_t irq, t_Isr *f_Isr, t_Handle handle)
 
 	err = bus_setup_intr(dev, r, flags, NULL, f_Isr, handle,
 		    &XX_IntrInfo[irq].cookie);
-	if (err)
-		goto finish;
 
-	/*
-	 * XXX: Bind FMan IRQ to CPU0. Current interrupt subsystem directs each
-	 * interrupt to all CPUs. Race between an interrupt assertion and
-	 * masking may occur and interrupt handler may be called multiple times
-	 * per one interrupt. FMan doesn't support such a situation. Workaround
-	 * is to bind FMan interrupt to one CPU0 only.
-	 */
-#ifdef SMP
-	if (XX_FmanNeedsIntrFix(irq))
-		err = powerpc_bind_intr(irq, 0);
-#endif
-finish:
 	return (err);
 }
 
@@ -646,7 +601,7 @@ XX_IpcInitSession(char destAddr[XX_IPC_MAX_ADDR_NAME_LENGTH],
 
 	/* Should not be called */
 	printf("NetCommSW: Unimplemented function %s() called!\n", __func__);
-	return (E_OK);
+	return (NULL);
 }
 
 t_Error
@@ -701,10 +656,15 @@ XX_VirtToPhys(void *addr)
 		return (XX_PInfo.portal_ci_pa[QM_PORTAL][cpu] +
 		    (vm_offset_t)addr - XX_PInfo.portal_ci_va[QM_PORTAL]);
 
-	paddr = pmap_kextract((vm_offset_t)addr);
+	if (PMAP_HAS_DMAP && (vm_offset_t)addr >= DMAP_BASE_ADDRESS &&
+	    (vm_offset_t)addr <= DMAP_MAX_ADDRESS)
+		return (DMAP_TO_PHYS((vm_offset_t)addr));
+	else
+		paddr = pmap_kextract((vm_offset_t)addr);
+
 	if (paddr == 0)
 		printf("NetCommSW: "
-		    "Unable to translate virtual address 0x%08X!\n", addr);
+		    "Unable to translate virtual address %p!\n", addr);
 	else
 		pmap_track_page(kernel_pmap, (vm_offset_t)addr);
 
@@ -757,8 +717,11 @@ XX_PhysToVirt(physAddress_t addr)
 	if (pv != NULL)
 		return ((void *)(pv->pv_va + ((vm_offset_t)addr & PAGE_MASK)));
 
+	if (PMAP_HAS_DMAP)
+		return ((void *)(uintptr_t)PHYS_TO_DMAP(addr));
+
 	printf("NetCommSW: "
-	    "Unable to translate physical address 0x%08llX!\n", addr);
+	    "Unable to translate physical address 0x%09jx!\n", (uintmax_t)addr);
 
 	return (NULL);
 }

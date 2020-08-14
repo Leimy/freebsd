@@ -52,9 +52,12 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/kernel.h>
+#include <sys/epoch.h>
+#include <sys/eventhandler.h>
 #include <sys/exec.h>
 #include <sys/file.h>
 #include <sys/filedesc.h>
+#include <sys/imgact.h>
 #include <sys/jail.h>
 #include <sys/ktr.h>
 #include <sys/lock.h>
@@ -105,6 +108,13 @@ struct thread0_storage thread0_st __aligned(32);
 struct	vmspace vmspace0;
 struct	proc *initproc;
 
+int
+linux_alloc_current_noop(struct thread *td __unused, int flags __unused)
+{
+	return (0);
+}
+int (*lkpi_alloc_current)(struct thread *, int) = linux_alloc_current_noop;
+
 #ifndef BOOTHOWTO
 #define	BOOTHOWTO	0
 #endif
@@ -118,6 +128,18 @@ SYSCTL_INT(_debug, OID_AUTO, boothowto, CTLFLAG_RD, &boothowto, 0,
 int	bootverbose = BOOTVERBOSE;
 SYSCTL_INT(_debug, OID_AUTO, bootverbose, CTLFLAG_RW, &bootverbose, 0,
 	"Control the output of verbose kernel messages");
+
+#ifdef VERBOSE_SYSINIT
+/*
+ * We'll use the defined value of VERBOSE_SYSINIT from the kernel config to
+ * dictate the default VERBOSE_SYSINIT behavior.  Significant values for this
+ * option and associated tunable are:
+ * - 0, 'compiled in but silent by default'
+ * - 1, 'compiled in but verbose by default' (default)
+ */
+int	verbose_sysinit = VERBOSE_SYSINIT;
+TUNABLE_INT("debug.verbose_sysinit", &verbose_sysinit);
+#endif
 
 #ifdef INVARIANTS
 FEATURE(invariants, "Kernel compiled with INVARIANTS, may affect performance");
@@ -137,11 +159,6 @@ SYSINIT(placeholder, SI_SUB_DUMMY, SI_ORDER_ANY, NULL, NULL);
 SET_DECLARE(sysinit_set, struct sysinit);
 struct sysinit **sysinit, **sysinit_end;
 struct sysinit **newsysinit, **newsysinit_end;
-
-EVENTHANDLER_LIST_DECLARE(process_init);
-EVENTHANDLER_LIST_DECLARE(thread_init);
-EVENTHANDLER_LIST_DECLARE(process_ctor);
-EVENTHANDLER_LIST_DECLARE(thread_ctor);
 
 /*
  * Merge a new sysinit set into the current set, reallocating it if
@@ -268,7 +285,7 @@ restart:
 			continue;
 
 #if defined(VERBOSE_SYSINIT)
-		if ((*sipp)->subsystem > last) {
+		if ((*sipp)->subsystem > last && verbose_sysinit != 0) {
 			verbose = 1;
 			last = (*sipp)->subsystem;
 			printf("subsystem %x\n", last);
@@ -355,18 +372,18 @@ SYSINIT(version, SI_SUB_COPYRIGHT, SI_ORDER_THIRD, print_version, NULL);
 #ifdef WITNESS
 static char wit_warn[] =
      "WARNING: WITNESS option enabled, expect reduced performance.\n";
-SYSINIT(witwarn, SI_SUB_COPYRIGHT, SI_ORDER_THIRD + 1,
+SYSINIT(witwarn, SI_SUB_COPYRIGHT, SI_ORDER_FOURTH,
    print_caddr_t, wit_warn);
-SYSINIT(witwarn2, SI_SUB_LAST, SI_ORDER_THIRD + 1,
+SYSINIT(witwarn2, SI_SUB_LAST, SI_ORDER_FOURTH,
    print_caddr_t, wit_warn);
 #endif
 
 #ifdef DIAGNOSTIC
 static char diag_warn[] =
      "WARNING: DIAGNOSTIC option enabled, expect reduced performance.\n";
-SYSINIT(diagwarn, SI_SUB_COPYRIGHT, SI_ORDER_THIRD + 2,
+SYSINIT(diagwarn, SI_SUB_COPYRIGHT, SI_ORDER_FIFTH,
     print_caddr_t, diag_warn);
-SYSINIT(diagwarn2, SI_SUB_LAST, SI_ORDER_THIRD + 2,
+SYSINIT(diagwarn2, SI_SUB_LAST, SI_ORDER_FIFTH,
     print_caddr_t, diag_warn);
 #endif
 
@@ -387,7 +404,6 @@ null_set_syscall_retval(struct thread *td __unused, int error __unused)
 struct sysentvec null_sysvec = {
 	.sv_size	= 0,
 	.sv_table	= NULL,
-	.sv_mask	= 0,
 	.sv_errsize	= 0,
 	.sv_errtbl	= NULL,
 	.sv_transtrap	= NULL,
@@ -399,7 +415,6 @@ struct sysentvec null_sysvec = {
 	.sv_coredump	= NULL,
 	.sv_imgact_try	= NULL,
 	.sv_minsigstksz	= 0,
-	.sv_pagesize	= PAGE_SIZE,
 	.sv_minuser	= VM_MIN_ADDRESS,
 	.sv_maxuser	= VM_MAXUSER_ADDRESS,
 	.sv_usrstack	= USRSTACK,
@@ -441,7 +456,7 @@ proc0_init(void *dummy __unused)
 	GIANT_REQUIRED;
 	p = &proc0;
 	td = &thread0;
-	
+
 	/*
 	 * Initialize magic number and osrel.
 	 */
@@ -502,6 +517,7 @@ proc0_init(void *dummy __unused)
 	p->p_peers = 0;
 	p->p_leader = p;
 	p->p_reaper = p;
+	p->p_treeflag |= P_TREE_REAPER;
 	LIST_INIT(&p->p_reaplist);
 
 	strncpy(p->p_comm, "kernel", sizeof (p->p_comm));
@@ -525,7 +541,10 @@ proc0_init(void *dummy __unused)
 	/* End hack. creds get properly set later with thread_cow_get_proc */
 	curthread->td_ucred = NULL;
 	newcred->cr_prison = &prison0;
+	newcred->cr_users++; /* avoid assertion failure */
 	proc_set_cred_init(p, newcred);
+	newcred->cr_users--;
+	crfree(newcred);
 #ifdef AUDIT
 	audit_cred_kproc0(newcred);
 #endif
@@ -539,7 +558,7 @@ proc0_init(void *dummy __unused)
 	siginit(&proc0);
 
 	/* Create the file descriptor table. */
-	p->p_fd = fdinit(NULL, false);
+	p->p_fd = fdinit(NULL, false, NULL);
 	p->p_fdtol = NULL;
 
 	/* Create the limits structures. */
@@ -607,7 +626,6 @@ SYSINIT(p0init, SI_SUB_INTRINSIC, SI_ORDER_FIRST, proc0_init, NULL);
 static void
 proc0_post(void *dummy __unused)
 {
-	struct timespec ts;
 	struct proc *p;
 	struct rusage ru;
 	struct thread *td;
@@ -618,42 +636,29 @@ proc0_post(void *dummy __unused)
 	 */
 	sx_slock(&allproc_lock);
 	FOREACH_PROC_IN_SYSTEM(p) {
+		PROC_LOCK(p);
+		if (p->p_state == PRS_NEW) {
+			PROC_UNLOCK(p);
+			continue;
+		}
 		microuptime(&p->p_stats->p_start);
 		PROC_STATLOCK(p);
 		rufetch(p, &ru);	/* Clears thread stats */
-		PROC_STATUNLOCK(p);
 		p->p_rux.rux_runtime = 0;
 		p->p_rux.rux_uticks = 0;
 		p->p_rux.rux_sticks = 0;
 		p->p_rux.rux_iticks = 0;
+		PROC_STATUNLOCK(p);
 		FOREACH_THREAD_IN_PROC(p, td) {
 			td->td_runtime = 0;
 		}
+		PROC_UNLOCK(p);
 	}
 	sx_sunlock(&allproc_lock);
 	PCPU_SET(switchtime, cpu_ticks());
 	PCPU_SET(switchticks, ticks);
-
-	/*
-	 * Give the ``random'' number generator a thump.
-	 */
-	nanotime(&ts);
-	srandom(ts.tv_sec ^ ts.tv_nsec);
 }
 SYSINIT(p0post, SI_SUB_INTRINSIC_POST, SI_ORDER_FIRST, proc0_post, NULL);
-
-static void
-random_init(void *dummy __unused)
-{
-
-	/*
-	 * After CPU has been started we have some randomness on most
-	 * platforms via get_cyclecount().  For platforms that don't
-	 * we will reseed random(9) in proc0_post() as well.
-	 */
-	srandom(get_cyclecount());
-}
-SYSINIT(random, SI_SUB_RANDOM, SI_ORDER_FIRST, random_init, NULL);
 
 /*
  ***************************************************************************
@@ -695,17 +700,13 @@ SYSCTL_INT(_kern, OID_AUTO, init_shutdown_timeout,
 static void
 start_init(void *dummy)
 {
-	vm_offset_t addr;
-	struct execve_args args;
-	int options, error;
-	char *var, *path, *next, *s;
-	char *ucp, **uap, *arg0, *arg1;
+	struct image_args args;
+	int error;
+	char *var, *path;
+	char *free_init_path, *tmp_init_path;
 	struct thread *td;
 	struct proc *p;
-
-	mtx_lock(&Giant);
-
-	GIANT_REQUIRED;
+	struct vmspace *oldvmspace;
 
 	TSENTER();	/* Here so we don't overlap with mi_startup. */
 
@@ -717,81 +718,32 @@ start_init(void *dummy)
 	/* Wipe GELI passphrase from the environment. */
 	kern_unsetenv("kern.geom.eli.passphrase");
 
-	/*
-	 * Need just enough stack to hold the faked-up "execve()" arguments.
-	 */
-	addr = p->p_sysent->sv_usrstack - PAGE_SIZE;
-	if (vm_map_find(&p->p_vmspace->vm_map, NULL, 0, &addr, PAGE_SIZE, 0,
-	    VMFS_NO_SPACE, VM_PROT_ALL, VM_PROT_ALL, 0) != 0)
-		panic("init: couldn't allocate argument space");
-	p->p_vmspace->vm_maxsaddr = (caddr_t)addr;
-	p->p_vmspace->vm_ssize = 1;
-
 	if ((var = kern_getenv("init_path")) != NULL) {
 		strlcpy(init_path, var, sizeof(init_path));
 		freeenv(var);
 	}
+	free_init_path = tmp_init_path = strdup(init_path, M_TEMP);
 	
-	for (path = init_path; *path != '\0'; path = next) {
-		while (*path == ':')
-			path++;
-		if (*path == '\0')
-			break;
-		for (next = path; *next != '\0' && *next != ':'; next++)
-			/* nothing */ ;
+	while ((path = strsep(&tmp_init_path, ":")) != NULL) {
 		if (bootverbose)
-			printf("start_init: trying %.*s\n", (int)(next - path),
-			    path);
+			printf("start_init: trying %s\n", path);
 			
-		/*
-		 * Move out the boot flag argument.
-		 */
-		options = 0;
-		ucp = (char *)p->p_sysent->sv_usrstack;
-		(void)subyte(--ucp, 0);		/* trailing zero */
-		if (boothowto & RB_SINGLE) {
-			(void)subyte(--ucp, 's');
-			options = 1;
-		}
-#ifdef notyet
-                if (boothowto & RB_FASTBOOT) {
-			(void)subyte(--ucp, 'f');
-			options = 1;
-		}
-#endif
+		memset(&args, 0, sizeof(args));
+		error = exec_alloc_args(&args);
+		if (error != 0)
+			panic("%s: Can't allocate space for init arguments %d",
+			    __func__, error);
 
-#ifdef BOOTCDROM
-		(void)subyte(--ucp, 'C');
-		options = 1;
-#endif
-
-		if (options == 0)
-			(void)subyte(--ucp, '-');
-		(void)subyte(--ucp, '-');		/* leading hyphen */
-		arg1 = ucp;
-
-		/*
-		 * Move out the file name (also arg 0).
-		 */
-		(void)subyte(--ucp, 0);
-		for (s = next - 1; s >= path; s--)
-			(void)subyte(--ucp, *s);
-		arg0 = ucp;
-
-		/*
-		 * Move out the arg pointers.
-		 */
-		uap = (char **)rounddown2((intptr_t)ucp, sizeof(intptr_t));
-		(void)suword((caddr_t)--uap, (long)0);	/* terminator */
-		(void)suword((caddr_t)--uap, (long)(intptr_t)arg1);
-		(void)suword((caddr_t)--uap, (long)(intptr_t)arg0);
-
-		/*
-		 * Point at the arguments.
-		 */
-		args.fname = arg0;
-		args.argv = uap;
-		args.envv = NULL;
+		error = exec_args_add_fname(&args, path, UIO_SYSSPACE);
+		if (error != 0)
+			panic("%s: Can't add fname %d", __func__, error);
+		error = exec_args_add_arg(&args, path, UIO_SYSSPACE);
+		if (error != 0)
+			panic("%s: Can't add argv[0] %d", __func__, error);
+		if (boothowto & RB_SINGLE)
+			error = exec_args_add_arg(&args, "-s", UIO_SYSSPACE);
+		if (error != 0)
+			panic("%s: Can't add argv[0] %d", __func__, error);
 
 		/*
 		 * Now try to exec the program.  If can't for any reason
@@ -800,25 +752,35 @@ start_init(void *dummy)
 		 * Otherwise, return via fork_trampoline() all the way
 		 * to user mode as init!
 		 */
-		if ((error = sys_execve(td, &args)) == EJUSTRETURN) {
-			mtx_unlock(&Giant);
+		KASSERT((td->td_pflags & TDP_EXECVMSPC) == 0,
+		    ("nested execve"));
+		oldvmspace = td->td_proc->p_vmspace;
+		error = kern_execve(td, &args, NULL);
+		KASSERT(error != 0,
+		    ("kern_execve returned success, not EJUSTRETURN"));
+		if (error == EJUSTRETURN) {
+			if ((td->td_pflags & TDP_EXECVMSPC) != 0) {
+				KASSERT(p->p_vmspace != oldvmspace,
+				    ("oldvmspace still used"));
+				vmspace_free(oldvmspace);
+				td->td_pflags &= ~TDP_EXECVMSPC;
+			}
+			free(free_init_path, M_TEMP);
 			TSEXIT();
 			return;
 		}
 		if (error != ENOENT)
-			printf("exec %.*s: error %d\n", (int)(next - path), 
-			    path, error);
+			printf("exec %s: error %d\n", path, error);
 	}
+	free(free_init_path, M_TEMP);
 	printf("init: not found in path %s\n", init_path);
 	panic("no init");
 }
 
 /*
- * Like kproc_create(), but runs in its own address space.
- * We do this early to reserve pid 1.
- *
- * Note special case - do not make it runnable yet.  Other work
- * in progress will change this more.
+ * Like kproc_create(), but runs in its own address space.  We do this
+ * early to reserve pid 1.  Note special case - do not make it
+ * runnable yet, init execution is started when userspace can be served.
  */
 static void
 create_init(const void *udata __unused)
@@ -841,7 +803,6 @@ create_init(const void *udata __unused)
 	PROC_LOCK(initproc);
 	initproc->p_flag |= P_SYSTEM | P_INMEM;
 	initproc->p_treeflag |= P_TREE_REAPER;
-	LIST_INSERT_HEAD(&initproc->p_reaplist, &proc0, p_reapsibling);
 	oldcred = initproc->p_ucred;
 	crcopy(newcred, oldcred);
 #ifdef MAC
@@ -852,8 +813,9 @@ create_init(const void *udata __unused)
 #endif
 	proc_set_cred(initproc, newcred);
 	td = FIRST_THREAD_IN_PROC(initproc);
-	crfree(td->td_ucred);
-	td->td_ucred = crhold(initproc->p_ucred);
+	crcowfree(td);
+	td->td_realucred = crcowget(initproc->p_ucred);
+	td->td_ucred = td->td_realucred;
 	PROC_UNLOCK(initproc);
 	sx_xunlock(&proctree_lock);
 	crfree(oldcred);
@@ -874,6 +836,5 @@ kick_init(const void *udata __unused)
 	thread_lock(td);
 	TD_SET_CAN_RUN(td);
 	sched_add(td, SRQ_BORING);
-	thread_unlock(td);
 }
 SYSINIT(kickinit, SI_SUB_KTHREAD_INIT, SI_ORDER_MIDDLE, kick_init, NULL);

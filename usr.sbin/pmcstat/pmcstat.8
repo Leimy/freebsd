@@ -25,7 +25,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd November 18, 2015
+.Dd August 5, 2020
 .Dt PMCSTAT 8
 .Os
 .Sh NAME
@@ -33,11 +33,14 @@
 .Nd "performance measurement with performance monitoring hardware"
 .Sh SYNOPSIS
 .Nm
+.Op Fl A
 .Op Fl C
 .Op Fl D Ar pathname
 .Op Fl E
 .Op Fl F Ar pathname
 .Op Fl G Ar pathname
+.Op Fl I
+.Op Fl L
 .Op Fl M Ar mapfilename
 .Op Fl N
 .Op Fl O Ar logfilename
@@ -45,6 +48,7 @@
 .Op Fl R Ar logfilename
 .Op Fl S Ar event-spec
 .Op Fl T
+.Op Fl U
 .Op Fl W
 .Op Fl a Ar pathname
 .Op Fl c Ar cpu-spec
@@ -52,6 +56,7 @@
 .Op Fl e
 .Op Fl f Ar pluginopt
 .Op Fl g
+.Op Fl i Ar lwp
 .Op Fl k Ar kerneldir
 .Op Fl l Ar secs
 .Op Fl m Ar pathname
@@ -62,6 +67,7 @@
 .Op Fl r Ar fsroot
 .Op Fl s Ar event-spec
 .Op Fl t Ar process-spec
+.Op Fl u Ar event-spec
 .Op Fl v
 .Op Fl w Ar secs
 .Op Fl z Ar graphdepth
@@ -118,6 +124,8 @@ process' current and future children.
 .Sh OPTIONS
 The following options are available:
 .Bl -tag -width indent
+.It Fl A
+Skip symbol lookup and display address instead.
 .It Fl C
 Toggle between showing cumulative or incremental counts for
 subsequent counting mode PMCs specified on the command line.
@@ -155,6 +163,10 @@ is a
 this information is sent to the output file specified by the
 .Fl o
 option.
+.It Fl I
+Show the offset of the instruction pointer into the symbol.
+.It Fl L
+List all event names.
 .It Fl M Ar mapfilename
 Write the mapping between executable objects encountered in the event
 log and the abbreviated pathnames used for
@@ -213,10 +225,14 @@ specified in
 .Ar event-spec .
 .It Fl T
 Use a top like mode for sampling PMCs. The following hotkeys
-can be used: 'c+a' switch to accumulative mode, 'c+d' switch
-to delta mode, 'm' merge PMCs, 'n' change view, 'p' show next
-PMC, ' ' pause, 'q' quit. calltree only: 'f' cost under threshold
-is seen as a dot.
+can be used: 'A' toggle symbol resolution, 'c+a' switch to accumulative mode, 'c+d'
+switch to delta mode, 'I' toggle showing offsets into symbols, 'm' merge PMCs, 'n'
+change view, 'p' show next PMC, ' ' pause, 'q' quit. calltree only: 'f' cost under
+threshold is seen as a dot.
+.It Fl U
+Toggle capturing user-space call traces while in kernel mode.
+The default is for sampling PMCs to capture user-space callchain information
+while in user-space mode, and kernel callchain information while in kernel mode.
 .It Fl W
 Toggle logging the incremental counts seen by the threads of a
 tracked process each time they are scheduled on a CPU.
@@ -280,6 +296,13 @@ A separate profile file is generated for each executable object
 encountered.
 Profile files are placed in sub-directories named by their PMC
 event name.
+.It Fl i Ar lwp
+Filter on thread ID
+.Ar lwp ,
+which you can get from
+.Xr ps 1
+.Fl o
+.Li lwp .
 .It Fl k Ar kerneldir
 Set the pathname of the kernel directory to argument
 .Ar kerneldir .
@@ -289,6 +312,8 @@ should look for the kernel and its modules.
 The default is to use the path of the running kernel obtained from the
 .Va kern.bootfile
 sysctl.
+Modules will also be searched for in /boot/modules if not found in
+.Ar kerneldir .
 .It Fl l Ar secs
 Set system-wide performance measurement duration for
 .Ar secs
@@ -352,6 +377,8 @@ Argument
 .Ar process-spec
 may be a non-negative integer denoting a specific process id, or a
 regular expression for selecting processes based on their command names.
+.It Fl u Ar event-spec
+Provide short description of event.
 .It Fl v
 Increase verbosity.
 .It Fl w Ar secs

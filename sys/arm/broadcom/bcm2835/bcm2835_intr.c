@@ -230,7 +230,7 @@ bcm2835_intc_intr(void *arg)
 		}
 		arm_irq_memory_barrier(0); /* XXX */
 	}
-	if (num == 0)
+	if (num == 0 && bootverbose)
 		device_printf(sc->sc_dev, "Spurious interrupt detected\n");
 
 	return (FILTER_HANDLED);
@@ -452,4 +452,4 @@ static driver_t bcm_intc_driver = {
 static devclass_t bcm_intc_devclass;
 
 EARLY_DRIVER_MODULE(intc, simplebus, bcm_intc_driver, bcm_intc_devclass,
-    0, 0, BUS_PASS_INTERRUPT + BUS_PASS_ORDER_LATE);
+    0, 0, BUS_PASS_INTERRUPT + BUS_PASS_ORDER_MIDDLE);

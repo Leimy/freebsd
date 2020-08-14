@@ -1,8 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 1997, Stefan Esser <se@freebsd.org>
- * All rights reserved.
+ * Copyright 1997, Stefan Esser <se@freebsd.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -33,7 +32,7 @@
 #define	_PCIVAR_H_
 
 #include <sys/queue.h>
-#include <sys/eventhandler.h>
+#include <sys/_eventhandler.h>
 
 /* some PCI bus constants */
 #define	PCI_MAXMAPS_0	6	/* max. no. of memory/port maps */
@@ -258,6 +257,74 @@ typedef struct {
 } pcih2cfgregs;
 
 extern uint32_t pci_numdevs;
+extern int pci_enable_aspm;
+
+/*
+ * The bitfield has to be stable and match the fields below (so that
+ * match_flag_vendor must be bit 0) so we have to do the endian dance. We can't
+ * use enums or #define constants because then the macros for subsetting matches
+ * wouldn't work. These tables are parsed by devmatch and others to connect
+ * modules with devices on the PCI bus.
+ */
+struct pci_device_table {
+#if BYTE_ORDER == LITTLE_ENDIAN
+	uint16_t
+		match_flag_vendor:1,
+		match_flag_device:1,
+		match_flag_subvendor:1,
+		match_flag_subdevice:1,
+		match_flag_class:1,
+		match_flag_subclass:1,
+		match_flag_revid:1,
+		match_flag_unused:9;
+#else
+	uint16_t
+		match_flag_unused:9,
+		match_flag_revid:1,
+		match_flag_subclass:1,
+		match_flag_class:1,
+		match_flag_subdevice:1,
+		match_flag_subvendor:1,
+		match_flag_device:1,
+		match_flag_vendor:1;
+#endif
+	uint16_t	vendor;
+	uint16_t	device;
+	uint16_t	subvendor;
+	uint16_t	subdevice;
+	uint16_t	class_id;
+	uint16_t	subclass;
+	uint16_t	revid;
+	uint16_t	unused;
+	uintptr_t	driver_data;
+	char		*descr;
+};
+
+#define	PCI_DEV(v, d)							\
+	.match_flag_vendor = 1, .vendor = (v),				\
+	.match_flag_device = 1, .device = (d)
+#define	PCI_SUBDEV(sv, sd)						\
+	.match_flag_subvendor = 1, .subvendor = (sv),			\
+	.match_flag_subdevice = 1, .subdevice = (sd)
+#define	PCI_CLASS(x)							\
+	.match_flag_class = 1, .class_id = (x)
+#define	PCI_SUBCLASS(x)							\
+	.match_flag_subclass = 1, .subclass = (x)
+#define	PCI_REVID(x)							\
+	.match_flag_revid = 1, .revid = (x)
+#define	PCI_DESCR(x)							\
+	.descr = (x)
+#define PCI_PNP_STR							\
+	"M16:mask;U16:vendor;U16:device;U16:subvendor;U16:subdevice;"	\
+	"U16:class;U16:subclass;U16:revid;"
+#define PCI_PNP_INFO(table)						\
+	MODULE_PNP_INFO(PCI_PNP_STR, pci, table, table,			\
+	    sizeof(table) / sizeof(table[0]))
+
+const struct pci_device_table *pci_match_device(device_t child,
+    const struct pci_device_table *id, size_t nelt);
+#define PCI_MATCH(child, table) \
+	pci_match_device(child, (table), nitems(table));
 
 /* Only if the prerequisites are present */
 #if defined(_SYS_BUS_H_) && defined(_SYS_PCIIO_H_)
@@ -416,7 +483,7 @@ pci_get_vpd_readonly(device_t dev, const char *kw, const char **vptr)
 static __inline int
 pci_is_vga_ioport_range(rman_res_t start, rman_res_t end)
 {
- 
+
 	return (((start >= 0x3b0 && end <= 0x3bb) ||
 	    (start >= 0x3c0 && end <= 0x3df)) ? 1 : 0);
 }
@@ -614,21 +681,18 @@ int	pci_get_max_read_req(device_t dev);
 void	pci_restore_state(device_t dev);
 void	pci_save_state(device_t dev);
 int	pci_set_max_read_req(device_t dev, int size);
+int	pci_power_reset(device_t dev);
 uint32_t pcie_read_config(device_t dev, int reg, int width);
 void	pcie_write_config(device_t dev, int reg, uint32_t value, int width);
 uint32_t pcie_adjust_config(device_t dev, int reg, uint32_t mask,
 	    uint32_t value, int width);
+void	pcie_apei_error(device_t dev, int sev, uint8_t *aer);
 bool	pcie_flr(device_t dev, u_int max_delay, bool force);
 int	pcie_get_max_completion_timeout(device_t dev);
 bool	pcie_wait_for_pending_transactions(device_t dev, u_int max_delay);
+int	pcie_link_reset(device_t port, int pcie_location);
 
-#ifdef BUS_SPACE_MAXADDR
-#if (BUS_SPACE_MAXADDR > 0xFFFFFFFF)
-#define	PCI_DMA_BOUNDARY	0x100000000
-#else
-#define	PCI_DMA_BOUNDARY	0
-#endif
-#endif
+void	pci_print_faulted_dev(void);
 
 #endif	/* _SYS_BUS_H_ */
 

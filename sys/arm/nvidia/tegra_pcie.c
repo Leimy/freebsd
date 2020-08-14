@@ -1395,8 +1395,8 @@ tegra_pcib_attach_msi(device_t dev)
 
 	sc = device_get_softc(dev);
 
-	sc->msi_page = kmem_alloc_contig(kernel_arena, PAGE_SIZE, M_WAITOK,
-	    0, BUS_SPACE_MAXADDR, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
+	sc->msi_page = kmem_alloc_contig(PAGE_SIZE, M_WAITOK, 0,
+	    BUS_SPACE_MAXADDR, PAGE_SIZE, 0, VM_MEMATTR_DEFAULT);
 
 	/* MSI BAR */
 	tegra_pcib_set_bar(sc, 9, vtophys(sc->msi_page), vtophys(sc->msi_page),
@@ -1632,5 +1632,5 @@ static device_method_t tegra_pcib_methods[] = {
 static devclass_t pcib_devclass;
 DEFINE_CLASS_1(pcib, tegra_pcib_driver, tegra_pcib_methods,
     sizeof(struct tegra_pcib_softc), ofw_pci_driver);
-DRIVER_MODULE(pcib, simplebus, tegra_pcib_driver, pcib_devclass,
+DRIVER_MODULE(tegra_pcib, simplebus, tegra_pcib_driver, pcib_devclass,
     NULL, NULL);

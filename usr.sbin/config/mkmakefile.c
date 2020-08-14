@@ -46,8 +46,11 @@ static const char rcsid[] =
 #include <ctype.h>
 #include <err.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/cnv.h>
+#include <sys/nv.h>
 #include <sys/param.h>
 #include "y.tab.h"
 #include "config.h"
@@ -59,8 +62,12 @@ static void do_rules(FILE *);
 static void do_xxfiles(char *, FILE *);
 static void do_objs(FILE *);
 static void do_before_depend(FILE *);
-static int opteq(const char *, const char *);
 static void read_files(void);
+static void sanitize_envline(char *result, const char *src);
+static bool preprocess(char *line, char *result);
+static void process_into_file(char *line, FILE *ofp);
+static void process_into_nvlist(char *line, nvlist_t *nvl);
+static void dump_nvlist(nvlist_t *nvl, FILE *ofp);
 
 static void errout(const char *fmt, ...)
 {
@@ -179,6 +186,121 @@ makefile(void)
 	moveifchanged(path("Makefile.new"), path("Makefile"));
 }
 
+static void
+sanitize_envline(char *result, const char *src)
+{
+	const char *eq;
+	char c, *dst;
+	bool leading;
+
+	/* If there is no '=' it's not a well-formed name=value line. */
+	if ((eq = strchr(src, '=')) == NULL) {
+		*result = 0;
+		return;
+	}
+	dst = result;
+
+	/* Copy chars before the '=', skipping any leading spaces/quotes. */
+	leading = true;
+	while (src < eq) {
+		c = *src++;
+		if (leading && (isspace(c) || c == '"'))
+			continue;
+		*dst++ = c;
+		leading = false;
+	}
+
+	/* If it was all leading space, we don't have a well-formed line. */
+	if (leading) {
+		*result = 0;
+		return;
+	}
+
+	/* Trim spaces/quotes immediately before the '=', then copy the '='. */
+	while (isspace(dst[-1]) || dst[-1] == '"')
+		--dst;
+	*dst++ = *src++;
+
+	/* Copy chars after the '=', skipping any leading whitespace. */
+	leading = true;
+	while ((c = *src++) != 0) {
+		if (leading && (isspace(c) || c == '"'))
+			continue;
+		*dst++ = c;
+		leading = false;
+	}
+
+	/* If it was all leading space, it's a valid 'var=' (nil value). */
+	if (leading) {
+		*dst = 0;
+		return;
+	}
+
+	/* Trim trailing whitespace and quotes. */
+	while (isspace(dst[-1]) || dst[-1] == '"')
+		--dst;
+
+	*dst = 0;
+}
+
+/*
+ * Returns true if the caller may use the string.
+ */
+static bool
+preprocess(char *line, char *result)
+{
+	char *s;
+
+	/* Strip any comments */
+	if ((s = strchr(line, '#')) != NULL)
+		*s = '\0';
+	sanitize_envline(result, line);
+	/* Return true if it's non-empty */
+	return (*result != '\0');
+}
+
+static void
+process_into_file(char *line, FILE *ofp)
+{
+	char result[BUFSIZ];
+
+	if (preprocess(line, result))
+		fprintf(ofp, "\"%s\\0\"\n", result);
+}
+
+static void
+process_into_nvlist(char *line, nvlist_t *nvl)
+{
+	char result[BUFSIZ], *s;
+
+	if (preprocess(line, result)) {
+		s = strchr(result, '=');
+		*s = '\0';
+		if (nvlist_exists(nvl, result))
+			nvlist_free(nvl, result);
+		nvlist_add_string(nvl, result, s + 1);
+	}
+}
+
+static void
+dump_nvlist(nvlist_t *nvl, FILE *ofp)
+{
+	const char *name;
+	void *cookie;
+
+	if (nvl == NULL)
+		return;
+
+	while (!nvlist_empty(nvl)) {
+		cookie = NULL;
+		name = nvlist_next(nvl, NULL, &cookie);
+		fprintf(ofp, "\"%s=%s\\0\"\n", name,
+		     cnvlist_get_string(cookie));
+
+		cnvlist_free_string(cookie);
+	}
+}
+
 /*
  * Build hints.c from the skeleton
  */
@@ -186,8 +308,8 @@ void
 makehints(void)
 {
 	FILE *ifp, *ofp;
+	nvlist_t *nvl;
 	char line[BUFSIZ];
-	char *s;
 	struct hint *hint;
 
 	ofp = fopen(path("hints.c.new"), "w");
@@ -196,43 +318,25 @@ makehints(void)
 	fprintf(ofp, "#include <sys/types.h>\n");
 	fprintf(ofp, "#include <sys/systm.h>\n");
 	fprintf(ofp, "\n");
-	fprintf(ofp, "int hintmode = %d;\n", hintmode);
+	/*
+	 * Write out hintmode for older kernels. Remove when config(8) major
+	 * version rolls over.
+	 */
+	if (versreq <= CONFIGVERS_ENVMODE_REQ)
+		fprintf(ofp, "int hintmode = %d;\n",
+			!STAILQ_EMPTY(&hints) ? 1 : 0);
 	fprintf(ofp, "char static_hints[] = {\n");
+	nvl = nvlist_create(0);
 	STAILQ_FOREACH(hint, &hints, hint_next) {
 		ifp = fopen(hint->hint_name, "r");
 		if (ifp == NULL)
 			err(1, "%s", hint->hint_name);
-		while (fgets(line, BUFSIZ, ifp) != NULL) {
-			/* zap trailing CR and/or LF */
-			while ((s = strrchr(line, '\n')) != NULL)
-				*s = '\0';
-			while ((s = strrchr(line, '\r')) != NULL)
-				*s = '\0';
-			/* remove # comments */
-			s = strchr(line, '#');
-			if (s)
-				*s = '\0';
-			/* remove any whitespace and " characters */
-			s = line;
-			while (*s) {
-				if (*s == ' ' || *s == '\t' || *s == '"') {
-					while (*s) {
-						s[0] = s[1];
-						s++;
-					}
-					/* start over */
-					s = line;
-					continue;
-				}
-				s++;
-			}
-			/* anything left? */
-			if (*line == '\0')
-				continue;
-			fprintf(ofp, "\"%s\\0\"\n", line);
-		}
+		while (fgets(line, BUFSIZ, ifp) != NULL)
+			process_into_nvlist(line, nvl);
+		dump_nvlist(nvl, ofp);
 		fclose(ifp);
 	}
+	nvlist_destroy(nvl);
 	fprintf(ofp, "\"\\0\"\n};\n");
 	fclose(ofp);
 	moveifchanged(path("hints.c.new"), path("hints.c"));
@@ -245,58 +349,39 @@ void
 makeenv(void)
 {
 	FILE *ifp, *ofp;
+	nvlist_t *nvl;
 	char line[BUFSIZ];
-	char *s;
+	struct envvar *envvar;
 
-	if (env) {
-		ifp = fopen(env, "r");
-		if (ifp == NULL)
-			err(1, "%s", env);
-	} else {
-		ifp = NULL;
-	}
 	ofp = fopen(path("env.c.new"), "w");
 	if (ofp == NULL)
 		err(1, "%s", path("env.c.new"));
 	fprintf(ofp, "#include <sys/types.h>\n");
 	fprintf(ofp, "#include <sys/systm.h>\n");
 	fprintf(ofp, "\n");
-	fprintf(ofp, "int envmode = %d;\n", envmode);
+	/*
+	 * Write out envmode for older kernels. Remove when config(8) major
+	 * version rolls over.
+	 */
+	if (versreq <= CONFIGVERS_ENVMODE_REQ)
+		fprintf(ofp, "int envmode = %d;\n",
+			!STAILQ_EMPTY(&envvars) ? 1 : 0);
 	fprintf(ofp, "char static_env[] = {\n");
-	if (ifp) {
-		while (fgets(line, BUFSIZ, ifp) != NULL) {
-			/* zap trailing CR and/or LF */
-			while ((s = strrchr(line, '\n')) != NULL)
-				*s = '\0';
-			while ((s = strrchr(line, '\r')) != NULL)
-				*s = '\0';
-			/* remove # comments */
-			s = strchr(line, '#');
-			if (s)
-				*s = '\0';
-			/* remove any whitespace and " characters */
-			s = line;
-			while (*s) {
-				if (*s == ' ' || *s == '\t' || *s == '"') {
-					while (*s) {
-						s[0] = s[1];
-						s++;
-					}
-					/* start over */
-					s = line;
-					continue;
-				}
-				s++;
-			}
-			/* anything left? */
-			if (*line == '\0')
-				continue;
-			fprintf(ofp, "\"%s\\0\"\n", line);
-		}
+	nvl = nvlist_create(0);
+	STAILQ_FOREACH(envvar, &envvars, envvar_next) {
+		if (envvar->env_is_file) {
+			ifp = fopen(envvar->env_str, "r");
+			if (ifp == NULL)
+				err(1, "%s", envvar->env_str);
+			while (fgets(line, BUFSIZ, ifp) != NULL)
+				process_into_nvlist(line, nvl);
+			dump_nvlist(nvl, ofp);
+			fclose(ifp);
+		} else
+			process_into_file(envvar->env_str, ofp);
 	}
+	nvlist_destroy(nvl);
 	fprintf(ofp, "\"\\0\"\n};\n");
-	if (ifp)
-		fclose(ifp);
 	fclose(ofp);
 	moveifchanged(path("env.c.new"), path("env.c"));
 }
@@ -312,7 +397,7 @@ read_file(char *fname)
 	char *wd, *this, *compilewith, *depends, *clean, *warning;
 	const char *objprefix;
 	int compile, match, nreqs, std, filetype, not,
-	    imp_rule, no_obj, before_depend, nowerror;
+	    imp_rule, no_ctfconvert, no_obj, before_depend, nowerror;
 
 	fp = fopen(fname, "r");
 	if (fp == NULL)
@@ -326,6 +411,7 @@ next:
 	 *      [ dependency "dependency-list"] [ before-depend ]
 	 *	[ clean "file-list"] [ warning "text warning" ]
 	 *	[ obj-prefix "file prefix"]
+	 *	[ nowerror ] [ local ]
 	 */
 	wd = get_word(fp);
 	if (wd == (char *)EOF) {
@@ -366,6 +452,7 @@ next:
 	warning = 0;
 	std = 0;
 	imp_rule = 0;
+	no_ctfconvert = 0;
 	no_obj = 0;
 	before_depend = 0;
 	nowerror = 0;
@@ -391,6 +478,10 @@ next:
 			compile += match;
 			match = 1;
 			nreqs = 0;
+			continue;
+		}
+		if (eq(wd, "no-ctfconvert")) {
+			no_ctfconvert++;
 			continue;
 		}
 		if (eq(wd, "no-obj")) {
@@ -479,7 +570,8 @@ next:
 				goto nextparam;
 			}
 		SLIST_FOREACH(op, &opt, op_next)
-			if (op->op_value == 0 && opteq(op->op_name, wd)) {
+			if (op->op_value == 0 &&
+			    strcasecmp(op->op_name, wd) == 0) {
 				if (not)
 					match = 0;
 				goto nextparam;
@@ -504,8 +596,10 @@ nextparam:;
 			tp->f_srcprefix = "$S/";
 		if (imp_rule)
 			tp->f_flags |= NO_IMPLCT_RULE;
+		if (no_ctfconvert)
+			tp->f_flags |= NO_CTFCONVERT;
 		if (no_obj)
-			tp->f_flags |= NO_OBJ;
+			tp->f_flags |= NO_OBJ | NO_CTFCONVERT;
 		if (before_depend)
 			tp->f_flags |= BEFORE_DEPEND;
 		if (nowerror)
@@ -542,23 +636,6 @@ read_files(void)
 	}
 }
 
-static int
-opteq(const char *cp, const char *dp)
-{
-	char c, d;
-
-	for (; ; cp++, dp++) {
-		if (*cp != *dp) {
-			c = isupper(*cp) ? tolower(*cp) : *cp;
-			d = isupper(*dp) ? tolower(*dp) : *dp;
-			if (c != d)
-				return (0);
-		}
-		if (*cp == 0)
-			return (1);
-	}
-}
-
 static void
 do_before_depend(FILE *fp)
 {
@@ -569,17 +646,16 @@ do_before_depend(FILE *fp)
 	lpos = 15;
 	STAILQ_FOREACH(tp, &ftab, f_next)
 		if (tp->f_flags & BEFORE_DEPEND) {
-			len = strlen(tp->f_fn);
-			if ((len = 3 + len) + lpos > 72) {
+			len = strlen(tp->f_fn) + strlen(tp->f_srcprefix);
+			if (len + lpos > 72) {
 				lpos = 8;
 				fputs("\\\n\t", fp);
 			}
 			if (tp->f_flags & NO_IMPLCT_RULE)
-				fprintf(fp, "%s ", tp->f_fn);
+				lpos += fprintf(fp, "%s ", tp->f_fn);
 			else
-				fprintf(fp, "%s%s ", tp->f_srcprefix,
+				lpos += fprintf(fp, "%s%s ", tp->f_srcprefix,
 				    tp->f_fn);
-			lpos += len + 1;
 		}
 	if (lpos != 8)
 		putc('\n', fp);
@@ -639,12 +715,11 @@ do_xxfiles(char *tag, FILE *fp)
 				continue;
 			if (strcasecmp(&tp->f_fn[len - slen], suff) != 0)
 				continue;
-			if ((len = 3 + len) + lpos > 72) {
+			if (len + strlen(tp->f_srcprefix) + lpos > 72) {
 				lpos = 8;
 				fputs("\\\n\t", fp);
 			}
-			fprintf(fp, "%s%s ", tp->f_srcprefix, tp->f_fn);
-			lpos += len + 1;
+			lpos += fprintf(fp, "%s%s ", tp->f_srcprefix, tp->f_fn);
 		}
 	free(suff);
 	if (lpos != 8)
@@ -737,7 +812,7 @@ do_rules(FILE *f)
 		else
 			fprintf(f, "\t%s\n", compilewith);
 
-		if (!(ftp->f_flags & NO_OBJ))
+		if (!(ftp->f_flags & NO_CTFCONVERT))
 			fprintf(f, "\t${NORMAL_CTFCONVERT}\n\n");
 		else
 			fprintf(f, "\n");

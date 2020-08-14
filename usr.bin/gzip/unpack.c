@@ -5,7 +5,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2009 Xin LI <delphij@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -156,9 +155,6 @@ unpack_parse_header(int in, int out, char *pre, size_t prelen, off_t *bytes_in,
 	unsigned char hdr[PACK_HEADER_LENGTH];	/* buffer for header */
 	ssize_t bytesread;		/* Bytes read from the file */
 	int i, j, thisbyte;
-
-	if (prelen > sizeof hdr)
-		maybe_err("prelen too long");
 
 	/* Prepend the header buffer if we already read some data */
 	if (prelen != 0)

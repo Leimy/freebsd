@@ -75,11 +75,12 @@
  *	Exported data structures.
  */
 
-extern int vm_page_max_wired;
+extern u_long vm_page_max_user_wired;
 extern int vm_pageout_page_count;
 
 #define	VM_OOM_MEM	1
-#define	VM_OOM_SWAPZ	2
+#define	VM_OOM_MEM_PF	2
+#define	VM_OOM_SWAPZ	3
 
 /*
  * vm_lowmem flags.
@@ -96,7 +97,7 @@ extern int vm_pageout_page_count;
  */
 
 void vm_wait(vm_object_t obj);
-void vm_waitpfault(void);
+void vm_waitpfault(struct domainset *, int timo);
 void vm_wait_domain(int domain);
 void vm_wait_min(void);
 void vm_wait_severe(void);
@@ -106,5 +107,6 @@ void vm_pageout_oom(int shortage);
 
 void vm_swapout_run(void);
 void vm_swapout_run_idle(void);
+
 #endif /* _KERNEL */
 #endif	/* _VM_VM_PAGEOUT_H_ */

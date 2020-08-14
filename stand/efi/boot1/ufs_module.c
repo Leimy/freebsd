@@ -36,9 +36,13 @@
 #include <stdbool.h>
 #include <sys/cdefs.h>
 #include <sys/param.h>
+#include <sys/disk/bsd.h>
 #include <efi.h>
 
 #include "boot_module.h"
+
+#define BSD_LABEL_BUFFER	8192
+#define BSD_LABEL_OFFSET	DEV_BSIZE
 
 static dev_info_t *devinfo;
 static dev_info_t *devices;
@@ -49,6 +53,7 @@ dskread(void *buf, uint64_t lba, int nblk)
 	int size;
 	EFI_STATUS status;
 
+	lba += devinfo->partoff;
 	lba = lba / (devinfo->dev->Media->BlockSize / DEV_BSIZE);
 	size = nblk * DEV_BSIZE;
 
@@ -68,16 +73,55 @@ dskread(void *buf, uint64_t lba, int nblk)
 
 #include "ufsread.c"
 
-static struct dmadat __dmadat;
+static struct dmadat __dmadat __aligned(512);
+static char ufs_buffer[BSD_LABEL_BUFFER] __aligned(512);
 
 static int
 init_dev(dev_info_t* dev)
 {
+	struct disklabel *dl;
+	uint64_t bs;
+	int ok;
 
 	devinfo = dev;
 	dmadat = &__dmadat;
 
-	return fsread(0, NULL, 0);
+	/*
+	 * First try offset 0. This is the typical GPT case where we have no
+	 * further partitioning (as well as the degenerate MBR case where
+	 * the bsdlabel has a 0 offset).
+	 */
+	devinfo->partoff = 0;
+	ok = fsread(0, NULL, 0);
+	if (ok >= 0)
+		return (ok);
+
+	/*
+	 * Next, we look for a bsdlabel. This is technically located in sector
+	 * 1. For 4k sectors, this offset is 4096, for 512b sectors it's
+	 * 512. However, we have to fall back to 512 here because we create
+	 * images that assume 512 byte blocks, but these can be put on devices
+	 * who have 4k (or other) block sizes. If there's a crazy block size, we
+	 * skip the 'at one sector' and go stright to checking at 512 bytes.
+	 * There are other offsets that are historic, but we don't probe those
+	 * since they were never used for MBR disks on FreeBSD on systems that
+	 * could boot UEFI. UEFI is little endian only, as are BSD labels. We
+	 * will retry fsread(0) only if there's a label found with a non-zero
+	 * offset.
+	 */
+	if (dskread(ufs_buffer, 0, BSD_LABEL_BUFFER / DEV_BSIZE) != 0)
+		return (-1);
+	dl = NULL;
+	bs = devinfo->dev->Media->BlockSize;
+	if (bs != 0 && bs <= BSD_LABEL_BUFFER / 2)
+		dl = (struct disklabel *)&ufs_buffer[bs];
+	if (dl == NULL || dl->d_magic != BSD_MAGIC || dl->d_magic2 != BSD_MAGIC)
+		dl = (struct disklabel *)&ufs_buffer[BSD_LABEL_OFFSET];
+	if (dl->d_magic != BSD_MAGIC || dl->d_magic2 != BSD_MAGIC ||
+	    dl->d_partitions[0].p_offset == 0)
+		return (-1);
+	devinfo->partoff = dl->d_partitions[0].p_offset;
+	return (fsread(0, NULL, 0));
 }
 
 static EFI_STATUS
@@ -96,7 +140,6 @@ static EFI_STATUS
 load(const char *filepath, dev_info_t *dev, void **bufp, size_t *bufsize)
 {
 	ufs_ino_t ino;
-	EFI_STATUS status;
 	size_t size;
 	ssize_t read;
 	void *buf;
@@ -104,7 +147,7 @@ load(const char *filepath, dev_info_t *dev, void **bufp, size_t *bufsize)
 #ifdef EFI_DEBUG
 	{
 		CHAR16 *text = efi_devpath_name(dev->devpath);
-		DPRINTF("Loading '%s' from %S\n", filepath, text);
+		DPRINTF("UFS Loading '%s' from %S\n", filepath, text);
 		efi_free_devpath_name(text);
 	}
 #endif
@@ -123,18 +166,18 @@ load(const char *filepath, dev_info_t *dev, void **bufp, size_t *bufsize)
 		return (EFI_INVALID_PARAMETER);
 	}
 
-	if ((status = BS->AllocatePool(EfiLoaderData, size, &buf)) !=
-	    EFI_SUCCESS) {
-		printf("Failed to allocate read buffer %zu for '%s' (%lu)\n",
-		    size, filepath, EFI_ERROR_CODE(status));
-		return (status);
+	buf = malloc(size);
+	if (buf == NULL) {
+		printf("Failed to allocate read buffer %zu for '%s'\n",
+		    size, filepath);
+		return (EFI_OUT_OF_RESOURCES);
 	}
 
 	read = fsread(ino, buf, size);
 	if ((size_t)read != size) {
 		printf("Failed to read '%s' (%zd != %zu)\n", filepath, read,
 		    size);
-		(void)BS->FreePool(buf);
+		free(buf);
 		return (EFI_INVALID_PARAMETER);
 	}
 

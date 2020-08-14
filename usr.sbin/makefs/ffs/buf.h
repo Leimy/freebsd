@@ -45,6 +45,7 @@
 #include <sys/param.h>
 #include <sys/queue.h>
 
+struct componentname;
 struct makefs_fsinfo;
 struct ucred;
 
@@ -54,7 +55,7 @@ struct vnode {
 };
 
 struct buf {
-	void *		b_data;
+	char *		b_data;
 	long		b_bufsize;
 	long		b_bcount;
 	daddr_t		b_blkno;
@@ -67,7 +68,7 @@ struct buf {
 void		bcleanup(void);
 int		bread(struct vnode *, daddr_t, int, struct ucred *,
     struct buf **);
-void		brelse(struct buf *, int);
+void		brelse(struct buf *);
 int		bwrite(struct buf *);
 struct buf *	getblk(struct vnode *, daddr_t, int, int, int, int);
 

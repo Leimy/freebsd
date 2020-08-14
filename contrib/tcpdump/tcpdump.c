@@ -77,7 +77,6 @@ The Regents of the University of California.  All rights reserved.\n";
  */
 #ifdef HAVE_CAPSICUM
 #include <sys/capsicum.h>
-#include <sys/sysctl.h>
 #include <sys/nv.h>
 #include <sys/ioccom.h>
 #include <net/bpf.h>
@@ -617,11 +616,10 @@ droproot(const char *username, const char *chroot_dir)
 #ifdef HAVE_LIBCAP_NG
 		{
 			int ret = capng_change_id(pw->pw_uid, pw->pw_gid, CAPNG_NO_FLAG);
-			if (ret < 0) {
-				fprintf(stderr, "error : ret %d\n", ret);
-			} else {
+			if (ret < 0)
+				error("capng_change_id(): return %d\n", ret);
+			else
 				fprintf(stderr, "dropped privs to %s\n", username);
-			}
 		}
 #else
 		if (initgroups(pw->pw_name, pw->pw_gid) != 0 ||
@@ -710,13 +708,15 @@ static char *
 get_next_file(FILE *VFile, char *ptr)
 {
 	char *ret;
+	size_t len;
 
 	ret = fgets(ptr, PATH_MAX, VFile);
 	if (!ret)
 		return NULL;
 
-	if (ptr[strlen(ptr) - 1] == '\n')
-		ptr[strlen(ptr) - 1] = '\0';
+	len = strlen (ptr);
+	if (len > 0 && ptr[len - 1] == '\n')
+		ptr[len - 1] = '\0';
 
 	return ret;
 }
@@ -738,7 +738,7 @@ capdns_setup(void)
 	if (capdnsloc == NULL)
 		error("unable to open system.dns service");
 	/* Limit system.dns to reverse DNS lookups. */
-	types[0] = "ADDR";
+	types[0] = "ADDR2NAME";
 	if (cap_dns_type_limit(capdnsloc, types, 1) < 0)
 		error("unable to limit access to system.dns service");
 	families[0] = AF_INET;
@@ -1062,6 +1062,10 @@ open_interface(const char *device, netdissect_options *ndo, char *ebuf)
 		if (status < 0)
 			error("%s: Can't set time stamp type: %s",
 		              device, pcap_statustostr(status));
+		else if (status > 0)
+			warning("When trying to set timestamp type '%s' on %s: %s",
+				pcap_tstamp_type_val_to_name(jflag), device,
+				pcap_statustostr(status));
 	}
 #endif
 	status = pcap_activate(pc);
@@ -1083,26 +1087,6 @@ open_interface(const char *device, netdissect_options *ndo, char *ebuf)
 		} else if (status == PCAP_ERROR_PERM_DENIED && *cp != '\0')
 			error("%s: %s\n(%s)", device,
 			    pcap_statustostr(status), cp);
-#ifdef __FreeBSD__
-		else if (status == PCAP_ERROR_RFMON_NOTSUP &&
-		    strncmp(device, "wlan", 4) == 0) {
-			char parent[8], newdev[8];
-			char sysctl[32];
-			size_t s = sizeof(parent);
-
-			snprintf(sysctl, sizeof(sysctl),
-			    "net.wlan.%d.%%parent", atoi(device + 4));
-			sysctlbyname(sysctl, parent, &s, NULL, 0);
-			strlcpy(newdev, device, sizeof(newdev));
-			/* Suggest a new wlan device. */
-			newdev[strlen(newdev)-1]++;
-			error("%s is not a monitor mode VAP\n"
-			    "To create a new monitor mode VAP use:\n"
-			    "  ifconfig %s create wlandev %s wlanmode monitor\n"
-			    "and use %s as the tcpdump interface",
-			    device, newdev, parent, newdev);
-		}
-#endif
 		else
 			error("%s: %s", device,
 			    pcap_statustostr(status));
@@ -1908,7 +1892,7 @@ main(int argc, char **argv)
 	if (pcap_setfilter(pd, &fcode) < 0)
 		error("%s", pcap_geterr(pd));
 #ifdef HAVE_CAPSICUM
-	if (RFileName == NULL && VFileName == NULL) {
+	if (RFileName == NULL && VFileName == NULL && pcap_fileno(pd) != -1) {
 		static const unsigned long cmds[] = { BIOCGSTATS, BIOCROTZBUF };
 
 		/*
@@ -2056,12 +2040,16 @@ main(int argc, char **argv)
 	}
 
 #ifdef HAVE_CAPSICUM
-	cansandbox = (VFileName == NULL && zflag == NULL);
+	cansandbox = (VFileName == NULL && zflag == NULL &&
+	    ndo->ndo_espsecret == NULL);
 #ifdef HAVE_CASPER
 	cansandbox = (cansandbox && (ndo->ndo_nflag || capdns != NULL));
 #else
 	cansandbox = (cansandbox && ndo->ndo_nflag);
 #endif	/* HAVE_CASPER */
+	cansandbox = (cansandbox && (pcap_fileno(pd) != -1 ||
+	    RFileName != NULL));
+
 	if (cansandbox && cap_enter() < 0 && errno != ENOSYS)
 		error("unable to enter the capability mode");
 #endif	/* HAVE_CAPSICUM */

@@ -53,6 +53,7 @@ HEADER {
 	typedef ACPI_STATUS (*acpi_scan_cb_t)(ACPI_HANDLE h, device_t *dev,
 	    int level, void *arg);
 
+	struct acpi_bix;
 	struct acpi_bif;
 	struct acpi_bst;
 };
@@ -61,10 +62,11 @@ HEADER {
 # Default implementation for acpi_id_probe().
 #
 CODE {
-	static char *
-	acpi_generic_id_probe(device_t bus, device_t dev, char **ids)
+	static int
+	acpi_generic_id_probe(device_t bus, device_t dev, char **ids,
+	    char **match)
 	{
-		return (NULL);
+		return (ENXIO);
 	}
 };
 
@@ -78,12 +80,19 @@ CODE {
 #
 # char **ids:  array of ID strings to consider
 #
-# Returns:  ID string matched or NULL if no match
+# char **match:  Pointer to store ID string matched or NULL if no match
+#                pass NULL if not needed.
 #
-METHOD char * id_probe {
+# Returns: BUS_PROBE_DEFAULT if _HID match
+#          BUS_PROBE_LOW_PRIORITY  if _CID match and not _HID match
+#          ENXIO if no match.
+#
+
+METHOD int id_probe {
 	device_t	bus;
 	device_t	dev;
 	char		**ids;
+	char 		**match;
 } DEFAULT acpi_generic_id_probe;
 
 #
@@ -202,14 +211,16 @@ METHOD int ec_write {
 };
 
 #
-# Get battery information (_BIF format)
+# Get battery information (_BIF or _BIX format)
 #
 # device_t dev:  Battery device
-# struct acpi_bif *bif:  Pointer to storage for _BIF results
+# void *bix:  Pointer to storage for _BIF or _BIX results
+# size_t len: length of acpi_bif or acpi_bix.
 #
 METHOD int batt_get_info {
 	device_t	dev;
-	struct acpi_bif	*bif;
+	void		*bix;
+	size_t		len;
 };
 
 #

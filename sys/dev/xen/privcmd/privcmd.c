@@ -128,7 +128,7 @@ retry:
 			m = vm_page_lookup(map->mem, i);
 			if (m == NULL)
 				continue;
-			if (vm_page_sleep_if_busy(m, "pcmdum"))
+			if (vm_page_busy_acquire(m, VM_ALLOC_WAITFAIL) == 0)
 				goto retry;
 			cdev_pager_free_page(map->mem, m);
 		}
@@ -154,7 +154,7 @@ privcmd_pg_fault(vm_object_t object, vm_ooffset_t offset,
 {
 	struct privcmd_map *map = object->handle;
 	vm_pindex_t pidx;
-	vm_page_t page, oldm;
+	vm_page_t page;
 
 	if (map->mapped != true)
 		return (VM_PAGER_FAIL);
@@ -169,20 +169,16 @@ privcmd_pg_fault(vm_object_t object, vm_ooffset_t offset,
 
 	KASSERT((page->flags & PG_FICTITIOUS) != 0,
 	    ("not fictitious %p", page));
-	KASSERT(page->wire_count == 1, ("wire_count not 1 %p", page));
-	KASSERT(vm_page_busied(page) == 0, ("page %p is busy", page));
+	KASSERT(vm_page_wired(page), ("page %p not wired", page));
+	KASSERT(!vm_page_busied(page), ("page %p is busy", page));
 
-	if (*mres != NULL) {
-		oldm = *mres;
-		vm_page_lock(oldm);
-		vm_page_free(oldm);
-		vm_page_unlock(oldm);
-		*mres = NULL;
-	}
+	vm_page_busy_acquire(page, 0);
+	vm_page_valid(page);
 
-	vm_page_insert(page, object, pidx);
-	page->valid = VM_PAGE_BITS_ALL;
-	vm_page_xbusy(page);
+	if (*mres != NULL)
+		vm_page_replace(page, object, pidx, *mres);
+	else
+		vm_page_insert(page, object, pidx);
 	*mres = page;
 	return (VM_PAGER_OK);
 }
@@ -232,9 +228,21 @@ privcmd_ioctl(struct cdev *dev, unsigned long cmd, caddr_t arg,
 		struct ioctl_privcmd_hypercall *hcall;
 
 		hcall = (struct ioctl_privcmd_hypercall *)arg;
-
+#ifdef __amd64__
+		/*
+		 * The hypervisor page table walker will refuse to access
+		 * user-space pages if SMAP is enabled, so temporary disable it
+		 * while performing the hypercall.
+		 */
+		if (cpu_stdext_feature & CPUID_STDEXT_SMAP)
+			stac();
+#endif
 		error = privcmd_hypercall(hcall->op, hcall->arg[0],
 		    hcall->arg[1], hcall->arg[2], hcall->arg[3], hcall->arg[4]);
+#ifdef __amd64__
+		if (cpu_stdext_feature & CPUID_STDEXT_SMAP)
+			clac();
+#endif
 		if (error >= 0) {
 			hcall->retval = error;
 			error = 0;

@@ -506,7 +506,7 @@ sysctl_kern_binmisc(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_NODE(_kern, OID_AUTO, binmisc, CTLFLAG_RW, 0,
+SYSCTL_NODE(_kern, OID_AUTO, binmisc, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "Image activator for miscellaneous binaries");
 
 SYSCTL_PROC(_kern_binmisc, OID_AUTO, add,
@@ -609,7 +609,6 @@ imgact_binmisc_exec(struct image_params *imgp)
 		fname = sbuf_data(sname);
 	}
 
-
 	/*
 	 * We need to "push" the interpreter in the arg[] list.  To do this,
 	 * we first shift all the other values in the `begin_argv' area to
@@ -649,21 +648,12 @@ imgact_binmisc_exec(struct image_params *imgp)
 		s++;
 	}
 
-	/* Check to make sure we won't overrun the stringspace. */
-	if (offset > imgp->args->stringspace) {
+	/* Make room for the interpreter */
+	error = exec_args_adjust_args(imgp->args, 0, offset);
+	if (error != 0) {
 		sx_sunlock(&interp_list_sx);
-		error = E2BIG;
 		goto done;
 	}
-
-	/* Make room for the interpreter */
-	bcopy(imgp->args->begin_argv, imgp->args->begin_argv + offset,
-	    imgp->args->endp - imgp->args->begin_argv);
-
-	/* Adjust everything by the offset. */
-	imgp->args->begin_envv += offset;
-	imgp->args->endp += offset;
-	imgp->args->stringspace -= offset;
 
 	/* Add the new argument(s) in the count. */
 	imgp->args->argc += ibe->ibe_interp_argcnt;
@@ -716,7 +706,6 @@ imgact_binmisc_exec(struct image_params *imgp)
 	if (!error)
 		imgp->interpreter_name = imgp->args->begin_argv;
 
-
 done:
 	if (sname)
 		sbuf_delete(sname);
@@ -747,8 +736,10 @@ imgact_binmisc_fini(void *arg)
 	sx_destroy(&interp_list_sx);
 }
 
-SYSINIT(imgact_binmisc, SI_SUB_EXEC, SI_ORDER_MIDDLE, imgact_binmisc_init, 0);
-SYSUNINIT(imgact_binmisc, SI_SUB_EXEC, SI_ORDER_MIDDLE, imgact_binmisc_fini, 0);
+SYSINIT(imgact_binmisc, SI_SUB_EXEC, SI_ORDER_MIDDLE, imgact_binmisc_init,
+    NULL);
+SYSUNINIT(imgact_binmisc, SI_SUB_EXEC, SI_ORDER_MIDDLE, imgact_binmisc_fini,
+    NULL);
 
 /*
  * Tell kern_execve.c about it, with a little help from the linker.

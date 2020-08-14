@@ -1915,6 +1915,7 @@ create_storvsc_request(union ccb *ccb, struct hv_storvsc_request *reqp)
 	reqp->sense_info_len = csio->sense_len;
 
 	reqp->ccb = ccb;
+	ccb->ccb_h.spriv_ptr0 = reqp;
 
 	if (0 == csio->dxfer_len) {
 		return (0);
@@ -2173,20 +2174,7 @@ storvsc_io_done(struct hv_storvsc_request *reqp)
 					    scsi_op_desc(cmd->opcode, NULL));
 				}
 			}
-
-			/*
-			 * XXX For a selection timeout, all of the LUNs
-			 * on the target will be gone.  It works for SCSI
-			 * disks, but does not work for IDE disks.
-			 *
-			 * For CAM_DEV_NOT_THERE, CAM will only get
-			 * rid of the device(s) specified by the path.
-			 */
-			if (storvsc_get_storage_type(sc->hs_dev) ==
-			    DRIVER_STORVSC)
-				ccb->ccb_h.status |= CAM_SEL_TIMEOUT;
-			else
-				ccb->ccb_h.status |= CAM_DEV_NOT_THERE;
+			ccb->ccb_h.status |= CAM_DEV_NOT_THERE;
 		} else {
 			ccb->ccb_h.status |= CAM_REQ_CMP;
 		}
@@ -2290,7 +2278,11 @@ storvsc_io_done(struct hv_storvsc_request *reqp)
 	}
 
 	ccb->csio.scsi_status = (vm_srb->scsi_status & 0xFF);
-	ccb->csio.resid = ccb->csio.dxfer_len - vm_srb->transfer_len;
+	if (srb_status == SRB_STATUS_SUCCESS ||
+	    srb_status == SRB_STATUS_DATA_OVERRUN)
+		ccb->csio.resid = ccb->csio.dxfer_len - vm_srb->transfer_len;
+	else
+		ccb->csio.resid = ccb->csio.dxfer_len;
 
 	if (reqp->sense_info_len != 0) {
 		csio->sense_resid = csio->sense_len - reqp->sense_info_len;

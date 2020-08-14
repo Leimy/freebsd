@@ -66,12 +66,21 @@ __FBSDID("$FreeBSD$");
 #include "paths.h"
 #include "rtld_tls.h"
 #include "rtld_printf.h"
+#include "rtld_malloc.h"
 #include "rtld_utrace.h"
 #include "notes.h"
+#include "rtld_libc.h"
 
 /* Types. */
-typedef void (*func_ptr_type)();
+typedef void (*func_ptr_type)(void);
 typedef void * (*path_enum_proc) (const char *path, size_t len, void *arg);
+
+
+/* Variables that cannot be static: */
+extern struct r_debug r_debug; /* For GDB */
+extern int _thread_autoinit_dummy_decl;
+extern void (*__cleanup)(void);
+
 
 /*
  * Function declarations.
@@ -79,10 +88,11 @@ typedef void * (*path_enum_proc) (const char *path, size_t len, void *arg);
 static const char *basename(const char *);
 static void digest_dynamic1(Obj_Entry *, int, const Elf_Dyn **,
     const Elf_Dyn **, const Elf_Dyn **);
-static void digest_dynamic2(Obj_Entry *, const Elf_Dyn *, const Elf_Dyn *,
+static bool digest_dynamic2(Obj_Entry *, const Elf_Dyn *, const Elf_Dyn *,
     const Elf_Dyn *);
-static void digest_dynamic(Obj_Entry *, int);
+static bool digest_dynamic(Obj_Entry *, int);
 static Obj_Entry *digest_phdr(const Elf_Phdr *, int, caddr_t, const char *);
+static void distribute_static_tls(Objlist *, RtldLockState *);
 static Obj_Entry *dlcheck(void *);
 static int dlclose_locked(void *, RtldLockState *);
 static Obj_Entry *dlopen_object(const char *name, int fd, Obj_Entry *refobj,
@@ -103,6 +113,7 @@ static void init_pagesizes(Elf_Auxinfo **aux_info);
 static void init_rtld(caddr_t, Elf_Auxinfo **);
 static void initlist_add_neededs(Needed_Entry *, Objlist *);
 static void initlist_add_objects(Obj_Entry *, Obj_Entry *, Objlist *);
+static int initlist_objects_ifunc(Objlist *, bool, int, RtldLockState *);
 static void linkmap_add(Obj_Entry *);
 static void linkmap_delete(Obj_Entry *);
 static void load_filtees(Obj_Entry *, int flags, RtldLockState *);
@@ -111,6 +122,7 @@ static int load_needed_objects(Obj_Entry *, int);
 static int load_preload_objects(void);
 static Obj_Entry *load_object(const char *, int fd, const Obj_Entry *, int);
 static void map_stacks_exec(RtldLockState *);
+static int obj_disable_relro(Obj_Entry *);
 static int obj_enforce_relro(Obj_Entry *);
 static Obj_Entry *obj_from_addr(const void *);
 static void objlist_call_fini(Objlist *, Obj_Entry *, RtldLockState *);
@@ -122,10 +134,12 @@ static void objlist_push_head(Objlist *, Obj_Entry *);
 static void objlist_push_tail(Objlist *, Obj_Entry *);
 static void objlist_put_after(Objlist *, Obj_Entry *, Obj_Entry *);
 static void objlist_remove(Objlist *, Obj_Entry *);
-static int open_binary_fd(const char *argv0, bool search_in_path);
-static int parse_args(char* argv[], int argc, bool *use_pathp, int *fdp);
+static int open_binary_fd(const char *argv0, bool search_in_path,
+    const char **binpath_res);
+static int parse_args(char* argv[], int argc, bool *use_pathp, int *fdp,
+    const char **argv0);
 static int parse_integer(const char *);
-static void *path_enumerate(const char *, path_enum_proc, void *);
+static void *path_enumerate(const char *, path_enum_proc, const char *, void *);
 static void print_usage(const char *argv0);
 static void release_object(Obj_Entry *);
 static int relocate_object_dag(Obj_Entry *root, bool bind_now,
@@ -134,13 +148,14 @@ static int relocate_object(Obj_Entry *obj, bool bind_now, Obj_Entry *rtldobj,
     int flags, RtldLockState *lockstate);
 static int relocate_objects(Obj_Entry *, bool, Obj_Entry *, int,
     RtldLockState *);
-static int resolve_objects_ifunc(Obj_Entry *first, bool bind_now,
-    int flags, RtldLockState *lockstate);
+static int resolve_object_ifunc(Obj_Entry *, bool, int, RtldLockState *);
 static int rtld_dirname(const char *, char *);
 static int rtld_dirname_abs(const char *, char *);
 static void *rtld_dlopen(const char *name, int fd, int mode);
 static void rtld_exit(void);
-static char *search_library_path(const char *, const char *, int *);
+static void rtld_nop_exit(void);
+static char *search_library_path(const char *, const char *, const char *,
+    int *);
 static char *search_library_pathfds(const char *, const char *, int *);
 static const void **get_program_var_addr(const char *, RtldLockState *);
 static void set_program_var(const char *, const void *);
@@ -158,7 +173,7 @@ static void unref_dag(Obj_Entry *);
 static void ref_dag(Obj_Entry *);
 static char *origin_subst_one(Obj_Entry *, char *, const char *,
     const char *, bool);
-static char *origin_subst(Obj_Entry *, char *);
+static char *origin_subst(Obj_Entry *, const char *);
 static bool obj_resolve_origin(Obj_Entry *obj);
 static void preinit_main(void);
 static int  rtld_verify_versions(const Objlist *);
@@ -195,8 +210,8 @@ static char *ld_library_path;	/* Environment variable for search path */
 static char *ld_library_dirs;	/* Environment variable for library descriptors */
 static char *ld_preload;	/* Environment variable for libraries to
 				   load first */
-static char *ld_elf_hints_path;	/* Environment variable for alternative hints path */
-static char *ld_tracing;	/* Called from ldd to print libs */
+static const char *ld_elf_hints_path;	/* Environment variable for alternative hints path */
+static const char *ld_tracing;	/* Called from ldd to print libs */
 static char *ld_utrace;		/* Use utrace() to log events. */
 static struct obj_entry_q obj_list;	/* Queue of all loaded objects */
 static Obj_Entry *obj_main;	/* The main program shared object */
@@ -235,10 +250,15 @@ int _rtld_get_stack_prot(void) __exported;
 int _rtld_is_dlopened(void *) __exported;
 void _rtld_error(const char *, ...) __exported;
 
-int npagesizes, osreldate;
-size_t *pagesizes;
+/* Only here to fix -Wmissing-prototypes warnings */
+int __getosreldate(void);
+func_ptr_type _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp);
+Elf_Addr _rtld_bind(Obj_Entry *obj, Elf_Size reloff);
 
-long __stack_chk_guard[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+
+int npagesizes;
+static int osreldate;
+size_t *pagesizes;
 
 static int stack_prot = PROT_READ | PROT_WRITE | RTLD_DEFAULT_STACK_EXEC;
 static int max_stack_flags;
@@ -262,20 +282,23 @@ char **main_argv;
 size_t tls_last_offset;		/* Static TLS offset of last module */
 size_t tls_last_size;		/* Static TLS size of last module */
 size_t tls_static_space;	/* Static TLS space allocated */
-size_t tls_static_max_align;
-int tls_dtv_generation = 1;	/* Used to detect when dtv size changes  */
+static size_t tls_static_max_align;
+Elf_Addr tls_dtv_generation = 1;	/* Used to detect when dtv size changes */
 int tls_max_index = 1;		/* Largest module index allocated */
 
-bool ld_library_path_rpath = false;
+static bool ld_library_path_rpath = false;
+bool ld_fast_sigblock = false;
 
 /*
  * Globals for path names, and such
  */
-char *ld_elf_hints_default = _PATH_ELF_HINTS;
-char *ld_path_libmap_conf = _PATH_LIBMAP_CONF;
-char *ld_path_rtld = _PATH_RTLD;
-char *ld_standard_library_path = STANDARD_LIBRARY_PATH;
-char *ld_env_prefix = LD_;
+const char *ld_elf_hints_default = _PATH_ELF_HINTS;
+const char *ld_path_libmap_conf = _PATH_LIBMAP_CONF;
+const char *ld_path_rtld = _PATH_RTLD;
+const char *ld_standard_library_path = STANDARD_LIBRARY_PATH;
+const char *ld_env_prefix = LD_;
+
+static void (*rtld_exit_ptr)(void);
 
 /*
  * Fill in a DoneList with an allocation large enough to hold all of
@@ -357,12 +380,16 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     RtldLockState lockstate;
     struct stat st;
     Elf_Addr *argcp;
-    char **argv, *argv0, **env, **envp, *kexecpath, *library_path_rpath;
+    char **argv, **env, **envp, *kexecpath, *library_path_rpath;
+    const char *argv0, *binpath;
     caddr_t imgentry;
     char buf[MAXPATHLEN];
-    int argc, fd, i, mib[2], phnum, rtld_argc;
-    size_t len;
-    bool dir_enable, explicit_fd, search_in_path;
+    int argc, fd, i, mib[4], old_osrel, osrel, phnum, rtld_argc;
+    size_t sz;
+#ifdef __powerpc__
+    int old_auxv_format = 1;
+#endif
+    bool dir_enable, direct_exec, explicit_fd, search_in_path;
 
     /*
      * On entry, the dynamic linker itself has not been relocated yet.
@@ -387,7 +414,28 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     for (auxp = aux;  auxp->a_type != AT_NULL;  auxp++) {
 	if (auxp->a_type < AT_COUNT)
 	    aux_info[auxp->a_type] = auxp;
+#ifdef __powerpc__
+	if (auxp->a_type == 23) /* AT_STACKPROT */
+	    old_auxv_format = 0;
+#endif
     }
+
+#ifdef __powerpc__
+    if (old_auxv_format) {
+	/* Remap from old-style auxv numbers. */
+	aux_info[23] = aux_info[21];	/* AT_STACKPROT */
+	aux_info[21] = aux_info[19];	/* AT_PAGESIZESLEN */
+	aux_info[19] = aux_info[17];	/* AT_NCPUS */
+	aux_info[17] = aux_info[15];	/* AT_CANARYLEN */
+	aux_info[15] = aux_info[13];	/* AT_EXECPATH */
+	aux_info[13] = NULL;		/* AT_GID */
+
+	aux_info[20] = aux_info[18];	/* AT_PAGESIZES */
+	aux_info[18] = aux_info[16];	/* AT_OSRELDATE */
+	aux_info[16] = aux_info[14];	/* AT_CANARY */
+	aux_info[14] = NULL;		/* AT_EGID */
+    }
+#endif
 
     /* Initialize and relocate ourselves. */
     assert(aux_info[AT_BASE] != NULL);
@@ -399,28 +447,12 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     main_argc = argc;
     main_argv = argv;
 
-    if (aux_info[AT_CANARY] != NULL &&
-	aux_info[AT_CANARY]->a_un.a_ptr != NULL) {
-	    i = aux_info[AT_CANARYLEN]->a_un.a_val;
-	    if (i > sizeof(__stack_chk_guard))
-		    i = sizeof(__stack_chk_guard);
-	    memcpy(__stack_chk_guard, aux_info[AT_CANARY]->a_un.a_ptr, i);
-    } else {
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_ARND;
-
-	len = sizeof(__stack_chk_guard);
-	if (sysctl(mib, 2, __stack_chk_guard, &len, NULL, 0) == -1 ||
-	    len != sizeof(__stack_chk_guard)) {
-		/* If sysctl was unsuccessful, use the "terminator canary". */
-		((unsigned char *)(void *)__stack_chk_guard)[0] = 0;
-		((unsigned char *)(void *)__stack_chk_guard)[1] = 0;
-		((unsigned char *)(void *)__stack_chk_guard)[2] = '\n';
-		((unsigned char *)(void *)__stack_chk_guard)[3] = 255;
-	}
-    }
+    if (aux_info[AT_BSDFLAGS] != NULL &&
+	(aux_info[AT_BSDFLAGS]->a_un.a_val & ELF_BSDF_SIGFASTBLK) != 0)
+	    ld_fast_sigblock = true;
 
     trust = !issetugid();
+    direct_exec = false;
 
     md_abi_variant_hook(aux_info);
 
@@ -432,19 +464,21 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 	phdr = (const Elf_Phdr *)aux_info[AT_PHDR]->a_un.a_ptr;
 	if (phdr == obj_rtld.phdr) {
 	    if (!trust) {
-		rtld_printf("Tainted process refusing to run binary %s\n",
-		  argv0);
+		_rtld_error("Tainted process refusing to run binary %s",
+		    argv0);
 		rtld_die();
 	    }
+	    direct_exec = true;
+
 	    dbg("opening main program in direct exec mode");
 	    if (argc >= 2) {
-		rtld_argc = parse_args(argv, argc, &search_in_path, &fd);
-		argv0 = argv[rtld_argc];
+		rtld_argc = parse_args(argv, argc, &search_in_path, &fd, &argv0);
 		explicit_fd = (fd != -1);
+		binpath = NULL;
 		if (!explicit_fd)
-		    fd = open_binary_fd(argv0, search_in_path);
+		    fd = open_binary_fd(argv0, search_in_path, &binpath);
 		if (fstat(fd, &st) == -1) {
-		    _rtld_error("failed to fstat FD %d (%s): %s", fd,
+		    _rtld_error("Failed to fstat FD %d (%s): %s", fd,
 		      explicit_fd ? "user-provided descriptor" : argv0,
 		      rtld_strerror(errno));
 		    rtld_die();
@@ -458,7 +492,7 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 		 * others x bit is enabled.
 		 * mmap(2) does not allow to mmap with PROT_EXEC if
 		 * binary' file comes from noexec mount.  We cannot
-		 * set VV_TEXT on the binary.
+		 * set a text reference on the binary.
 		 */
 		dir_enable = false;
 		if (st.st_uid == geteuid()) {
@@ -471,8 +505,8 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 		    dir_enable = true;
 		}
 		if (!dir_enable) {
-		    rtld_printf("No execute permission for binary %s\n",
-		      argv0);
+		    _rtld_error("No execute permission for binary %s",
+		        argv0);
 		    rtld_die();
 		}
 
@@ -489,19 +523,40 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 		    argv[i] = argv[i + rtld_argc];
 		*argcp -= rtld_argc;
 		environ = env = envp = argv + main_argc + 1;
+		dbg("move env from %p to %p", envp + rtld_argc, envp);
 		do {
 		    *envp = *(envp + rtld_argc);
-		    envp++;
-		} while (*envp != NULL);
+		}  while (*envp++ != NULL);
 		aux = auxp = (Elf_Auxinfo *)envp;
 		auxpf = (Elf_Auxinfo *)(envp + rtld_argc);
+		dbg("move aux from %p to %p", auxpf, aux);
+		/* XXXKIB insert place for AT_EXECPATH if not present */
 		for (;; auxp++, auxpf++) {
 		    *auxp = *auxpf;
 		    if (auxp->a_type == AT_NULL)
 			    break;
 		}
+		/* Since the auxiliary vector has moved, redigest it. */
+		for (i = 0;  i < AT_COUNT;  i++)
+		    aux_info[i] = NULL;
+		for (auxp = aux;  auxp->a_type != AT_NULL;  auxp++) {
+		    if (auxp->a_type < AT_COUNT)
+			aux_info[auxp->a_type] = auxp;
+		}
+
+		/* Point AT_EXECPATH auxv and aux_info to the binary path. */
+		if (binpath == NULL) {
+		    aux_info[AT_EXECPATH] = NULL;
+		} else {
+		    if (aux_info[AT_EXECPATH] == NULL) {
+			aux_info[AT_EXECPATH] = xmalloc(sizeof(Elf_Auxinfo));
+			aux_info[AT_EXECPATH]->a_type = AT_EXECPATH;
+		    }
+		    aux_info[AT_EXECPATH]->a_un.a_ptr = __DECONST(void *,
+		      binpath);
+		}
 	    } else {
-		rtld_printf("no binary\n");
+		_rtld_error("No binary");
 		rtld_die();
 	    }
 	}
@@ -625,7 +680,8 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     }
 #endif
 
-    digest_dynamic(obj_main, 0);
+    if (!digest_dynamic(obj_main, 0))
+	rtld_die();
     dbg("%s valid_hash_sysv %d valid_hash_gnu %d dynsymcount %d",
 	obj_main->path, obj_main->valid_hash_sysv, obj_main->valid_hash_gnu,
 	obj_main->dynsymcount);
@@ -652,7 +708,8 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     preload_tail = globallist_curr(TAILQ_LAST(&obj_list, obj_entry_q));
 
     dbg("loading needed objects");
-    if (load_needed_objects(obj_main, 0) == -1)
+    if (load_needed_objects(obj_main, ld_tracing != NULL ? RTLD_LO_TRACE :
+      0) == -1)
 	rtld_die();
 
     /* Make a list of all objects loaded at startup. */
@@ -706,14 +763,12 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     if (do_copy_relocations(obj_main) == -1)
 	rtld_die();
 
-    dbg("enforcing main obj relro");
-    if (obj_enforce_relro(obj_main) == -1)
-	rtld_die();
-
     if (getenv(_LD("DUMP_REL_POST")) != NULL) {
        dump_relocations(obj_main);
        exit (0);
     }
+
+    ifunc_init(aux);
 
     /*
      * Setup TLS for main thread.  This must be done after the
@@ -736,13 +791,6 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
     r_debug_state(NULL, &obj_main->linkmap); /* say hello to gdb! */
 
     map_stacks_exec(NULL);
-    ifunc_init(aux);
-
-    dbg("resolving ifuncs");
-    if (resolve_objects_ifunc(obj_main,
-      ld_bind_now != NULL && *ld_bind_now != '\0', SYMLOOK_EARLY,
-      NULL) == -1)
-	rtld_die();
 
     if (!obj_main->crt_no_init) {
 	/*
@@ -761,7 +809,26 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
      */
     pre_init();
 
+    if (direct_exec) {
+	/* Set osrel for direct-execed binary */
+	mib[0] = CTL_KERN;
+	mib[1] = KERN_PROC;
+	mib[2] = KERN_PROC_OSREL;
+	mib[3] = getpid();
+	osrel = obj_main->osrel;
+	sz = sizeof(old_osrel);
+	dbg("setting osrel to %d", osrel);
+	(void)sysctl(mib, 4, &old_osrel, &sz, &osrel, sizeof(osrel));
+    }
+
     wlock_acquire(rtld_bind_lock, &lockstate);
+
+    dbg("resolving ifuncs");
+    if (initlist_objects_ifunc(&initlist, ld_bind_now != NULL &&
+      *ld_bind_now != '\0', SYMLOOK_EARLY, &lockstate) == -1)
+	rtld_die();
+
+    rtld_exit_ptr = rtld_exit;
     if (obj_main->crt_no_init)
 	preinit_main();
     objlist_call_init(&initlist, &lockstate);
@@ -774,12 +841,17 @@ _rtld(Elf_Addr *sp, func_ptr_type *exit_proc, Obj_Entry **objp)
 	if (ld_loadfltr || obj->z_loadfltr)
 	    load_filtees(obj, 0, &lockstate);
     }
+
+    dbg("enforcing main obj relro");
+    if (obj_enforce_relro(obj_main) == -1)
+	rtld_die();
+
     lock_release(rtld_bind_lock, &lockstate);
 
     dbg("transferring control to program entry point = %p", obj_main->entry);
 
     /* Return the exit procedure and the program entry point. */
-    *exit_proc = rtld_exit;
+    *exit_proc = rtld_exit_ptr;
     *objp = obj_main;
     return (func_ptr_type) obj_main->entry;
 }
@@ -813,11 +885,11 @@ _rtld_bind(Obj_Entry *obj, Elf_Size reloff)
     if (sigsetjmp(lockstate.env, 0) != 0)
 	    lock_upgrade(rtld_bind_lock, &lockstate);
     if (obj->pltrel)
-	rel = (const Elf_Rel *) ((caddr_t) obj->pltrel + reloff);
+	rel = (const Elf_Rel *)((const char *)obj->pltrel + reloff);
     else
-	rel = (const Elf_Rel *) ((caddr_t) obj->pltrela + reloff);
+	rel = (const Elf_Rel *)((const char *)obj->pltrela + reloff);
 
-    where = (Elf_Addr *) (obj->relocbase + rel->r_offset);
+    where = (Elf_Addr *)(obj->relocbase + rel->r_offset);
     def = find_symdef(ELF_R_SYM(rel->r_info), obj, &defobj, SYMLOOK_IN_PLT,
 	NULL, &lockstate);
     if (def == NULL)
@@ -960,7 +1032,7 @@ origin_subst_one(Obj_Entry *obj, char *real, const char *kw,
 }
 
 static char *
-origin_subst(Obj_Entry *obj, char *real)
+origin_subst(Obj_Entry *obj, const char *real)
 {
 	char *res1, *res2, *res3, *res4;
 
@@ -972,7 +1044,9 @@ origin_subst(Obj_Entry *obj, char *real)
 			return (NULL);
 		}
 	}
-	res1 = origin_subst_one(obj, real, "$ORIGIN", NULL, false);
+	/* __DECONST is safe here since without may_free real is unchanged */
+	res1 = origin_subst_one(obj, __DECONST(char *, real), "$ORIGIN", NULL,
+	    false);
 	res2 = origin_subst_one(NULL, res1, "$OSNAME", uts.sysname, true);
 	res3 = origin_subst_one(NULL, res2, "$OSREL", uts.release, true);
 	res4 = origin_subst_one(NULL, res3, "$PLATFORM", uts.machine, true);
@@ -986,6 +1060,7 @@ rtld_die(void)
 
     if (msg == NULL)
 	msg = "Fatal error";
+    rtld_fdputstr(STDERR_FILENO, _BASENAME_RTLD ": ");
     rtld_fdputstr(STDERR_FILENO, msg);
     rtld_fdputchar(STDERR_FILENO, '\n');
     _exit(1);
@@ -1018,7 +1093,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	switch (dynp->d_tag) {
 
 	case DT_REL:
-	    obj->rel = (const Elf_Rel *) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->rel = (const Elf_Rel *)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_RELSZ:
@@ -1039,7 +1114,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_RELA:
-	    obj->rela = (const Elf_Rela *) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->rela = (const Elf_Rela *)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_RELASZ:
@@ -1065,7 +1140,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_STRTAB:
-	    obj->strtab = (const char *) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->strtab = (const char *)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_STRSZ:
@@ -1073,7 +1148,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_VERNEED:
-	    obj->verneed = (const Elf_Verneed *) (obj->relocbase +
+	    obj->verneed = (const Elf_Verneed *)(obj->relocbase +
 		dynp->d_un.d_val);
 	    break;
 
@@ -1082,7 +1157,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_VERDEF:
-	    obj->verdef = (const Elf_Verdef *) (obj->relocbase +
+	    obj->verdef = (const Elf_Verdef *)(obj->relocbase +
 		dynp->d_un.d_val);
 	    break;
 
@@ -1118,7 +1193,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 		bloom_size32 = (__ELF_WORD_SIZE / 32) * nmaskwords;
 		obj->maskwords_bm_gnu = nmaskwords - 1;
 		obj->shift2_gnu = hashtab[3];
-		obj->bloom_gnu = (Elf_Addr *) (hashtab + 4);
+		obj->bloom_gnu = (const Elf_Addr *)(hashtab + 4);
 		obj->buckets_gnu = hashtab + 4 + bloom_size32;
 		obj->chain_zero_gnu = obj->buckets_gnu + obj->nbuckets_gnu -
 		  obj->symndx_gnu;
@@ -1149,6 +1224,9 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 
 		*needed_filtees_tail = nep;
 		needed_filtees_tail = &nep->next;
+
+		if (obj->linkmap.l_refname == NULL)
+		    obj->linkmap.l_refname = (char *)dynp->d_un.d_val;
 	    }
 	    break;
 
@@ -1165,7 +1243,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_PLTGOT:
-	    obj->pltgot = (Elf_Addr *) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->pltgot = (Elf_Addr *)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_TEXTREL:
@@ -1193,7 +1271,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_INIT:
-	    obj->init = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->init = (Elf_Addr)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_PREINIT_ARRAY:
@@ -1213,7 +1291,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	    break;
 
 	case DT_FINI:
-	    obj->fini = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+	    obj->fini = (Elf_Addr)(obj->relocbase + dynp->d_un.d_ptr);
 	    break;
 
 	case DT_FINI_ARRAY:
@@ -1233,7 +1311,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	case DT_DEBUG:
 	    if (!early)
 		dbg("Filling in DT_DEBUG entry");
-	    ((Elf_Dyn*)dynp)->d_un.d_ptr = (Elf_Addr) &r_debug;
+	    (__DECONST(Elf_Dyn *, dynp))->d_un.d_ptr = (Elf_Addr)&r_debug;
 	    break;
 #endif
 
@@ -1246,8 +1324,8 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 		    obj->textrel = true;
 		if (dynp->d_un.d_val & DF_BIND_NOW)
 		    obj->bind_now = true;
-		/*if (dynp->d_un.d_val & DF_STATIC_TLS)
-		    ;*/
+		if (dynp->d_un.d_val & DF_STATIC_TLS)
+		    obj->static_tls = true;
 	    break;
 #ifdef __mips__
 	case DT_MIPS_LOCAL_GOTNO:
@@ -1266,17 +1344,30 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 		*((Elf_Addr *)(dynp->d_un.d_ptr)) = (Elf_Addr) &r_debug;
 		break;
 
+	case DT_MIPS_RLD_MAP_REL:
+		// The MIPS_RLD_MAP_REL tag stores the offset to the .rld_map
+		// section relative to the address of the tag itself.
+		*((Elf_Addr *)(__DECONST(char*, dynp) + dynp->d_un.d_val)) =
+		    (Elf_Addr) &r_debug;
+		break;
+
 	case DT_MIPS_PLTGOT:
-		obj->mips_pltgot = (Elf_Addr *) (obj->relocbase +
+		obj->mips_pltgot = (Elf_Addr *)(obj->relocbase +
 		    dynp->d_un.d_ptr);
 		break;
 		
 #endif
 
+#ifdef __powerpc__
 #ifdef __powerpc64__
 	case DT_PPC64_GLINK:
-		obj->glink = (Elf_Addr) (obj->relocbase + dynp->d_un.d_ptr);
+		obj->glink = (Elf_Addr)(obj->relocbase + dynp->d_un.d_ptr);
 		break;
+#else
+	case DT_PPC_GOT:
+		obj->gotptr = (Elf_Addr *)(obj->relocbase + dynp->d_un.d_ptr);
+		break;
+#endif
 #endif
 
 	case DT_FLAGS_1:
@@ -1296,6 +1387,8 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 		    obj->z_interpose = true;
 		if (dynp->d_un.d_val & DF_1_NODEFLIB)
 		    obj->z_nodeflib = true;
+		if (dynp->d_un.d_val & DF_1_PIE)
+		    obj->z_pie = true;
 	    break;
 
 	default:
@@ -1331,6 +1424,10 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
 	}
 	obj->dynsymcount += obj->symndx_gnu;
     }
+
+    if (obj->linkmap.l_refname != NULL)
+	obj->linkmap.l_refname = obj->strtab + (unsigned long)obj->
+	  linkmap.l_refname;
 }
 
 static bool
@@ -1343,26 +1440,27 @@ obj_resolve_origin(Obj_Entry *obj)
 	return (rtld_dirname_abs(obj->path, obj->origin_path) != -1);
 }
 
-static void
+static bool
 digest_dynamic2(Obj_Entry *obj, const Elf_Dyn *dyn_rpath,
     const Elf_Dyn *dyn_soname, const Elf_Dyn *dyn_runpath)
 {
 
 	if (obj->z_origin && !obj_resolve_origin(obj))
-		rtld_die();
+		return (false);
 
 	if (dyn_runpath != NULL) {
-		obj->runpath = (char *)obj->strtab + dyn_runpath->d_un.d_val;
+		obj->runpath = (const char *)obj->strtab + dyn_runpath->d_un.d_val;
 		obj->runpath = origin_subst(obj, obj->runpath);
 	} else if (dyn_rpath != NULL) {
-		obj->rpath = (char *)obj->strtab + dyn_rpath->d_un.d_val;
+		obj->rpath = (const char *)obj->strtab + dyn_rpath->d_un.d_val;
 		obj->rpath = origin_subst(obj, obj->rpath);
 	}
 	if (dyn_soname != NULL)
 		object_add_name(obj, obj->strtab + dyn_soname->d_un.d_val);
+	return (true);
 }
 
-static void
+static bool
 digest_dynamic(Obj_Entry *obj, int early)
 {
 	const Elf_Dyn *dyn_rpath;
@@ -1370,7 +1468,7 @@ digest_dynamic(Obj_Entry *obj, int early)
 	const Elf_Dyn *dyn_runpath;
 
 	digest_dynamic1(obj, early, &dyn_rpath, &dyn_soname, &dyn_runpath);
-	digest_dynamic2(obj, dyn_rpath, dyn_soname, dyn_runpath);
+	return (digest_dynamic2(obj, dyn_rpath, dyn_soname, dyn_runpath));
 }
 
 /*
@@ -1395,7 +1493,7 @@ digest_phdr(const Elf_Phdr *phdr, int phnum, caddr_t entry, const char *path)
 
 	obj->phdr = phdr;
 	obj->phsize = ph->p_memsz;
-	obj->relocbase = (caddr_t)phdr - ph->p_vaddr;
+	obj->relocbase = __DECONST(char *, phdr) - ph->p_vaddr;
 	break;
     }
 
@@ -1412,8 +1510,6 @@ digest_phdr(const Elf_Phdr *phdr, int phnum, caddr_t entry, const char *path)
 	    if (nsegs == 0) {	/* First load segment */
 		obj->vaddrbase = trunc_page(ph->p_vaddr);
 		obj->mapbase = obj->vaddrbase + obj->relocbase;
-		obj->textsize = round_page(ph->p_vaddr + ph->p_memsz) -
-		  obj->vaddrbase;
 	    } else {		/* Last load segment */
 		obj->mapsize = round_page(ph->p_vaddr + ph->p_memsz) -
 		  obj->vaddrbase;
@@ -1431,6 +1527,7 @@ digest_phdr(const Elf_Phdr *phdr, int phnum, caddr_t entry, const char *path)
 	    obj->tlsalign = ph->p_align;
 	    obj->tlsinitsize = ph->p_filesz;
 	    obj->tlsinit = (void*)(ph->p_vaddr + obj->relocbase);
+	    obj->tlspoffset = ph->p_offset;
 	    break;
 
 	case PT_GNU_STACK:
@@ -1473,6 +1570,7 @@ digest_notes(Obj_Entry *obj, Elf_Addr note_start, Elf_Addr note_end)
 		    note->n_descsz != sizeof(int32_t))
 			continue;
 		if (note->n_type != NT_FREEBSD_ABI_TAG &&
+		    note->n_type != NT_FREEBSD_FEATURE_CTL &&
 		    note->n_type != NT_FREEBSD_NOINIT_TAG)
 			continue;
 		note_name = (const char *)(note + 1);
@@ -1486,6 +1584,13 @@ digest_notes(Obj_Entry *obj, Elf_Addr note_start, Elf_Addr note_end)
 			p += roundup2(note->n_namesz, sizeof(Elf32_Addr));
 			obj->osrel = *(const int32_t *)(p);
 			dbg("note osrel %d", obj->osrel);
+			break;
+		case NT_FREEBSD_FEATURE_CTL:
+			/* FreeBSD ABI feature control note */
+			p = (uintptr_t)(note + 1);
+			p += roundup2(note->n_namesz, sizeof(Elf32_Addr));
+			obj->fctl0 = *(const uint32_t *)(p);
+			dbg("note fctl0 %#x", obj->fctl0);
 			break;
 		case NT_FREEBSD_NOINIT_TAG:
 			/* FreeBSD 'crt does not call init' note */
@@ -1599,15 +1704,15 @@ gnu_hash(const char *s)
 static char *
 find_library(const char *xname, const Obj_Entry *refobj, int *fdp)
 {
-	char *pathname;
-	char *name;
+	char *pathname, *refobj_path;
+	const char *name;
 	bool nodeflib, objgiven;
 
 	objgiven = refobj != NULL;
 
 	if (libmap_disable || !objgiven ||
 	    (name = lm_find(refobj->path, xname)) == NULL)
-		name = (char *)xname;
+		name = xname;
 
 	if (strchr(name, '/') != NULL) {	/* Hard coded pathname */
 		if (name[0] != '/' && !trust) {
@@ -1620,6 +1725,7 @@ find_library(const char *xname, const Obj_Entry *refobj, int *fdp)
 	}
 
 	dbg(" Searching for \"%s\"", name);
+	refobj_path = objgiven ? refobj->path : NULL;
 
 	/*
 	 * If refobj->rpath != NULL, then refobj->runpath is NULL.  Fall
@@ -1628,52 +1734,61 @@ find_library(const char *xname, const Obj_Entry *refobj, int *fdp)
 	 * nodeflib.
 	 */
 	if (objgiven && refobj->rpath != NULL && ld_library_path_rpath) {
-		pathname = search_library_path(name, ld_library_path, fdp);
+		pathname = search_library_path(name, ld_library_path,
+		    refobj_path, fdp);
 		if (pathname != NULL)
 			return (pathname);
 		if (refobj != NULL) {
-			pathname = search_library_path(name, refobj->rpath, fdp);
+			pathname = search_library_path(name, refobj->rpath,
+			    refobj_path, fdp);
 			if (pathname != NULL)
 				return (pathname);
 		}
 		pathname = search_library_pathfds(name, ld_library_dirs, fdp);
 		if (pathname != NULL)
 			return (pathname);
-		pathname = search_library_path(name, gethints(false), fdp);
+		pathname = search_library_path(name, gethints(false),
+		    refobj_path, fdp);
 		if (pathname != NULL)
 			return (pathname);
-		pathname = search_library_path(name, ld_standard_library_path, fdp);
+		pathname = search_library_path(name, ld_standard_library_path,
+		    refobj_path, fdp);
 		if (pathname != NULL)
 			return (pathname);
 	} else {
 		nodeflib = objgiven ? refobj->z_nodeflib : false;
 		if (objgiven) {
-			pathname = search_library_path(name, refobj->rpath, fdp);
+			pathname = search_library_path(name, refobj->rpath,
+			    refobj->path, fdp);
 			if (pathname != NULL)
 				return (pathname);
 		}
 		if (objgiven && refobj->runpath == NULL && refobj != obj_main) {
-			pathname = search_library_path(name, obj_main->rpath, fdp);
+			pathname = search_library_path(name, obj_main->rpath,
+			    refobj_path, fdp);
 			if (pathname != NULL)
 				return (pathname);
 		}
-		pathname = search_library_path(name, ld_library_path, fdp);
+		pathname = search_library_path(name, ld_library_path,
+		    refobj_path, fdp);
 		if (pathname != NULL)
 			return (pathname);
 		if (objgiven) {
-			pathname = search_library_path(name, refobj->runpath, fdp);
+			pathname = search_library_path(name, refobj->runpath,
+			    refobj_path, fdp);
 			if (pathname != NULL)
 				return (pathname);
 		}
 		pathname = search_library_pathfds(name, ld_library_dirs, fdp);
 		if (pathname != NULL)
 			return (pathname);
-		pathname = search_library_path(name, gethints(nodeflib), fdp);
+		pathname = search_library_path(name, gethints(nodeflib),
+		    refobj_path, fdp);
 		if (pathname != NULL)
 			return (pathname);
 		if (objgiven && !nodeflib) {
 			pathname = search_library_path(name,
-			    ld_standard_library_path, fdp);
+			    ld_standard_library_path, refobj_path, fdp);
 			if (pathname != NULL)
 				return (pathname);
 		}
@@ -1786,7 +1901,8 @@ find_symdef(unsigned long symnum, const Obj_Entry *refobj,
 static const char *
 gethints(bool nostdlib)
 {
-	static char *hints, *filtered_path;
+	static char *filtered_path;
+	static const char *hints;
 	static struct elfhints_hdr hdr;
 	struct fill_search_info_args sargs, hargs;
 	struct dl_serinfo smeta, hmeta, *SLPinfo, *hintinfo;
@@ -1868,8 +1984,9 @@ cleanup1:
 	hargs.request = RTLD_DI_SERINFOSIZE;
 	hargs.serinfo = &hmeta;
 
-	path_enumerate(ld_standard_library_path, fill_search_info, &sargs);
-	path_enumerate(hints, fill_search_info, &hargs);
+	path_enumerate(ld_standard_library_path, fill_search_info, NULL,
+	    &sargs);
+	path_enumerate(hints, fill_search_info, NULL, &hargs);
 
 	SLPinfo = xmalloc(smeta.dls_size);
 	hintinfo = xmalloc(hmeta.dls_size);
@@ -1887,8 +2004,9 @@ cleanup1:
 	hargs.serpath = &hintinfo->dls_serpath[0];
 	hargs.strspace = (char *)&hintinfo->dls_serpath[hmeta.dls_cnt];
 
-	path_enumerate(ld_standard_library_path, fill_search_info, &sargs);
-	path_enumerate(hints, fill_search_info, &hargs);
+	path_enumerate(ld_standard_library_path, fill_search_info, NULL,
+	    &sargs);
+	path_enumerate(hints, fill_search_info, NULL, &hargs);
 
 	/*
 	 * Now calculate the difference between two sets, by excluding
@@ -2051,6 +2169,34 @@ process_z(Obj_Entry *root)
 		}
 	}
 }
+
+static void
+parse_rtld_phdr(Obj_Entry *obj)
+{
+	const Elf_Phdr *ph;
+	Elf_Addr note_start, note_end;
+
+	obj->stack_flags = PF_X | PF_R | PF_W;
+	for (ph = obj->phdr;  (const char *)ph < (const char *)obj->phdr +
+	    obj->phsize; ph++) {
+		switch (ph->p_type) {
+		case PT_GNU_STACK:
+			obj->stack_flags = ph->p_flags;
+			break;
+		case PT_GNU_RELRO:
+			obj->relro_page = obj->relocbase +
+			    trunc_page(ph->p_vaddr);
+			obj->relro_size = round_page(ph->p_memsz);
+			break;
+		case PT_NOTE:
+			note_start = (Elf_Addr)obj->relocbase + ph->p_vaddr;
+			note_end = note_start + ph->p_filesz;
+			digest_notes(obj, note_start, note_end);
+			break;
+		}
+	}
+}
+
 /*
  * Initialize the dynamic linker.  The argument is the address at which
  * the dynamic linker has been mapped into memory.  The primary task of
@@ -2119,6 +2265,9 @@ init_rtld(caddr_t mapbase, Elf_Auxinfo **aux_info)
 
     /* Replace the path with a dynamically allocated copy. */
     obj_rtld.path = xstrdup(ld_path_rtld);
+
+    parse_rtld_phdr(&obj_rtld);
+    obj_enforce_relro(&obj_rtld);
 
     r_debug.r_brk = r_debug_state;
     r_debug.r_state = RT_CONSISTENT;
@@ -2218,9 +2367,7 @@ initlist_add_objects(Obj_Entry *obj, Obj_Entry *tail, Objlist *list)
 	initlist_add_neededs(obj->needed_aux_filtees, list);
 
     /* Add the object to the init list. */
-    if (obj->preinit_array != (Elf_Addr)NULL || obj->init != (Elf_Addr)NULL ||
-      obj->init_array != (Elf_Addr)NULL)
-	objlist_push_tail(list, obj);
+    objlist_push_tail(list, obj);
 
     /* Add the object to the global fini list in the reverse order. */
     if ((obj->fini != (Elf_Addr)NULL || obj->fini_array != (Elf_Addr)NULL)
@@ -2465,7 +2612,7 @@ do_load_object(int fd, const char *name, char *path, struct stat *sbp,
 	    return NULL;
 	}
 	if (fs.f_flags & MNT_NOEXEC) {
-	    _rtld_error("Cannot execute objects on %s\n", fs.f_mntonname);
+	    _rtld_error("Cannot execute objects on %s", fs.f_mntonname);
 	    return NULL;
 	}
     }
@@ -2481,16 +2628,20 @@ do_load_object(int fd, const char *name, char *path, struct stat *sbp,
     if (name != NULL)
 	object_add_name(obj, name);
     obj->path = path;
-    digest_dynamic(obj, 0);
+    if (!digest_dynamic(obj, 0))
+	goto errp;
     dbg("%s valid_hash_sysv %d valid_hash_gnu %d dynsymcount %d", obj->path,
 	obj->valid_hash_sysv, obj->valid_hash_gnu, obj->dynsymcount);
+    if (obj->z_pie && (flags & RTLD_LO_TRACE) == 0) {
+	dbg("refusing to load PIE executable \"%s\"", obj->path);
+	_rtld_error("Cannot load PIE binary %s as DSO", obj->path);
+	goto errp;
+    }
     if (obj->z_noopen && (flags & (RTLD_LO_DLOPEN | RTLD_LO_TRACE)) ==
       RTLD_LO_DLOPEN) {
 	dbg("refusing to load non-loadable \"%s\"", obj->path);
 	_rtld_error("Cannot dlopen non-loadable %s", obj->path);
-	munmap(obj->mapbase, obj->mapsize);
-	obj_free(obj);
-	return (NULL);
+	goto errp;
     }
 
     obj->dlopened = (flags & RTLD_LO_DLOPEN) != 0;
@@ -2507,7 +2658,12 @@ do_load_object(int fd, const char *name, char *path, struct stat *sbp,
     LD_UTRACE(UTRACE_LOAD_OBJECT, obj, obj->mapbase, obj->mapsize, 0,
 	obj->path);    
 
-    return obj;
+    return (obj);
+
+errp:
+    munmap(obj->mapbase, obj->mapsize);
+    obj_free(obj);
+    return (NULL);
 }
 
 static Obj_Entry *
@@ -2520,7 +2676,7 @@ obj_from_addr(const void *addr)
 	    continue;
 	if (addr < (void *) obj->mapbase)
 	    continue;
-	if (addr < (void *) (obj->mapbase + obj->mapsize))
+	if (addr < (void *)(obj->mapbase + obj->mapsize))
 	    return obj;
     }
     return NULL;
@@ -2636,6 +2792,7 @@ objlist_call_init(Objlist *list, RtldLockState *lockstate)
     Obj_Entry *obj;
     char *saved_msg;
     Elf_Addr *init_addr;
+    void (*reg)(void (*)(void));
     int index;
 
     /*
@@ -2664,7 +2821,16 @@ objlist_call_init(Objlist *list, RtldLockState *lockstate)
 	 */
 	elm->obj->init_done = true;
 	hold_object(elm->obj);
+	reg = NULL;
+	if (elm->obj == obj_main && obj_main->crt_no_init) {
+		reg = (void (*)(void (*)(void)))get_program_var_addr(
+		    "__libc_atexit", lockstate);
+	}
 	lock_release(rtld_bind_lock, lockstate);
+	if (reg != NULL) {
+		reg(rtld_exit);
+		rtld_exit_ptr = rtld_nop_exit;
+	}
 
         /*
          * It is legal to have both DT_INIT and DT_INIT_ARRAY defined.
@@ -2866,21 +3032,11 @@ relocate_object(Obj_Entry *obj, bool bind_now, Obj_Entry *rtldobj,
 	init_pltgot(obj);
 
 	/* Process the PLT relocations. */
-	if (reloc_plt(obj) == -1)
+	if (reloc_plt(obj, flags, lockstate) == -1)
 		return (-1);
 	/* Relocate the jump slots if we are doing immediate binding. */
-	if (obj->bind_now || bind_now)
-		if (reloc_jmpslots(obj, flags, lockstate) == -1)
-			return (-1);
-
-	/*
-	 * Process the non-PLT IFUNC relocations.  The relocations are
-	 * processed in two phases, because IFUNC resolvers may
-	 * reference other symbols, which must be readily processed
-	 * before resolvers are called.
-	 */
-	if (obj->non_plt_gnu_ifunc &&
-	    reloc_non_plt(obj, rtldobj, flags | SYMLOOK_IFUNC, lockstate))
+	if ((obj->bind_now || bind_now) && reloc_jmpslots(obj, flags,
+	    lockstate) == -1)
 		return (-1);
 
 	if (!obj->mainprog && obj_enforce_relro(obj) == -1)
@@ -2937,26 +3093,24 @@ static int
 resolve_object_ifunc(Obj_Entry *obj, bool bind_now, int flags,
     RtldLockState *lockstate)
 {
-	if (obj->irelative && reloc_iresolve(obj, lockstate) == -1)
-		return (-1);
-	if ((obj->bind_now || bind_now) && obj->gnu_ifunc &&
-	    reloc_gnu_ifunc(obj, flags, lockstate) == -1)
-		return (-1);
-	return (0);
-}
 
-static int
-resolve_objects_ifunc(Obj_Entry *first, bool bind_now, int flags,
-    RtldLockState *lockstate)
-{
-	Obj_Entry *obj;
-
-	for (obj = first; obj != NULL; obj = TAILQ_NEXT(obj, next)) {
-		if (obj->marker)
-			continue;
-		if (resolve_object_ifunc(obj, bind_now, flags, lockstate) == -1)
-			return (-1);
-	}
+	if (obj->ifuncs_resolved)
+		return (0);
+	obj->ifuncs_resolved = true;
+	if (!obj->irelative && !obj->irelative_nonplt &&
+	    !((obj->bind_now || bind_now) && obj->gnu_ifunc) &&
+	    !obj->non_plt_gnu_ifunc)
+		return (0);
+	if (obj_disable_relro(obj) == -1 ||
+	    (obj->irelative && reloc_iresolve(obj, lockstate) == -1) ||
+	    (obj->irelative_nonplt && reloc_iresolve_nonplt(obj,
+	    lockstate) == -1) ||
+	    ((obj->bind_now || bind_now) && obj->gnu_ifunc &&
+	    reloc_gnu_ifunc(obj, flags, lockstate) == -1) ||
+	    (obj->non_plt_gnu_ifunc && reloc_non_plt(obj, &obj_rtld,
+	    flags | SYMLOOK_IFUNC, lockstate) == -1) ||
+	    obj_enforce_relro(obj) == -1)
+		return (-1);
 	return (0);
 }
 
@@ -2965,9 +3119,13 @@ initlist_objects_ifunc(Objlist *list, bool bind_now, int flags,
     RtldLockState *lockstate)
 {
 	Objlist_Entry *elm;
+	Obj_Entry *obj;
 
 	STAILQ_FOREACH(elm, list, link) {
-		if (resolve_object_ifunc(elm->obj, bind_now, flags,
+		obj = elm->obj;
+		if (obj->marker)
+			continue;
+		if (resolve_object_ifunc(obj, bind_now, flags,
 		    lockstate) == -1)
 			return (-1);
 	}
@@ -2992,12 +3150,18 @@ rtld_exit(void)
     lock_release(rtld_bind_lock, &lockstate);
 }
 
+static void
+rtld_nop_exit(void)
+{
+}
+
 /*
  * Iterate over a search path, translate each element, and invoke the
  * callback on the result.
  */
 static void *
-path_enumerate(const char *path, path_enum_proc callback, void *arg)
+path_enumerate(const char *path, path_enum_proc callback,
+    const char *refobj_path, void *arg)
 {
     const char *trans;
     if (path == NULL)
@@ -3009,7 +3173,7 @@ path_enumerate(const char *path, path_enum_proc callback, void *arg)
 	char  *res;
 
 	len = strcspn(path, ":;");
-	trans = lm_findn(NULL, path, len);
+	trans = lm_findn(refobj_path, path, len);
 	if (trans)
 	    res = callback(trans, strlen(trans), arg);
 	else
@@ -3068,7 +3232,8 @@ try_library_path(const char *dir, size_t dirlen, void *param)
 }
 
 static char *
-search_library_path(const char *name, const char *path, int *fdp)
+search_library_path(const char *name, const char *path,
+    const char *refobj_path, int *fdp)
 {
     char *p;
     struct try_library_args arg;
@@ -3082,7 +3247,7 @@ search_library_path(const char *name, const char *path, int *fdp)
     arg.buflen = PATH_MAX;
     arg.fd = -1;
 
-    p = path_enumerate(path, try_library_path, &arg);
+    p = path_enumerate(path, try_library_path, refobj_path, &arg);
     *fdp = arg.fd;
 
     free(arg.buffer);
@@ -3215,12 +3380,12 @@ dlerror(void)
  */
 void
 dllockinit(void *context,
-	   void *(*lock_create)(void *context),
-           void (*rlock_acquire)(void *lock),
-           void (*wlock_acquire)(void *lock),
-           void (*lock_release)(void *lock),
-           void (*lock_destroy)(void *lock),
-	   void (*context_destroy)(void *context))
+    void *(*_lock_create)(void *context) __unused,
+    void (*_rlock_acquire)(void *lock) __unused,
+    void (*_wlock_acquire)(void *lock)  __unused,
+    void (*_lock_release)(void *lock) __unused,
+    void (*_lock_destroy)(void *lock) __unused,
+    void (*context_destroy)(void *context))
 {
     static void *cur_context;
     static void (*cur_context_destroy)(void *);
@@ -3258,7 +3423,7 @@ rtld_dlopen(const char *name, int fd, int mode)
 	rlock_acquire(rtld_bind_lock, &lockstate);
 	if (sigsetjmp(lockstate.env, 0) != 0)
 	    lock_upgrade(rtld_bind_lock, &lockstate);
-	environ = (char **)*get_program_var_addr("environ", &lockstate);
+	environ = __DECONST(char **, *get_program_var_addr("environ", &lockstate));
 	lock_release(rtld_bind_lock, &lockstate);
     }
     lo_flags = RTLD_LO_DLOPEN;
@@ -3266,8 +3431,10 @@ rtld_dlopen(const char *name, int fd, int mode)
 	    lo_flags |= RTLD_LO_NODELETE;
     if (mode & RTLD_NOLOAD)
 	    lo_flags |= RTLD_LO_NOLOAD;
+    if (mode & RTLD_DEEPBIND)
+	    lo_flags |= RTLD_LO_DEEPBIND;
     if (ld_tracing != NULL)
-	    lo_flags |= RTLD_LO_TRACE;
+	    lo_flags |= RTLD_LO_TRACE | RTLD_LO_IGNSTLS;
 
     return (dlopen_object(name, fd, obj_main, lo_flags,
       mode & (RTLD_MODEMASK | RTLD_GLOBAL), NULL));
@@ -3293,6 +3460,9 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
     RtldLockState mlockstate;
     int result;
 
+    dbg("dlopen_object name \"%s\" fd %d refobj \"%s\" lo_flags %#x mode %#x",
+      name != NULL ? name : "<null>", fd, refobj == NULL ? "<null>" :
+      refobj->path, lo_flags, mode);
     objlist_init(&initlist);
 
     if (lockstate == NULL && !(lo_flags & RTLD_LO_EARLY)) {
@@ -3317,8 +3487,18 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
 	if (globallist_next(old_obj_tail) != NULL) {
 	    /* We loaded something new. */
 	    assert(globallist_next(old_obj_tail) == obj);
-	    result = load_needed_objects(obj,
-		lo_flags & (RTLD_LO_DLOPEN | RTLD_LO_EARLY));
+	    if ((lo_flags & RTLD_LO_DEEPBIND) != 0)
+		obj->symbolic = true;
+	    result = 0;
+	    if ((lo_flags & (RTLD_LO_EARLY | RTLD_LO_IGNSTLS)) == 0 &&
+	      obj->static_tls && !allocate_tls_offset(obj)) {
+		_rtld_error("%s: No space available "
+		  "for static Thread Local Storage", obj->path);
+		result = -1;
+	    }
+	    if (result != -1)
+		result = load_needed_objects(obj, lo_flags & (RTLD_LO_DLOPEN |
+		  RTLD_LO_EARLY | RTLD_LO_IGNSTLS | RTLD_LO_TRACE));
 	    init_dag(obj);
 	    ref_dag(obj);
 	    if (result != -1)
@@ -3378,8 +3558,10 @@ dlopen_object(const char *name, int fd, Obj_Entry *refobj, int lo_flags,
 	name);
     GDB_STATE(RT_CONSISTENT,obj ? &obj->linkmap : NULL);
 
-    if (!(lo_flags & RTLD_LO_EARLY)) {
+    if ((lo_flags & RTLD_LO_EARLY) == 0) {
 	map_stacks_exec(lockstate);
+	if (obj != NULL)
+	    distribute_static_tls(&initlist, lockstate);
     }
 
     if (initlist_objects_ifunc(&initlist, (mode & RTLD_MODEMASK) == RTLD_NOW,
@@ -3799,12 +3981,12 @@ do_search_info(const Obj_Entry *obj, int request, struct dl_serinfo *info)
     _info.dls_size = __offsetof(struct dl_serinfo, dls_serpath);
     _info.dls_cnt  = 0;
 
-    path_enumerate(obj->rpath, fill_search_info, &args);
-    path_enumerate(ld_library_path, fill_search_info, &args);
-    path_enumerate(obj->runpath, fill_search_info, &args);
-    path_enumerate(gethints(obj->z_nodeflib), fill_search_info, &args);
+    path_enumerate(obj->rpath, fill_search_info, NULL, &args);
+    path_enumerate(ld_library_path, fill_search_info, NULL, &args);
+    path_enumerate(obj->runpath, fill_search_info, NULL, &args);
+    path_enumerate(gethints(obj->z_nodeflib), fill_search_info, NULL, &args);
     if (!obj->z_nodeflib)
-      path_enumerate(ld_standard_library_path, fill_search_info, &args);
+      path_enumerate(ld_standard_library_path, fill_search_info, NULL, &args);
 
 
     if (request == RTLD_DI_SERINFOSIZE) {
@@ -3824,25 +4006,25 @@ do_search_info(const Obj_Entry *obj, int request, struct dl_serinfo *info)
     args.strspace = (char *)&info->dls_serpath[_info.dls_cnt];
 
     args.flags = LA_SER_RUNPATH;
-    if (path_enumerate(obj->rpath, fill_search_info, &args) != NULL)
+    if (path_enumerate(obj->rpath, fill_search_info, NULL, &args) != NULL)
 	return (-1);
 
     args.flags = LA_SER_LIBPATH;
-    if (path_enumerate(ld_library_path, fill_search_info, &args) != NULL)
+    if (path_enumerate(ld_library_path, fill_search_info, NULL, &args) != NULL)
 	return (-1);
 
     args.flags = LA_SER_RUNPATH;
-    if (path_enumerate(obj->runpath, fill_search_info, &args) != NULL)
+    if (path_enumerate(obj->runpath, fill_search_info, NULL, &args) != NULL)
 	return (-1);
 
     args.flags = LA_SER_CONFIG;
-    if (path_enumerate(gethints(obj->z_nodeflib), fill_search_info, &args)
+    if (path_enumerate(gethints(obj->z_nodeflib), fill_search_info, NULL, &args)
       != NULL)
 	return (-1);
 
     args.flags = LA_SER_DEFAULT;
-    if (!obj->z_nodeflib &&
-      path_enumerate(ld_standard_library_path, fill_search_info, &args) != NULL)
+    if (!obj->z_nodeflib && path_enumerate(ld_standard_library_path,
+      fill_search_info, NULL, &args) != NULL)
 	return (-1);
     return (0);
 }
@@ -3895,12 +4077,17 @@ rtld_dirname_abs(const char *path, char *base)
 {
 	char *last;
 
-	if (realpath(path, base) == NULL)
+	if (realpath(path, base) == NULL) {
+		_rtld_error("realpath \"%s\" failed (%s)", path,
+		    rtld_strerror(errno));
 		return (-1);
+	}
 	dbg("%s -> %s", path, base);
 	last = strrchr(base, '/');
-	if (last == NULL)
+	if (last == NULL) {
+		_rtld_error("non-abs result from realpath \"%s\"", path);
 		return (-1);
+	}
 	if (last != base)
 		*last = '\0';
 	return (0);
@@ -3909,52 +4096,50 @@ rtld_dirname_abs(const char *path, char *base)
 static void
 linkmap_add(Obj_Entry *obj)
 {
-    struct link_map *l = &obj->linkmap;
-    struct link_map *prev;
+	struct link_map *l, *prev;
 
-    obj->linkmap.l_name = obj->path;
-    obj->linkmap.l_addr = obj->mapbase;
-    obj->linkmap.l_ld = obj->dynamic;
-#ifdef __mips__
-    /* GDB needs load offset on MIPS to use the symbols */
-    obj->linkmap.l_offs = obj->relocbase;
-#endif
+	l = &obj->linkmap;
+	l->l_name = obj->path;
+	l->l_base = obj->mapbase;
+	l->l_ld = obj->dynamic;
+	l->l_addr = obj->relocbase;
 
-    if (r_debug.r_map == NULL) {
-	r_debug.r_map = l;
-	return;
-    }
+	if (r_debug.r_map == NULL) {
+		r_debug.r_map = l;
+		return;
+	}
 
-    /*
-     * Scan to the end of the list, but not past the entry for the
-     * dynamic linker, which we want to keep at the very end.
-     */
-    for (prev = r_debug.r_map;
-      prev->l_next != NULL && prev->l_next != &obj_rtld.linkmap;
-      prev = prev->l_next)
-	;
+	/*
+	 * Scan to the end of the list, but not past the entry for the
+	 * dynamic linker, which we want to keep at the very end.
+	 */
+	for (prev = r_debug.r_map;
+	    prev->l_next != NULL && prev->l_next != &obj_rtld.linkmap;
+	     prev = prev->l_next)
+		;
 
-    /* Link in the new entry. */
-    l->l_prev = prev;
-    l->l_next = prev->l_next;
-    if (l->l_next != NULL)
-	l->l_next->l_prev = l;
-    prev->l_next = l;
+	/* Link in the new entry. */
+	l->l_prev = prev;
+	l->l_next = prev->l_next;
+	if (l->l_next != NULL)
+		l->l_next->l_prev = l;
+	prev->l_next = l;
 }
 
 static void
 linkmap_delete(Obj_Entry *obj)
 {
-    struct link_map *l = &obj->linkmap;
+	struct link_map *l;
 
-    if (l->l_prev == NULL) {
-	if ((r_debug.r_map = l->l_next) != NULL)
-	    l->l_next->l_prev = NULL;
-	return;
-    }
+	l = &obj->linkmap;
+	if (l->l_prev == NULL) {
+		if ((r_debug.r_map = l->l_next) != NULL)
+			l->l_next->l_prev = NULL;
+		return;
+	}
 
-    if ((l->l_prev->l_next = l->l_next) != NULL)
-	l->l_next->l_prev = l->l_prev;
+	if ((l->l_prev->l_next = l->l_next) != NULL)
+		l->l_next->l_prev = l->l_prev;
 }
 
 /*
@@ -3971,7 +4156,7 @@ linkmap_delete(Obj_Entry *obj)
  *  +0   RetAddr
  */
 void
-r_debug_state(struct r_debug* rd, struct link_map *m)
+r_debug_state(struct r_debug* rd __unused, struct link_map *m  __unused)
 {
     /*
      * The following is a hack to force the compiler to emit calls to
@@ -3989,7 +4174,7 @@ r_debug_state(struct r_debug* rd, struct link_map *m)
  * main is not available in the symbol table.
  */
 void
-_r_debug_postinit(struct link_map *m)
+_r_debug_postinit(struct link_map *m __unused)
 {
 
 	/* See r_debug_state(). */
@@ -4310,8 +4495,8 @@ matched_symbol(SymLook *req, const Obj_Entry *obj, Sym_Match_Result *result,
 		else if (((req->flags & SYMLOOK_IN_PLT) == 0) &&
 		    (ELF_ST_TYPE(symp->st_info) == STT_FUNC))
 			break;
-		/* fallthrough */
 #endif
+		/* fallthrough */
 	default:
 		return (false);
 	}
@@ -4480,8 +4665,8 @@ symlook_obj1_gnu(SymLook *req, const Obj_Entry *obj)
 static void
 trace_loaded_objects(Obj_Entry *obj)
 {
-    char	*fmt1, *fmt2, *fmt, *main_local, *list_containers;
-    int		c;
+    const char *fmt1, *fmt2, *fmt, *main_local, *list_containers;
+    int c;
 
     if ((main_local = getenv(_LD("TRACE_LOADED_OBJECTS_PROGNAME"))) == NULL)
 	main_local = "";
@@ -4495,9 +4680,9 @@ trace_loaded_objects(Obj_Entry *obj)
     list_containers = getenv(_LD("TRACE_LOADED_OBJECTS_ALL"));
 
     for (; obj != NULL; obj = TAILQ_NEXT(obj, next)) {
-	Needed_Entry		*needed;
-	char			*name, *path;
-	bool			is_lib;
+	Needed_Entry *needed;
+	const char *name, *path;
+	bool is_lib;
 
 	if (obj->marker)
 	    continue;
@@ -4512,7 +4697,7 @@ trace_loaded_objects(Obj_Entry *obj)
 	    } else
 		path = "not found";
 
-	    name = (char *)obj->strtab + needed->name;
+	    name = obj->strtab + needed->name;
 	    is_lib = strncmp(name, "lib", 3) == 0;	/* XXX - bogus */
 
 	    fmt = is_lib ? fmt1 : fmt2;
@@ -4716,54 +4901,100 @@ tls_get_addr_common(Elf_Addr **dtvp, int index, size_t offset)
     defined(__powerpc__) || defined(__riscv)
 
 /*
+ * Return pointer to allocated TLS block
+ */
+static void *
+get_tls_block_ptr(void *tcb, size_t tcbsize)
+{
+    size_t extra_size, post_size, pre_size, tls_block_size;
+    size_t tls_init_align;
+
+    tls_init_align = MAX(obj_main->tlsalign, 1);
+
+    /* Compute fragments sizes. */
+    extra_size = tcbsize - TLS_TCB_SIZE;
+    post_size = calculate_tls_post_size(tls_init_align);
+    tls_block_size = tcbsize + post_size;
+    pre_size = roundup2(tls_block_size, tls_init_align) - tls_block_size;
+
+    return ((char *)tcb - pre_size - extra_size);
+}
+
+/*
  * Allocate Static TLS using the Variant I method.
+ *
+ * For details on the layout, see lib/libc/gen/tls.c.
+ *
+ * NB: rtld's tls_static_space variable includes TLS_TCB_SIZE and post_size as
+ *     it is based on tls_last_offset, and TLS offsets here are really TCB
+ *     offsets, whereas libc's tls_static_space is just the executable's static
+ *     TLS segment.
  */
 void *
 allocate_tls(Obj_Entry *objs, void *oldtcb, size_t tcbsize, size_t tcbalign)
 {
     Obj_Entry *obj;
-    char *tcb;
-    Elf_Addr **tls;
-    Elf_Addr *dtv;
+    char *tls_block;
+    Elf_Addr *dtv, **tcb;
     Elf_Addr addr;
-    int i;
+    Elf_Addr i;
+    size_t extra_size, maxalign, post_size, pre_size, tls_block_size;
+    size_t tls_init_align, tls_init_offset;
 
     if (oldtcb != NULL && tcbsize == TLS_TCB_SIZE)
 	return (oldtcb);
 
     assert(tcbsize >= TLS_TCB_SIZE);
-    tcb = xcalloc(1, tls_static_space - TLS_TCB_SIZE + tcbsize);
-    tls = (Elf_Addr **)(tcb + tcbsize - TLS_TCB_SIZE);
+    maxalign = MAX(tcbalign, tls_static_max_align);
+    tls_init_align = MAX(obj_main->tlsalign, 1);
+
+    /* Compute fragmets sizes. */
+    extra_size = tcbsize - TLS_TCB_SIZE;
+    post_size = calculate_tls_post_size(tls_init_align);
+    tls_block_size = tcbsize + post_size;
+    pre_size = roundup2(tls_block_size, tls_init_align) - tls_block_size;
+    tls_block_size += pre_size + tls_static_space - TLS_TCB_SIZE - post_size;
+
+    /* Allocate whole TLS block */
+    tls_block = malloc_aligned(tls_block_size, maxalign, 0);
+    tcb = (Elf_Addr **)(tls_block + pre_size + extra_size);
 
     if (oldtcb != NULL) {
-	memcpy(tls, oldtcb, tls_static_space);
-	free(oldtcb);
+	memcpy(tls_block, get_tls_block_ptr(oldtcb, tcbsize),
+	    tls_static_space);
+	free_aligned(get_tls_block_ptr(oldtcb, tcbsize));
 
 	/* Adjust the DTV. */
-	dtv = tls[0];
+	dtv = tcb[0];
 	for (i = 0; i < dtv[1]; i++) {
 	    if (dtv[i+2] >= (Elf_Addr)oldtcb &&
 		dtv[i+2] < (Elf_Addr)oldtcb + tls_static_space) {
-		dtv[i+2] = dtv[i+2] - (Elf_Addr)oldtcb + (Elf_Addr)tls;
+		dtv[i+2] = dtv[i+2] - (Elf_Addr)oldtcb + (Elf_Addr)tcb;
 	    }
 	}
     } else {
 	dtv = xcalloc(tls_max_index + 2, sizeof(Elf_Addr));
-	tls[0] = dtv;
+	tcb[0] = dtv;
 	dtv[0] = tls_dtv_generation;
 	dtv[1] = tls_max_index;
 
 	for (obj = globallist_curr(objs); obj != NULL;
 	  obj = globallist_next(obj)) {
-	    if (obj->tlsoffset > 0) {
-		addr = (Elf_Addr)tls + obj->tlsoffset;
-		if (obj->tlsinitsize > 0)
-		    memcpy((void*) addr, obj->tlsinit, obj->tlsinitsize);
-		if (obj->tlssize > obj->tlsinitsize)
-		    memset((void*) (addr + obj->tlsinitsize), 0,
-			   obj->tlssize - obj->tlsinitsize);
-		dtv[obj->tlsindex + 1] = addr;
+	    if (obj->tlsoffset == 0)
+		continue;
+	    tls_init_offset = obj->tlspoffset & (obj->tlsalign - 1);
+	    addr = (Elf_Addr)tcb + obj->tlsoffset;
+	    if (tls_init_offset > 0)
+		memset((void *)addr, 0, tls_init_offset);
+	    if (obj->tlsinitsize > 0) {
+		memcpy((void *)(addr + tls_init_offset), obj->tlsinit,
+		    obj->tlsinitsize);
 	    }
+	    if (obj->tlssize > obj->tlsinitsize) {
+		memset((void *)(addr + tls_init_offset + obj->tlsinitsize),
+		    0, obj->tlssize - obj->tlsinitsize - tls_init_offset);
+	    }
+	    dtv[obj->tlsindex + 1] = addr;
 	}
     }
 
@@ -4771,18 +5002,23 @@ allocate_tls(Obj_Entry *objs, void *oldtcb, size_t tcbsize, size_t tcbalign)
 }
 
 void
-free_tls(void *tcb, size_t tcbsize, size_t tcbalign)
+free_tls(void *tcb, size_t tcbsize, size_t tcbalign __unused)
 {
     Elf_Addr *dtv;
     Elf_Addr tlsstart, tlsend;
-    int dtvsize, i;
+    size_t post_size;
+    size_t dtvsize, i, tls_init_align;
 
     assert(tcbsize >= TLS_TCB_SIZE);
+    tls_init_align = MAX(obj_main->tlsalign, 1);
 
-    tlsstart = (Elf_Addr)tcb + tcbsize - TLS_TCB_SIZE;
-    tlsend = tlsstart + tls_static_space;
+    /* Compute fragments sizes. */
+    post_size = calculate_tls_post_size(tls_init_align);
 
-    dtv = *(Elf_Addr **)tlsstart;
+    tlsstart = (Elf_Addr)tcb + TLS_TCB_SIZE + post_size;
+    tlsend = (Elf_Addr)tcb + tls_static_space;
+
+    dtv = *(Elf_Addr **)tcb;
     dtvsize = dtv[1];
     for (i = 0; i < dtvsize; i++) {
 	if (dtv[i+2] && (dtv[i+2] < tlsstart || dtv[i+2] >= tlsend)) {
@@ -4790,12 +5026,12 @@ free_tls(void *tcb, size_t tcbsize, size_t tcbalign)
 	}
     }
     free(dtv);
-    free(tcb);
+    free_aligned(get_tls_block_ptr(tcb, tcbsize));
 }
 
 #endif
 
-#if defined(__i386__) || defined(__amd64__) || defined(__sparc64__)
+#if defined(__i386__) || defined(__amd64__)
 
 /*
  * Allocate Static TLS using the Variant II method.
@@ -4808,18 +5044,18 @@ allocate_tls(Obj_Entry *objs, void *oldtls, size_t tcbsize, size_t tcbalign)
     char *tls;
     Elf_Addr *dtv, *olddtv;
     Elf_Addr segbase, oldsegbase, addr;
-    int i;
+    size_t i;
 
     ralign = tcbalign;
     if (tls_static_max_align > ralign)
 	    ralign = tls_static_max_align;
-    size = round(tls_static_space, ralign) + round(tcbsize, ralign);
+    size = roundup(tls_static_space, ralign) + roundup(tcbsize, ralign);
 
     assert(tcbsize >= 2*sizeof(Elf_Addr));
-    tls = malloc_aligned(size, ralign);
+    tls = malloc_aligned(size, ralign, 0 /* XXX */);
     dtv = xcalloc(tls_max_index + 2, sizeof(Elf_Addr));
 
-    segbase = (Elf_Addr)(tls + round(tls_static_space, ralign));
+    segbase = (Elf_Addr)(tls + roundup(tls_static_space, ralign));
     ((Elf_Addr*)segbase)[0] = segbase;
     ((Elf_Addr*)segbase)[1] = (Elf_Addr) dtv;
 
@@ -4857,10 +5093,12 @@ allocate_tls(Obj_Entry *objs, void *oldtls, size_t tcbsize, size_t tcbalign)
 		if (obj->marker || obj->tlsoffset == 0)
 			continue;
 		addr = segbase - obj->tlsoffset;
-		memset((void*) (addr + obj->tlsinitsize),
+		memset((void*)(addr + obj->tlsinitsize),
 		       0, obj->tlssize - obj->tlsinitsize);
-		if (obj->tlsinit)
+		if (obj->tlsinit) {
 		    memcpy((void*) addr, obj->tlsinit, obj->tlsinitsize);
+		    obj->static_tls_copied = true;
+		}
 		dtv[obj->tlsindex + 1] = addr;
 	}
     }
@@ -4869,7 +5107,7 @@ allocate_tls(Obj_Entry *objs, void *oldtls, size_t tcbsize, size_t tcbalign)
 }
 
 void
-free_tls(void *tls, size_t tcbsize, size_t tcbalign)
+free_tls(void *tls, size_t tcbsize  __unused, size_t tcbalign)
 {
     Elf_Addr* dtv;
     size_t size, ralign;
@@ -4883,7 +5121,7 @@ free_tls(void *tls, size_t tcbsize, size_t tcbalign)
     ralign = tcbalign;
     if (tls_static_max_align > ralign)
 	    ralign = tls_static_max_align;
-    size = round(tls_static_space, ralign);
+    size = roundup(tls_static_space, ralign);
 
     dtv = ((Elf_Addr**)tls)[1];
     dtvsize = dtv[1];
@@ -4907,25 +5145,24 @@ free_tls(void *tls, size_t tcbsize, size_t tcbalign)
 void *
 allocate_module_tls(int index)
 {
-    Obj_Entry* obj;
-    char* p;
+	Obj_Entry *obj;
+	char *p;
 
-    TAILQ_FOREACH(obj, &obj_list, next) {
-	if (obj->marker)
-	    continue;
-	if (obj->tlsindex == index)
-	    break;
-    }
-    if (!obj) {
-	_rtld_error("Can't find module with TLS index %d", index);
-	rtld_die();
-    }
+	TAILQ_FOREACH(obj, &obj_list, next) {
+		if (obj->marker)
+			continue;
+		if (obj->tlsindex == index)
+			break;
+	}
+	if (obj == NULL) {
+		_rtld_error("Can't find module with TLS index %d", index);
+		rtld_die();
+	}
 
-    p = malloc_aligned(obj->tlssize, obj->tlsalign);
-    memcpy(p, obj->tlsinit, obj->tlsinitsize);
-    memset(p + obj->tlsinitsize, 0, obj->tlssize - obj->tlsinitsize);
-
-    return p;
+	p = malloc_aligned(obj->tlssize, obj->tlsalign, obj->tlspoffset);
+	memcpy(p, obj->tlsinit, obj->tlsinitsize);
+	memset(p + obj->tlsinitsize, 0, obj->tlssize - obj->tlsinitsize);
+	return (p);
 }
 
 bool
@@ -4942,10 +5179,11 @@ allocate_tls_offset(Obj_Entry *obj)
     }
 
     if (tls_last_offset == 0)
-	off = calculate_first_tls_offset(obj->tlssize, obj->tlsalign);
+	off = calculate_first_tls_offset(obj->tlssize, obj->tlsalign,
+	  obj->tlspoffset);
     else
 	off = calculate_tls_offset(tls_last_offset, tls_last_size,
-				   obj->tlssize, obj->tlsalign);
+	  obj->tlssize, obj->tlsalign, obj->tlspoffset);
 
     /*
      * If we have already fixed the size of the static TLS block, we
@@ -5085,13 +5323,13 @@ check_object_provided_version(Obj_Entry *refobj, const Obj_Entry *depobj,
 	}
 	if (vna->vna_hash == vd->vd_hash) {
 	    const Elf_Verdaux *aux = (const Elf_Verdaux *)
-		((char *)vd + vd->vd_aux);
+		((const char *)vd + vd->vd_aux);
 	    if (strcmp(vername, depobj->strtab + aux->vda_name) == 0)
 		return (0);
 	}
 	if (vd->vd_next == 0)
 	    break;
-	vd = (const Elf_Verdef *) ((char *)vd + vd->vd_next);
+	vd = (const Elf_Verdef *)((const char *)vd + vd->vd_next);
     }
     if (vna->vna_flags & VER_FLG_WEAK)
 	return (0);
@@ -5127,18 +5365,18 @@ rtld_verify_object_versions(Obj_Entry *obj)
 		obj->path, vn->vn_version);
 	    return (-1);
 	}
-	vna = (const Elf_Vernaux *) ((char *)vn + vn->vn_aux);
+	vna = (const Elf_Vernaux *)((const char *)vn + vn->vn_aux);
 	for (;;) {
 	    vernum = VER_NEED_IDX(vna->vna_other);
 	    if (vernum > maxvernum)
 		maxvernum = vernum;
 	    if (vna->vna_next == 0)
 		 break;
-	    vna = (const Elf_Vernaux *) ((char *)vna + vna->vna_next);
+	    vna = (const Elf_Vernaux *)((const char *)vna + vna->vna_next);
 	}
 	if (vn->vn_next == 0)
 	    break;
-	vn = (const Elf_Verneed *) ((char *)vn + vn->vn_next);
+	vn = (const Elf_Verneed *)((const char *)vn + vn->vn_next);
     }
 
     vd = obj->verdef;
@@ -5153,7 +5391,7 @@ rtld_verify_object_versions(Obj_Entry *obj)
 		maxvernum = vernum;
 	if (vd->vd_next == 0)
 	    break;
-	vd = (const Elf_Verdef *) ((char *)vd + vd->vd_next);
+	vd = (const Elf_Verdef *)((const char *)vd + vd->vd_next);
     }
 
     if (maxvernum == 0)
@@ -5172,7 +5410,7 @@ rtld_verify_object_versions(Obj_Entry *obj)
 	if ((vd->vd_flags & VER_FLG_BASE) == 0) {
 	    vernum = VER_DEF_IDX(vd->vd_ndx);
 	    assert(vernum <= maxvernum);
-	    vda = (const Elf_Verdaux *)((char *)vd + vd->vd_aux);
+	    vda = (const Elf_Verdaux *)((const char *)vd + vd->vd_aux);
 	    obj->vertab[vernum].hash = vd->vd_hash;
 	    obj->vertab[vernum].name = obj->strtab + vda->vda_name;
 	    obj->vertab[vernum].file = NULL;
@@ -5180,7 +5418,7 @@ rtld_verify_object_versions(Obj_Entry *obj)
 	}
 	if (vd->vd_next == 0)
 	    break;
-	vd = (const Elf_Verdef *) ((char *)vd + vd->vd_next);
+	vd = (const Elf_Verdef *)((const char *)vd + vd->vd_next);
     }
 
     vn = obj->verneed;
@@ -5188,7 +5426,7 @@ rtld_verify_object_versions(Obj_Entry *obj)
 	depobj = locate_dependency(obj, obj->strtab + vn->vn_file);
 	if (depobj == NULL)
 	    return (-1);
-	vna = (const Elf_Vernaux *) ((char *)vn + vn->vn_aux);
+	vna = (const Elf_Vernaux *)((const char *)vn + vn->vn_aux);
 	for (;;) {
 	    if (check_object_provided_version(obj, depobj, vna))
 		return (-1);
@@ -5201,11 +5439,11 @@ rtld_verify_object_versions(Obj_Entry *obj)
 		VER_INFO_HIDDEN : 0;
 	    if (vna->vna_next == 0)
 		 break;
-	    vna = (const Elf_Vernaux *) ((char *)vna + vna->vna_next);
+	    vna = (const Elf_Vernaux *)((const char *)vna + vna->vna_next);
 	}
 	if (vn->vn_next == 0)
 	    break;
-	vn = (const Elf_Verneed *) ((char *)vn + vn->vn_next);
+	vn = (const Elf_Verneed *)((const char *)vn + vn->vn_next);
     }
     return 0;
 }
@@ -5280,17 +5518,31 @@ _rtld_is_dlopened(void *arg)
 	return (res);
 }
 
-int
-obj_enforce_relro(Obj_Entry *obj)
+static int
+obj_remap_relro(Obj_Entry *obj, int prot)
 {
 
 	if (obj->relro_size > 0 && mprotect(obj->relro_page, obj->relro_size,
-	    PROT_READ) == -1) {
-		_rtld_error("%s: Cannot enforce relro protection: %s",
-		    obj->path, rtld_strerror(errno));
+	    prot) == -1) {
+		_rtld_error("%s: Cannot set relro protection to %#x: %s",
+		    obj->path, prot, rtld_strerror(errno));
 		return (-1);
 	}
 	return (0);
+}
+
+static int
+obj_disable_relro(Obj_Entry *obj)
+{
+
+	return (obj_remap_relro(obj, PROT_READ | PROT_WRITE));
+}
+
+static int
+obj_enforce_relro(Obj_Entry *obj)
+{
+
+	return (obj_remap_relro(obj, PROT_READ));
 }
 
 static void
@@ -5305,6 +5557,27 @@ map_stacks_exec(RtldLockState *lockstate)
 	if (thr_map_stacks_exec != NULL) {
 		stack_prot |= PROT_EXEC;
 		thr_map_stacks_exec();
+	}
+}
+
+static void
+distribute_static_tls(Objlist *list, RtldLockState *lockstate)
+{
+	Objlist_Entry *elm;
+	Obj_Entry *obj;
+	void (*distrib)(size_t, void *, size_t, size_t);
+
+	distrib = (void (*)(size_t, void *, size_t, size_t))(uintptr_t)
+	    get_program_var_addr("__pthread_distribute_static_tls", lockstate);
+	if (distrib == NULL)
+		return;
+	STAILQ_FOREACH(elm, list, link) {
+		obj = elm->obj;
+		if (obj->marker || !obj->tls_done || obj->static_tls_copied)
+			continue;
+		distrib(obj->tlsoffset, obj->tlsinit, obj->tlsinitsize,
+		    obj->tlssize);
+		obj->static_tls_copied = true;
 	}
 }
 
@@ -5333,49 +5606,64 @@ symlook_init_from_req(SymLook *dst, const SymLook *src)
 }
 
 static int
-open_binary_fd(const char *argv0, bool search_in_path)
+open_binary_fd(const char *argv0, bool search_in_path,
+    const char **binpath_res)
 {
-	char *pathenv, *pe, binpath[PATH_MAX];
+	char *binpath, *pathenv, *pe, *res1;
+	const char *res;
 	int fd;
 
+	binpath = NULL;
+	res = NULL;
 	if (search_in_path && strchr(argv0, '/') == NULL) {
+		binpath = xmalloc(PATH_MAX);
 		pathenv = getenv("PATH");
 		if (pathenv == NULL) {
-			rtld_printf("-p and no PATH environment variable\n");
+			_rtld_error("-p and no PATH environment variable");
 			rtld_die();
 		}
 		pathenv = strdup(pathenv);
 		if (pathenv == NULL) {
-			rtld_printf("Cannot allocate memory\n");
+			_rtld_error("Cannot allocate memory");
 			rtld_die();
 		}
 		fd = -1;
 		errno = ENOENT;
 		while ((pe = strsep(&pathenv, ":")) != NULL) {
-			if (strlcpy(binpath, pe, sizeof(binpath)) >=
-			    sizeof(binpath))
+			if (strlcpy(binpath, pe, PATH_MAX) >= PATH_MAX)
 				continue;
 			if (binpath[0] != '\0' &&
-			    strlcat(binpath, "/", sizeof(binpath)) >=
-			    sizeof(binpath))
+			    strlcat(binpath, "/", PATH_MAX) >= PATH_MAX)
 				continue;
-			if (strlcat(binpath, argv0, sizeof(binpath)) >=
-			    sizeof(binpath))
+			if (strlcat(binpath, argv0, PATH_MAX) >= PATH_MAX)
 				continue;
 			fd = open(binpath, O_RDONLY | O_CLOEXEC | O_VERIFY);
-			if (fd != -1 || errno != ENOENT)
+			if (fd != -1 || errno != ENOENT) {
+				res = binpath;
 				break;
+			}
 		}
 		free(pathenv);
 	} else {
 		fd = open(argv0, O_RDONLY | O_CLOEXEC | O_VERIFY);
+		res = argv0;
 	}
 
 	if (fd == -1) {
-		rtld_printf("Opening %s: %s\n", argv0,
-		    rtld_strerror(errno));
+		_rtld_error("Cannot open %s: %s", argv0, rtld_strerror(errno));
 		rtld_die();
 	}
+	if (res != NULL && res[0] != '/') {
+		res1 = xmalloc(PATH_MAX);
+		if (realpath(res, res1) != NULL) {
+			if (res != argv0)
+				free(__DECONST(char *, res));
+			res = res1;
+		} else {
+			free(res1);
+		}
+	}
+	*binpath_res = res;
 	return (fd);
 }
 
@@ -5383,15 +5671,20 @@ open_binary_fd(const char *argv0, bool search_in_path)
  * Parse a set of command-line arguments.
  */
 static int
-parse_args(char* argv[], int argc, bool *use_pathp, int *fdp)
+parse_args(char* argv[], int argc, bool *use_pathp, int *fdp,
+    const char **argv0)
 {
 	const char *arg;
-	int fd, i, j, arglen;
+	char machine[64];
+	size_t sz;
+	int arglen, fd, i, j, mib[2];
 	char opt;
+	bool seen_b, seen_f;
 
 	dbg("Parsing command-line arguments");
 	*use_pathp = false;
 	*fdp = -1;
+	seen_b = seen_f = false;
 
 	for (i = 1; i < argc; i++ ) {
 		arg = argv[i];
@@ -5417,38 +5710,77 @@ parse_args(char* argv[], int argc, bool *use_pathp, int *fdp)
 			opt = arg[j];
 			if (opt == 'h') {
 				print_usage(argv[0]);
-				rtld_die();
+				_exit(0);
+			} else if (opt == 'b') {
+				if (seen_f) {
+					_rtld_error("Both -b and -f specified");
+					rtld_die();
+				}
+				i++;
+				*argv0 = argv[i];
+				seen_b = true;
+				break;
 			} else if (opt == 'f') {
-			/*
-			 * -f XX can be used to specify a descriptor for the
-			 * binary named at the command line (i.e., the later
-			 * argument will specify the process name but the
-			 * descriptor is what will actually be executed)
-			 */
-			if (j != arglen - 1) {
-				/* -f must be the last option in, e.g., -abcf */
-				_rtld_error("invalid options: %s", arg);
-				rtld_die();
-			}
-			i++;
-			fd = parse_integer(argv[i]);
-			if (fd == -1) {
-				_rtld_error("invalid file descriptor: '%s'",
-				    argv[i]);
-				rtld_die();
-			}
-			*fdp = fd;
-			break;
+				if (seen_b) {
+					_rtld_error("Both -b and -f specified");
+					rtld_die();
+				}
+
+				/*
+				 * -f XX can be used to specify a
+				 * descriptor for the binary named at
+				 * the command line (i.e., the later
+				 * argument will specify the process
+				 * name but the descriptor is what
+				 * will actually be executed).
+				 *
+				 * -f must be the last option in, e.g., -abcf.
+				 */
+				if (j != arglen - 1) {
+					_rtld_error("Invalid options: %s", arg);
+					rtld_die();
+				}
+				i++;
+				fd = parse_integer(argv[i]);
+				if (fd == -1) {
+					_rtld_error(
+					    "Invalid file descriptor: '%s'",
+					    argv[i]);
+					rtld_die();
+				}
+				*fdp = fd;
+				seen_f = true;
+				break;
 			} else if (opt == 'p') {
 				*use_pathp = true;
+			} else if (opt == 'v') {
+				machine[0] = '\0';
+				mib[0] = CTL_HW;
+				mib[1] = HW_MACHINE;
+				sz = sizeof(machine);
+				sysctl(mib, nitems(mib), machine, &sz, NULL, 0);
+				rtld_printf(
+				    "FreeBSD ld-elf.so.1 %s\n"
+				    "FreeBSD_version %d\n"
+				    "Default lib path %s\n"
+				    "Env prefix %s\n"
+				    "Hint file %s\n"
+				    "libmap file %s\n",
+				    machine,
+				    __FreeBSD_version, ld_standard_library_path,
+				    ld_env_prefix, ld_elf_hints_default,
+				    ld_path_libmap_conf);
+				_exit(0);
 			} else {
-				rtld_printf("invalid argument: '%s'\n", arg);
+				_rtld_error("Invalid argument: '%s'", arg);
 				print_usage(argv[0]);
 				rtld_die();
 			}
 		}
 	}
 
+	if (!seen_b)
+		*argv0 = argv[i];
 	return (i);
 }
 
@@ -5483,15 +5815,18 @@ static void
 print_usage(const char *argv0)
 {
 
-	rtld_printf("Usage: %s [-h] [-f <FD>] [--] <binary> [<args>]\n"
-		"\n"
-		"Options:\n"
-		"  -h        Display this help message\n"
-		"  -p        Search in PATH for named binary\n"
-		"  -f <FD>   Execute <FD> instead of searching for <binary>\n"
-		"  --        End of RTLD options\n"
-		"  <binary>  Name of process to execute\n"
-		"  <args>    Arguments to the executed process\n", argv0);
+	rtld_printf(
+	    "Usage: %s [-h] [-b <exe>] [-f <FD>] [-p] [--] <binary> [<args>]\n"
+	    "\n"
+	    "Options:\n"
+	    "  -h        Display this help message\n"
+	    "  -b <exe>  Execute <exe> instead of <binary>, arg0 is <binary>\n"
+	    "  -f <FD>   Execute <FD> instead of searching for <binary>\n"
+	    "  -p        Search in PATH for named binary\n"
+	    "  -v        Display identification information\n"
+	    "  --        End of RTLD options\n"
+	    "  <binary>  Name of process to execute\n"
+	    "  <args>    Arguments to the executed process\n", argv0);
 }
 
 /*
@@ -5517,43 +5852,6 @@ __getosreldate(void)
 		osreldate = osrel;
 	return (osreldate);
 }
-
-void
-exit(int status)
-{
-
-	_exit(status);
-}
-
-void (*__cleanup)(void);
-int __isthreaded = 0;
-int _thread_autoinit_dummy_decl = 1;
-
-/*
- * No unresolved symbols for rtld.
- */
-void
-__pthread_cxa_finalize(struct dl_phdr_info *a)
-{
-}
-
-void
-__stack_chk_fail(void)
-{
-
-	_rtld_error("stack overflow detected; terminated");
-	rtld_die();
-}
-__weak_reference(__stack_chk_fail, __stack_chk_fail_local);
-
-void
-__chk_fail(void)
-{
-
-	_rtld_error("buffer overflow detected; terminated");
-	rtld_die();
-}
-
 const char *
 rtld_strerror(int errnum)
 {
@@ -5562,3 +5860,38 @@ rtld_strerror(int errnum)
 		return ("Unknown error");
 	return (sys_errlist[errnum]);
 }
+
+/* malloc */
+void *
+malloc(size_t nbytes)
+{
+
+	return (__crt_malloc(nbytes));
+}
+
+void *
+calloc(size_t num, size_t size)
+{
+
+	return (__crt_calloc(num, size));
+}
+
+void
+free(void *cp)
+{
+
+	__crt_free(cp);
+}
+
+void *
+realloc(void *cp, size_t nbytes)
+{
+
+	return (__crt_realloc(cp, nbytes));
+}
+
+extern int _rtld_version__FreeBSD_version __exported;
+int _rtld_version__FreeBSD_version = __FreeBSD_version;
+
+extern char _rtld_version_laddr_offset __exported;
+char _rtld_version_laddr_offset;

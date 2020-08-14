@@ -45,7 +45,6 @@ __FBSDID("$FreeBSD$");
  */
 
 #include "opt_clock.h"
-#include "opt_compat.h"
 #include "opt_cpu.h"
 #include "opt_isa.h"
 
@@ -53,7 +52,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/bus.h>
 #include <sys/systm.h>
 #include <sys/proc.h>
-#include <sys/pioctl.h>
 #include <sys/kernel.h>
 #include <sys/ktr.h>
 #include <sys/lock.h>
@@ -116,10 +114,39 @@ ia32_fetch_syscall_args(struct thread *td)
 	caddr_t params;
 	u_int32_t args[8], tmp;
 	int error, i;
+#ifdef COMPAT_43
+	u_int32_t eip;
+	int cs;
+#endif
 
 	p = td->td_proc;
 	frame = td->td_frame;
 	sa = &td->td_sa;
+
+#ifdef COMPAT_43
+	if (__predict_false(frame->tf_cs == 7 && frame->tf_rip == 2)) {
+		/*
+		 * In lcall $7,$0 after int $0x80.  Convert the user
+		 * frame to what it would be for a direct int 0x80 instead
+		 * of lcall $7,$0, by popping the lcall return address.
+		 */
+		error = fueword32((void *)frame->tf_rsp, &eip);
+		if (error == -1)
+			return (EFAULT);
+		cs = fuword16((void *)(frame->tf_rsp + sizeof(u_int32_t)));
+		if (cs == -1)
+			return (EFAULT);
+
+		/*
+		 * Unwind in-kernel frame after all stack frame pieces
+		 * were successfully read.
+		 */
+		frame->tf_rip = eip;
+		frame->tf_cs = cs;
+		frame->tf_rsp += 2 * sizeof(u_int32_t);
+		frame->tf_err = 7;		/* size of lcall $7,$0 */
+	}
+#endif
 
 	params = (caddr_t)frame->tf_rsp + sizeof(u_int32_t);
 	sa->code = frame->tf_rax;
@@ -149,8 +176,6 @@ ia32_fetch_syscall_args(struct thread *td)
 		sa->code = tmp;
 		params += sizeof(quad_t);
 	}
- 	if (p->p_sysent->sv_mask)
- 		sa->code &= p->p_sysent->sv_mask;
  	if (sa->code >= p->p_sysent->sv_size)
  		sa->callp = &p->p_sysent->sv_table[0];
   	else
@@ -181,14 +206,13 @@ ia32_syscall(struct trapframe *frame)
 {
 	struct thread *td;
 	register_t orig_tf_rflags;
-	int error;
 	ksiginfo_t ksi;
 
 	orig_tf_rflags = frame->tf_rflags;
 	td = curthread;
 	td->td_frame = frame;
 
-	error = syscallenter(td);
+	syscallenter(td);
 
 	/*
 	 * Traced syscall.
@@ -202,7 +226,8 @@ ia32_syscall(struct trapframe *frame)
 		trapsignal(td, &ksi);
 	}
 
-	syscallret(td, error);
+	syscallret(td);
+	amd64_syscall_ret_flush_l1d(td->td_errno);
 }
 
 static void

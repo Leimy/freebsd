@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2006 Marcel Moolenaar.  All rights reserved.
  * Copyright (c) 2002 JF Hay.  All rights reserved.
- * Copyright (c) 2001 M. Warner Losh.  All rights reserved.
+ * Copyright (c) 2001 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -83,7 +83,7 @@ uart_puc_probe(device_t dev)
 
 	if (BUS_READ_IVAR(parent, dev, PUC_IVAR_CLOCK, &rclk))
 		rclk = 0;
-	return (uart_bus_probe(dev, 0, 0, rclk, 0, 0));
+	return (uart_bus_probe(dev, 0, 0, rclk, 0, 0, 0));
 }
 
 DRIVER_MODULE(uart, puc, uart_puc_driver, uart_devclass, 0, 0);

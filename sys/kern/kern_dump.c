@@ -37,6 +37,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/watchdog.h>
 #include <vm/vm.h>
 #include <vm/vm_param.h>
+#include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 #include <vm/pmap.h>
 #include <machine/dump.h>
 #include <machine/elf.h>
@@ -52,7 +54,7 @@ static size_t fragsz;
 
 struct dump_pa dump_map[DUMPSYS_MD_PA_NPAIRS];
 
-#if !defined(__powerpc__) && !defined(__sparc__)
+#if !defined(__powerpc__)
 void
 dumpsys_gen_pa_init(void)
 {
@@ -95,14 +97,12 @@ dumpsys_gen_unmap_chunk(vm_paddr_t pa __unused, size_t chunk __unused,
 
 }
 
-#if !defined(__sparc__)
 int
 dumpsys_gen_write_aux_headers(struct dumperinfo *di)
 {
 
 	return (0);
 }
-#endif
 
 int
 dumpsys_buf_seek(struct dumperinfo *di, size_t sz)
@@ -238,7 +238,6 @@ dumpsys_foreach_chunk(dumpsys_callback_t cb, void *arg)
 	return (seqnr);
 }
 
-#if !defined(__sparc__)
 static off_t fileofs;
 
 static int
@@ -290,7 +289,7 @@ dumpsys_generic(struct dumperinfo *di)
 	size_t hdrsz;
 	int error;
 
-#ifndef __powerpc__
+#if !defined(__powerpc__) || defined(__powerpc64__)
 	if (do_minidump)
 		return (minidumpsys(di));
 #endif
@@ -330,12 +329,12 @@ dumpsys_generic(struct dumperinfo *di)
 	dump_init_header(di, &kdh, KERNELDUMPMAGIC, KERNELDUMP_ARCH_VERSION,
 	    dumpsize);
 
-	printf("Dumping %ju MB (%d chunks)\n", (uintmax_t)dumpsize >> 20,
-	    ehdr.e_phnum - DUMPSYS_NUM_AUX_HDRS);
-
 	error = dump_start(di, &kdh);
 	if (error != 0)
 		goto fail;
+
+	printf("Dumping %ju MB (%d chunks)\n", (uintmax_t)dumpsize >> 20,
+	    ehdr.e_phnum - DUMPSYS_NUM_AUX_HDRS);
 
 	/* Dump ELF header */
 	error = dumpsys_buf_write(di, (char*)&ehdr, sizeof(ehdr));
@@ -385,4 +384,3 @@ dumpsys_generic(struct dumperinfo *di)
 		printf("\n** DUMP FAILED (ERROR %d) **\n", error);
 	return (error);
 }
-#endif

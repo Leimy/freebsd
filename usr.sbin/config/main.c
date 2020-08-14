@@ -72,6 +72,17 @@ static const char rcsid[] =
 
 #define	CDIR	"../compile/"
 
+char	*machinename;
+char	*machinearch;
+
+struct cfgfile_head	cfgfiles;
+struct cputype_head	cputype;
+struct opt_head		opt, mkopt, rmopts;
+struct opt_list_head	otab;
+struct envvar_head	envvars;
+struct hint_head	hints;
+struct includepath_head	includepath;
+
 char *	PREFIX;
 char 	destdir[MAXPATHLEN];
 char 	srcdir[MAXPATHLEN];
@@ -86,12 +97,14 @@ int	incignore;
  * literally).
  */
 int	filebased = 0;
+int	versreq;
 
 static void configfile(void);
 static void get_srcdir(void);
 static void usage(void);
 static void cleanheaders(char *);
 static void kernconfdump(const char *);
+static void badversion(void);
 static void checkversion(void);
 extern int yyparse(void);
 
@@ -99,6 +112,8 @@ struct hdr_list {
 	char *h_name;
 	struct hdr_list *h_next;
 } *htab;
+
+static struct sbuf *line_buf = NULL;
 
 /*
  * Config builds a set of files for building a UNIX
@@ -114,14 +129,35 @@ main(int argc, char **argv)
 	char *kernfile;
 	struct includepath* ipath;
 	int printmachine;
+	bool cust_dest = false;
 
 	printmachine = 0;
 	kernfile = NULL;
 	SLIST_INIT(&includepath);
-	while ((ch = getopt(argc, argv, "CI:d:gmpsVx:")) != -1)
+	SLIST_INIT(&cputype);
+	SLIST_INIT(&mkopt);
+	SLIST_INIT(&opt);
+	SLIST_INIT(&rmopts);
+	STAILQ_INIT(&cfgfiles);
+	STAILQ_INIT(&dtab);
+	STAILQ_INIT(&fntab);
+	STAILQ_INIT(&ftab);
+	STAILQ_INIT(&hints);
+	STAILQ_INIT(&envvars);
+	while ((ch = getopt(argc, argv, "Cd:gI:mps:Vx:")) != -1)
 		switch (ch) {
 		case 'C':
 			filebased = 1;
+			break;
+		case 'd':
+			if (*destdir == '\0')
+				strlcpy(destdir, optarg, sizeof(destdir));
+			else
+				errx(EXIT_FAILURE, "directory already set");
+			cust_dest = true;
+			break;
+		case 'g':
+			debugging++;
 			break;
 		case 'I':
 			ipath = (struct includepath *) \
@@ -133,15 +169,6 @@ main(int argc, char **argv)
 			break;
 		case 'm':
 			printmachine = 1;
-			break;
-		case 'd':
-			if (*destdir == '\0')
-				strlcpy(destdir, optarg, sizeof(destdir));
-			else
-				errx(EXIT_FAILURE, "directory already set");
-			break;
-		case 'g':
-			debugging++;
 			break;
 		case 'p':
 			profiling++;
@@ -195,15 +222,6 @@ main(int argc, char **argv)
 		strlcat(destdir, PREFIX, sizeof(destdir));
 	}
 
-	SLIST_INIT(&cputype);
-	SLIST_INIT(&mkopt);
-	SLIST_INIT(&opt);
-	SLIST_INIT(&rmopts);
-	STAILQ_INIT(&cfgfiles);
-	STAILQ_INIT(&dtab);
-	STAILQ_INIT(&fntab);
-	STAILQ_INIT(&ftab);
-	STAILQ_INIT(&hints);
 	if (yyparse())
 		exit(3);
 
@@ -229,7 +247,14 @@ main(int argc, char **argv)
 		exit(0);
 	}
 
-	/* Make compile directory */
+	/*
+	 * Make CDIR directory, if doing a default destination. Some version
+	 * control systems delete empty directories and this seemlessly copes.
+	 */
+	if (!cust_dest && stat(CDIR, &buf))
+		if (mkdir(CDIR, 0777))
+			err(2, "%s", CDIR);
+	/* Create the compile directory */
 	p = path((char *)NULL);
 	if (stat(p, &buf)) {
 		if (mkdir(p, 0777))
@@ -290,6 +315,29 @@ usage(void)
 	exit(EX_USAGE);
 }
 
+static void
+init_line_buf(void)
+{
+	if (line_buf == NULL) {
+		line_buf = sbuf_new(NULL, NULL, 80, SBUF_AUTOEXTEND);
+		if (line_buf == NULL) {
+			errx(EXIT_FAILURE, "failed to allocate line buffer");
+		}
+	} else {
+		sbuf_clear(line_buf);
+	}
+}
+
+static char *
+get_line_buf(void)
+{
+	if (sbuf_finish(line_buf) != 0) {
+		errx(EXIT_FAILURE, "failed to generate line buffer, "
+		    "partial line = %s", sbuf_data(line_buf));
+	}
+	return sbuf_data(line_buf);
+}
+
 /*
  * get_word
  *	returns EOF on end of file
@@ -299,11 +347,10 @@ usage(void)
 char *
 get_word(FILE *fp)
 {
-	static char line[80];
 	int ch;
-	char *cp;
 	int escaped_nl = 0;
 
+	init_line_buf();
 begin:
 	while ((ch = getc(fp)) != EOF)
 		if (ch != ' ' && ch != '\t')
@@ -322,23 +369,20 @@ begin:
 		else
 			return (NULL);
 	}
-	cp = line;
-	*cp++ = ch;
+	sbuf_putc(line_buf, ch);
 	/* Negation operator is a word by itself. */
 	if (ch == '!') {
-		*cp = 0;
-		return (line);
+		return get_line_buf();
 	}
 	while ((ch = getc(fp)) != EOF) {
 		if (isspace(ch))
 			break;
-		*cp++ = ch;
+		sbuf_putc(line_buf, ch);
 	}
-	*cp = 0;
 	if (ch == EOF)
 		return ((char *)EOF);
 	(void) ungetc(ch, fp);
-	return (line);
+	return (get_line_buf());
 }
 
 /*
@@ -349,11 +393,10 @@ begin:
 char *
 get_quoted_word(FILE *fp)
 {
-	static char line[256];
 	int ch;
-	char *cp;
 	int escaped_nl = 0;
 
+	init_line_buf();
 begin:
 	while ((ch = getc(fp)) != EOF)
 		if (ch != ' ' && ch != '\t')
@@ -372,7 +415,6 @@ begin:
 		else
 			return (NULL);
 	}
-	cp = line;
 	if (ch == '"' || ch == '\'') {
 		int quote = ch;
 
@@ -381,9 +423,8 @@ begin:
 			if (ch == quote && !escaped_nl)
 				break;
 			if (ch == '\n' && !escaped_nl) {
-				*cp = 0;
 				printf("config: missing quote reading `%s'\n",
-					line);
+					get_line_buf());
 				exit(2);
 			}
 			if (ch == '\\' && !escaped_nl) {
@@ -391,24 +432,23 @@ begin:
 				continue;
 			}
 			if (ch != quote && escaped_nl)
-				*cp++ = '\\';
-			*cp++ = ch;
+				sbuf_putc(line_buf, '\\');
+			sbuf_putc(line_buf, ch);
 			escaped_nl = 0;
 		}
 	} else {
-		*cp++ = ch;
+		sbuf_putc(line_buf, ch);
 		while ((ch = getc(fp)) != EOF) {
 			if (isspace(ch))
 				break;
-			*cp++ = ch;
+			sbuf_putc(line_buf, ch);
 		}
 		if (ch != EOF)
 			(void) ungetc(ch, fp);
 	}
-	*cp = 0;
 	if (ch == EOF)
 		return ((char *)EOF);
-	return (line);
+	return (get_line_buf());
 }
 
 /*
@@ -741,8 +781,8 @@ kernconfdump(const char *file)
 	fclose(fp);
 }
 
-static void 
-badversion(int versreq)
+static void
+badversion(void)
 {
 	fprintf(stderr, "ERROR: version of config(8) does not match kernel!\n");
 	fprintf(stderr, "config version = %d, ", CONFIGVERS);
@@ -762,7 +802,6 @@ checkversion(void)
 {
 	FILE *ifp;
 	char line[BUFSIZ];
-	int versreq;
 
 	ifp = open_makefile_template();
 	while (fgets(line, BUFSIZ, ifp) != 0) {
@@ -774,7 +813,7 @@ checkversion(void)
 		if (MAJOR_VERS(versreq) == MAJOR_VERS(CONFIGVERS) &&
 		    versreq <= CONFIGVERS)
 			continue;
-		badversion(versreq);
+		badversion();
 	}
 	fclose(ifp);
 }

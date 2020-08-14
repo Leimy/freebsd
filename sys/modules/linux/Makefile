@@ -17,12 +17,16 @@ SRCS=	linux_fork.c linux${SFX}_dummy.c linux_file.c linux_event.c \
 	linux${SFX}_sysvec.c linux_uid16.c linux_time.c \
 	linux_timer.c linux_vdso.c \
 	opt_inet6.h opt_compat.h opt_posix.h opt_usb.h vnode_if.h \
-	device_if.h bus_if.h \
-	linux${SFX}_support.s
-DPSRCS=	assym.s linux${SFX}_genassym.c
+	device_if.h bus_if.h
+.if ${MACHINE_CPUARCH} == "amd64"
+SRCS+=	linux${SFX}_support.s
+.else
+SRCS+=	linux_copyout.c
+.endif
+DPSRCS=	assym.inc linux${SFX}_genassym.c
 
-# XXX: for assym.s
-SRCS+=  opt_kstack_pages.h opt_nfs.h opt_compat.h opt_hwpmc_hooks.h
+# XXX: for assym.inc
+SRCS+=  opt_kstack_pages.h opt_nfs.h opt_hwpmc_hooks.h
 .if ${MACHINE_CPUARCH} == "i386"
 SRCS+=	opt_apic.h
 .endif
@@ -43,45 +47,41 @@ EXPORT_SYMS+=	linux_ioctl_register_handler
 EXPORT_SYMS+=	linux_ioctl_unregister_handler
 .endif
 
-CLEANFILES=	linux${SFX}_assym.h linux${SFX}_genassym.o linux${SFX}_locore.o
+CLEANFILES=	linux${SFX}_assym.h linux${SFX}_genassym.o linux${SFX}_locore.o \
+		genassym.o
 
 linux${SFX}_assym.h: linux${SFX}_genassym.o
 	sh ${SYSDIR}/kern/genassym.sh linux${SFX}_genassym.o > ${.TARGET}
 
-linux${SFX}_locore.o: linux${SFX}_assym.h assym.s
+linux${SFX}_locore.o: linux${SFX}_assym.h assym.inc
 	${CC} -x assembler-with-cpp -DLOCORE -m32 -shared -s			\
-	-pipe -I. -I${SYSDIR} -Werror -Wall -fno-common -nostdinc -nostdlib	\
+	-pipe -I. -I${SYSDIR} ${WERROR} -Wall -fno-common -nostdinc -nostdlib	\
 	-fno-omit-frame-pointer -fPIC						\
 	-Wl,-T${SRCTOP}/sys/${MACHINE_CPUARCH}/linux${SFX}/${VDSO}.lds.s	\
 	-Wl,-soname=${VDSO}.so.1,--eh-frame-hdr,-warn-common		\
 	    ${.IMPSRC} -o ${.TARGET}
 
-linux${SFX}_support.o: linux${SFX}_assym.h assym.s
+.if ${MACHINE_CPUARCH} == "amd64"
+linux${SFX}_support.o: linux${SFX}_assym.h assym.inc
 	${CC} -c -x assembler-with-cpp -DLOCORE ${CFLAGS} \
 	    ${.IMPSRC} -o ${.TARGET}
 
-.if ${MACHINE_CPUARCH} == "amd64"
 ${VDSO}.so: linux${SFX}_locore.o
 	${OBJCOPY} --input-target binary --output-target elf64-x86-64-freebsd			\
 	    --binary-architecture i386 linux${SFX}_locore.o ${.TARGET}
-	strip -N _binary_linux${SFX}_locore_o_size ${.TARGET}
+	${STRIPBIN} -N _binary_linux${SFX}_locore_o_size ${.TARGET}
 .else
 ${VDSO}.so: linux${SFX}_locore.o
 	${OBJCOPY} --input-target binary --output-target elf32-i386-freebsd			\
 	    --binary-architecture i386 linux${SFX}_locore.o ${.TARGET}
-	strip -N _binary_linux_locore_o_size ${.TARGET}
+	${STRIPBIN} -N _binary_linux_locore_o_size ${.TARGET}
 .endif
 
-linux${SFX}_genassym.o:
-	${CC} -c ${CFLAGS:N-flto:N-fno-common} ${.IMPSRC}
+linux${SFX}_genassym.o: offset.inc
+	${CC} -c ${CFLAGS:N-flto:N-fno-common} -fcommon ${.IMPSRC}
 
 .if !defined(KERNBUILDDIR)
-.if defined(KTR)
-CFLAGS+=	-DKTR
-.endif
-.if defined(DEBUG)
-CFLAGS+=	-DDEBUG
-.endif
+.warning Building Linuxulator outside of a kernel does not make sense
 .endif
 
 .include <bsd.kmod.mk>

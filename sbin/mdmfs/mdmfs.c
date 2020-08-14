@@ -88,8 +88,11 @@ static void	 do_mount_md(const char *, const char *);
 static void	 do_mount_tmpfs(const char *, const char *);
 static void	 do_mtptsetup(const char *, struct mtpt_info *);
 static void	 do_newfs(const char *);
+static void	 do_copy(const char *, const char *);
 static void	 extract_ugid(const char *, struct mtpt_info *);
 static int	 run(int *, const char *, ...) __printflike(2, 3);
+static const char *run_exitstr(int);
+static int	 run_exitnumber(int);
 static void	 usage(void);
 
 int
@@ -102,7 +105,7 @@ main(int argc, char **argv)
 	enum md_types mdtype;		/* The type of our memory disk. */
 	bool have_mdtype, mlmac;
 	bool detach, softdep, autounit, newfs;
-	const char *mtpoint, *size_arg, *unitstr;
+	const char *mtpoint, *size_arg, *skel, *unitstr;
 	char *p;
 	int ch, idx;
 	void *set;
@@ -116,6 +119,7 @@ main(int argc, char **argv)
 	mlmac = false;
 	newfs = true;
 	have_mdtype = false;
+	skel = NULL;
 	mdtype = MD_SWAP;
 	mdname = MD_NAME;
 	mdnamelen = strlen(mdname);
@@ -140,7 +144,7 @@ main(int argc, char **argv)
 	}
 
 	while ((ch = getopt(argc, argv,
-	    "a:b:Cc:Dd:E:e:F:f:hi:LlMm:NnO:o:Pp:Ss:tT:Uv:w:X")) != -1)
+	    "a:b:Cc:Dd:E:e:F:f:hi:k:LlMm:NnO:o:Pp:Ss:tT:Uv:w:X")) != -1)
 		switch (ch) {
 		case 'a':
 			argappend(&newfs_arg, "-a %s", optarg);
@@ -182,6 +186,9 @@ main(int argc, char **argv)
 		case 'i':
 			argappend(&newfs_arg, "-i %s", optarg);
 			break;
+		case 'k':
+			skel = optarg;
+			break;
 		case 'L':
 			loudsubs = true;
 			break;
@@ -194,6 +201,7 @@ main(int argc, char **argv)
 				usage();
 			mdtype = MD_MALLOC;
 			have_mdtype = true;
+			argappend(&mdconfig_arg, "-o reserve");
 			break;
 		case 'm':
 			argappend(&newfs_arg, "-m %s", optarg);
@@ -356,6 +364,8 @@ main(int argc, char **argv)
 	}
 
 	do_mtptsetup(mtpoint, &mi);
+	if (skel != NULL)
+		do_copy(mtpoint, skel);
 
 	return (0);
 }
@@ -431,7 +441,8 @@ do_mdconfig_attach(const char *args, const enum md_types mdtype)
 	rv = run(NULL, "%s -a %s%s -u %s%d", path_mdconfig, ta, args,
 	    mdname, unit);
 	if (rv)
-		errx(1, "mdconfig (attach) exited with error code %d", rv);
+		errx(1, "mdconfig (attach) exited %s %d", run_exitstr(rv),
+		    run_exitnumber(rv));
 }
 
 /*
@@ -441,7 +452,8 @@ static void
 do_mdconfig_attach_au(const char *args, const enum md_types mdtype)
 {
 	const char *ta;		/* Type arg. */
-	char *linep, *linebuf; 	/* Line pointer, line buffer. */
+	char *linep;
+	char linebuf[12];	/* 32-bit unit (10) + '\n' (1) + '\0' (1) */
 	int fd;			/* Standard output of mdconfig invocation. */
 	FILE *sfd;
 	int rv;
@@ -464,7 +476,8 @@ do_mdconfig_attach_au(const char *args, const enum md_types mdtype)
 	}
 	rv = run(&fd, "%s -a %s%s", path_mdconfig, ta, args);
 	if (rv)
-		errx(1, "mdconfig (attach) exited with error code %d", rv);
+		errx(1, "mdconfig (attach) exited %s %d", run_exitstr(rv),
+		    run_exitnumber(rv));
 
 	/* Receive the unit number. */
 	if (norun) {	/* Since we didn't run, we can't read.  Fake it. */
@@ -475,14 +488,15 @@ do_mdconfig_attach_au(const char *args, const enum md_types mdtype)
 	if (sfd == NULL)
 		err(1, "fdopen");
 	linep = fgetln(sfd, &linelen);
-	if (linep == NULL && linelen < mdnamelen + 1)
-		errx(1, "unexpected output from mdconfig (attach)");
 	/* If the output format changes, we want to know about it. */
-	assert(strncmp(linep, mdname, mdnamelen) == 0);
-	linebuf = malloc(linelen - mdnamelen + 1);
-	assert(linebuf != NULL);
+	if (linep == NULL || linelen <= mdnamelen + 1 ||
+	    linelen - mdnamelen >= sizeof(linebuf) ||
+	    strncmp(linep, mdname, mdnamelen) != 0)
+		errx(1, "unexpected output from mdconfig (attach)");
+	linep += mdnamelen;
+	linelen -= mdnamelen;
 	/* Can't use strlcpy because linep is not NULL-terminated. */
-	strncpy(linebuf, linep + mdnamelen, linelen);
+	strncpy(linebuf, linep, linelen);
 	linebuf[linelen] = '\0';
 	ul = strtoul(linebuf, &p, 10);
 	if (ul == ULONG_MAX || *p != '\n')
@@ -490,7 +504,6 @@ do_mdconfig_attach_au(const char *args, const enum md_types mdtype)
 	unit = ul;
 
 	fclose(sfd);
-	close(fd);
 }
 
 /*
@@ -503,8 +516,8 @@ do_mdconfig_detach(void)
 
 	rv = run(NULL, "%s -d -u %s%d", path_mdconfig, mdname, unit);
 	if (rv && debug)	/* This is allowed to fail. */
-		warnx("mdconfig (detach) exited with error code %d (ignored)",
-		    rv);
+		warnx("mdconfig (detach) exited %s %d (ignored)",
+		    run_exitstr(rv), run_exitnumber(rv));
 }
 
 /*
@@ -518,7 +531,8 @@ do_mount_md(const char *args, const char *mtpoint)
 	rv = run(NULL, "%s%s /dev/%s%d%s %s", _PATH_MOUNT, args,
 	    mdname, unit, mdsuffix, mtpoint);
 	if (rv)
-		errx(1, "mount exited with error code %d", rv);
+		errx(1, "mount exited %s %d", run_exitstr(rv),
+		    run_exitnumber(rv));
 }
 
 /*
@@ -531,7 +545,8 @@ do_mount_tmpfs(const char *args, const char *mtpoint)
 
 	rv = run(NULL, "%s -t tmpfs %s tmp %s", _PATH_MOUNT, args, mtpoint);
 	if (rv)
-		errx(1, "tmpfs mount exited with error code %d", rv);
+		errx(1, "tmpfs mount exited %s %d", run_exitstr(rv),
+		    run_exitnumber(rv));
 }
 
 /*
@@ -603,7 +618,25 @@ do_newfs(const char *args)
 
 	rv = run(NULL, "%s%s /dev/%s%d", _PATH_NEWFS, args, mdname, unit);
 	if (rv)
-		errx(1, "newfs exited with error code %d", rv);
+		errx(1, "newfs exited %s %d", run_exitstr(rv),
+		    run_exitnumber(rv));
+}
+
+
+/*
+ * Copy skel into the mountpoint.
+ */
+static void
+do_copy(const char *mtpoint, const char *skel)
+{
+	int rv;
+
+	rv = chdir(skel);
+	if (rv != 0)
+		err(1, "chdir to %s", skel);
+	rv = run(NULL, "/bin/pax -rw -pe . %s", mtpoint);
+	if (rv != 0)
+		errx(1, "skel copy failed");
 }
 
 /*
@@ -674,8 +707,12 @@ extract_ugid(const char *str, struct mtpt_info *mip)
  * Run a process with command name and arguments pointed to by the
  * formatted string 'cmdline'.  Since system(3) is not used, the first
  * space-delimited token of 'cmdline' must be the full pathname of the
- * program to run.  The return value is the return code of the process
- * spawned.  If 'ofd' is non-NULL, it is set to the standard output of
+ * program to run.
+ *
+ * The return value is the return code of the process spawned, or a negative
+ * signal number if the process exited due to an uncaught signal.
+ *
+ * If 'ofd' is non-NULL, it is set to the standard output of
  * the program spawned (i.e., you can read from ofd and get the output
  * of the program).
  */
@@ -771,7 +808,35 @@ run(int *ofd, const char *cmdline, ...)
 	free(argv);
 	while (waitpid(pid, &status, 0) != pid)
 		;
-	return (WEXITSTATUS(status));
+	if (WIFEXITED(status))
+		return (WEXITSTATUS(status));
+	if (WIFSIGNALED(status))
+		return (-WTERMSIG(status));
+	err(1, "unexpected waitpid status: 0x%x", status);
+}
+
+/*
+ * If run() returns non-zero, provide a string explaining why.
+ */
+static const char *
+run_exitstr(int rv)
+{
+	if (rv > 0)
+		return ("with error code");
+	if (rv < 0)
+		return ("with signal");
+	return (NULL);
+}
+
+/*
+ * If run returns non-zero, provide a relevant number.
+ */
+static int
+run_exitnumber(int rv)
+{
+	if (rv < 0)
+		return (-rv);
+	return (rv);
 }
 
 static void
@@ -781,8 +846,8 @@ usage(void)
 	fprintf(stderr,
 "usage: %s [-DLlMNnPStUX] [-a maxcontig] [-b block-size]\n"
 "\t[-c blocks-per-cylinder-group][-d max-extent-size] [-E path-mdconfig]\n"
-"\t[-e maxbpg] [-F file] [-f frag-size] [-i bytes] [-m percent-free]\n"
-"\t[-O optimization] [-o mount-options]\n"
+"\t[-e maxbpg] [-F file] [-f frag-size] [-i bytes] [-k skel]\n"
+"\t[-m percent-free] [-O optimization] [-o mount-options]\n"
 "\t[-p permissions] [-s size] [-v version] [-w user:group]\n"
 "\tmd-device mount-point\n", getprogname());
 	exit(1);

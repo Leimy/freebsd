@@ -76,6 +76,7 @@ struct iomux_softc {
 static struct iomux_softc *iomux_sc;
 
 static struct ofw_compat_data compat_data[] = {
+	{"fsl,imx8mq-iomuxc",	true},
 	{"fsl,imx6dl-iomuxc",	true},
 	{"fsl,imx6q-iomuxc",	true},
 	{"fsl,imx6sl-iomuxc",	true},
@@ -153,8 +154,8 @@ iomux_configure_pins(device_t dev, phandle_t cfgxref)
 
 	sc = device_get_softc(dev);
 	cfgnode = OF_node_from_xref(cfgxref);
-	ntuples = OF_getencprop_alloc(cfgnode, "fsl,pins", sizeof(*cfgtuples),
-	    (void **)&cfgtuples);
+	ntuples = OF_getencprop_alloc_multi(cfgnode, "fsl,pins",
+	    sizeof(*cfgtuples), (void **)&cfgtuples);
 	if (ntuples < 0)
 		return (ENOENT);
 	if (ntuples == 0)

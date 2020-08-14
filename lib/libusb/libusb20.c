@@ -77,8 +77,8 @@ dummy_callback(struct libusb20_transfer *xfer)
 #define	dummy_check_connected (void *)dummy_int
 #define	dummy_set_power_mode (void *)dummy_int
 #define	dummy_get_power_mode (void *)dummy_int
-#define	dummy_get_port_path (void *)dummy_int
 #define	dummy_get_power_usage (void *)dummy_int
+#define	dummy_get_stats (void *)dummy_int
 #define	dummy_kernel_driver_active (void *)dummy_int
 #define	dummy_detach_kernel_driver (void *)dummy_int
 #define	dummy_do_request_sync (void *)dummy_int
@@ -745,7 +745,26 @@ libusb20_dev_get_power_mode(struct libusb20_device *pdev)
 int
 libusb20_dev_get_port_path(struct libusb20_device *pdev, uint8_t *buf, uint8_t bufsize)
 {
-	return (pdev->methods->get_port_path(pdev, buf, bufsize));
+
+	if (pdev->port_level == 0) {
+		/*
+		 * Fallback for backends without port path:
+		 */
+		if (bufsize < 2)
+			return (LIBUSB20_ERROR_OVERFLOW);
+		buf[0] = pdev->parent_address;
+		buf[1] = pdev->parent_port;
+		return (2);
+	}
+
+	/* check if client buffer is too small */
+	if (pdev->port_level > bufsize)
+		return (LIBUSB20_ERROR_OVERFLOW);
+
+	/* copy port number information */
+	memcpy(buf, pdev->port_path, pdev->port_level);
+
+	return (pdev->port_level);	/* success */
 }
 
 uint16_t
@@ -796,6 +815,7 @@ libusb20_dev_req_string_sync(struct libusb20_device *pdev,
 {
 	struct LIBUSB20_CONTROL_SETUP_DECODED req;
 	int error;
+	int flags;
 
 	/* make sure memory is initialised */
 	memset(ptr, 0, len);
@@ -822,22 +842,24 @@ libusb20_dev_req_string_sync(struct libusb20_device *pdev,
 	error = libusb20_dev_request_sync(pdev, &req,
 	    ptr, NULL, 1000, LIBUSB20_TRANSFER_SINGLE_SHORT_NOT_OK);
 	if (error) {
-		return (error);
+		/* try to request full string */
+		req.wLength = 255;
+		flags = 0;
+	} else {
+		/* extract length and request full string */
+		req.wLength = *(uint8_t *)ptr;
+		flags = LIBUSB20_TRANSFER_SINGLE_SHORT_NOT_OK;
 	}
-	req.wLength = *(uint8_t *)ptr;	/* bytes */
 	if (req.wLength > len) {
 		/* partial string read */
 		req.wLength = len;
 	}
-	error = libusb20_dev_request_sync(pdev, &req,
-	    ptr, NULL, 1000, LIBUSB20_TRANSFER_SINGLE_SHORT_NOT_OK);
-
-	if (error) {
+	error = libusb20_dev_request_sync(pdev, &req, ptr, NULL, 1000, flags);
+	if (error)
 		return (error);
-	}
-	if (((uint8_t *)ptr)[1] != LIBUSB20_DT_STRING) {
+
+	if (((uint8_t *)ptr)[1] != LIBUSB20_DT_STRING)
 		return (LIBUSB20_ERROR_OTHER);
-	}
 	return (0);			/* success */
 }
 
@@ -934,6 +956,14 @@ libusb20_dev_alloc_config(struct libusb20_device *pdev, uint8_t configIndex)
 	uint8_t do_close;
 	int error;
 
+	/*
+	 * Catch invalid configuration descriptor reads early on to
+	 * avoid issues with devices that don't check for a valid USB
+	 * configuration read request.
+	 */
+	if (configIndex >= pdev->ddesc.bNumConfigurations)
+		return (NULL);
+
 	if (!pdev->is_opened) {
 		error = libusb20_dev_open(pdev, 0);
 		if (error) {
@@ -1018,6 +1048,31 @@ uint8_t
 libusb20_dev_get_speed(struct libusb20_device *pdev)
 {
 	return (pdev->usb_speed);
+}
+
+int
+libusb20_dev_get_stats(struct libusb20_device *pdev, struct libusb20_device_stats *pstats)
+{
+	uint8_t do_close;
+	int error;
+
+	if (!pdev->is_opened) {
+		error = libusb20_dev_open(pdev, 0);
+		if (error == 0) {
+			do_close = 1;
+		} else {
+			do_close = 0;
+		}
+	} else {
+		do_close = 0;
+	}
+
+	error = pdev->methods->get_stats(pdev, pstats);
+
+	if (do_close)
+		(void) libusb20_dev_close(pdev);
+
+	return (error);
 }
 
 /* if this function returns an error, the device is gone */

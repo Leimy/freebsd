@@ -41,6 +41,7 @@
 #include <sys/param.h>
 
 #include <sys/proc.h>
+#include <sys/sdt.h>
 #include <sys/systm.h>
 #include <sys/bio.h>
 #include <sys/buf.h>
@@ -48,6 +49,7 @@
 #include <sys/ucred.h>
 #include <sys/vnode.h>
 
+#include <fs/ext2fs/fs.h>
 #include <fs/ext2fs/inode.h>
 #include <fs/ext2fs/ext2fs.h>
 #include <fs/ext2fs/ext2_extern.h>
@@ -112,7 +114,7 @@ ext2_clusteracct(struct m_ext2fs *fs, char *bbp, int cg, e4fs_daddr_t bno, int c
 		bit = 1;
 		loc = 0;
 
-		for (i = 0; i < fs->e2fs->e2fs_fpg; i++) {
+		for (i = 0; i < fs->e2fs_fpg; i++) {
 			if ((bbp[loc] & bit) == 0)
 				run++;
 			else if (run != 0) {
@@ -142,8 +144,8 @@ ext2_clusteracct(struct m_ext2fs *fs, char *bbp, int cg, e4fs_daddr_t bno, int c
 	/* Find the size of the cluster going forward. */
 	start = bno + 1;
 	end = start + fs->e2fs_contigsumsize;
-	if (end > fs->e2fs->e2fs_fpg)
-		end = fs->e2fs->e2fs_fpg;
+	if (end > fs->e2fs_fpg)
+		end = fs->e2fs_fpg;
 	loc = start / NBBY;
 	bit = 1 << (start % NBBY);
 	for (i = start; i < end; i++) {

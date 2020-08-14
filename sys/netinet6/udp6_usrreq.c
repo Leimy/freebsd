@@ -219,18 +219,20 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 	uint16_t uh_sum;
 	uint8_t nxt;
 
-	ifp = m->m_pkthdr.rcvif;
-	ip6 = mtod(m, struct ip6_hdr *);
+	NET_EPOCH_ASSERT();
 
-#ifndef PULLDOWN_TEST
-	IP6_EXTHDR_CHECK(m, off, sizeof(struct udphdr), IPPROTO_DONE);
+	ifp = m->m_pkthdr.rcvif;
+
+	if (m->m_len < off + sizeof(struct udphdr)) {
+		m = m_pullup(m, off + sizeof(struct udphdr));
+		if (m == NULL) {
+			IP6STAT_INC(ip6s_exthdrtoolong);
+			*mp = NULL;
+			return (IPPROTO_DONE);
+		}
+	}
 	ip6 = mtod(m, struct ip6_hdr *);
 	uh = (struct udphdr *)((caddr_t)ip6 + off);
-#else
-	IP6_EXTHDR_GET(uh, struct udphdr *, m, off, sizeof(*uh));
-	if (!uh)
-		return (IPPROTO_DONE);
-#endif
 
 	UDPSTAT_INC(udps_ipackets);
 
@@ -300,7 +302,6 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 		struct inpcbhead *pcblist;
 		struct ip6_moptions *imo;
 
-		INP_INFO_RLOCK(pcbinfo);
 		/*
 		 * In the event that laddr should be set to the link-local
 		 * address (this happens in RIPng), the multicast address
@@ -318,7 +319,7 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 		 */
 		pcblist = udp_get_pcblist(nxt);
 		last = NULL;
-		LIST_FOREACH(inp, pcblist, inp_list) {
+		CK_LIST_FOREACH(inp, pcblist, inp_list) {
 			if ((inp->inp_vflag & INP_IPV6) == 0)
 				continue;
 			if (inp->inp_lport != uh->uh_dport)
@@ -355,6 +356,10 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 				int			 blocked;
 
 				INP_RLOCK(inp);
+				if (__predict_false(inp->inp_flags2 & INP_FREED)) {
+					INP_RUNLOCK(inp);
+					continue;
+				}
 
 				bzero(&mcaddr, sizeof(struct sockaddr_in6));
 				mcaddr.sin6_len = sizeof(struct sockaddr_in6);
@@ -382,10 +387,19 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 				if ((n = m_copym(m, 0, M_COPYALL, M_NOWAIT)) !=
 				    NULL) {
 					INP_RLOCK(last);
-					UDP_PROBE(receive, NULL, last, ip6,
-					    last, uh);
-					if (udp6_append(last, n, off, fromsa))
-						goto inp_lost;
+					if (__predict_true(last->inp_flags2 & INP_FREED) == 0) {
+						if (nxt == IPPROTO_UDPLITE)
+							UDPLITE_PROBE(receive, NULL, last,
+							    ip6, last, uh);
+						else
+							UDP_PROBE(receive, NULL, last,
+							    ip6, last, uh);
+						if (udp6_append(last, n, off, fromsa)) {
+							/* XXX-BZ do we leak m here? */
+							*mp = NULL;
+							return (IPPROTO_DONE);
+						}
+					}
 					INP_RUNLOCK(last);
 				}
 			}
@@ -399,7 +413,7 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 			 * will never clear these options after setting them.
 			 */
 			if ((last->inp_socket->so_options &
-			     (SO_REUSEPORT|SO_REUSEADDR)) == 0)
+			     (SO_REUSEPORT|SO_REUSEPORT_LB|SO_REUSEADDR)) == 0)
 				break;
 		}
 
@@ -411,14 +425,19 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 			 */
 			UDPSTAT_INC(udps_noport);
 			UDPSTAT_INC(udps_noportmcast);
-			goto badheadlocked;
+			goto badunlocked;
 		}
 		INP_RLOCK(last);
-		INP_INFO_RUNLOCK(pcbinfo);
-		UDP_PROBE(receive, NULL, last, ip6, last, uh);
-		if (udp6_append(last, m, off, fromsa) == 0) 
+		if (__predict_true(last->inp_flags2 & INP_FREED) == 0) {
+			if (nxt == IPPROTO_UDPLITE)
+				UDPLITE_PROBE(receive, NULL, last, ip6, last, uh);
+			else
+				UDP_PROBE(receive, NULL, last, ip6, last, uh);
+			if (udp6_append(last, m, off, fromsa) == 0)
+				INP_RUNLOCK(last);
+		} else
 			INP_RUNLOCK(last);
-	inp_lost:
+		*mp = NULL;
 		return (IPPROTO_DONE);
 	}
 	/*
@@ -462,7 +481,7 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 		    INPLOOKUP_WILDCARD | INPLOOKUP_RLOCKPCB,
 		    m->m_pkthdr.rcvif, m);
 	if (inp == NULL) {
-		if (udp_log_in_vain) {
+		if (V_udp_log_in_vain) {
 			char ip6bufs[INET6_ADDRSTRLEN];
 			char ip6bufd[INET6_ADDRSTRLEN];
 
@@ -473,6 +492,10 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 			    ip6_sprintf(ip6bufs, &ip6->ip6_src),
 			    ntohs(uh->uh_sport));
 		}
+		if (nxt == IPPROTO_UDPLITE)
+			UDPLITE_PROBE(receive, NULL, NULL, ip6, NULL, uh);
+		else
+			UDP_PROBE(receive, NULL, NULL, ip6, NULL, uh);
 		UDPSTAT_INC(udps_noport);
 		if (m->m_flags & M_MCAST) {
 			printf("UDP6: M_MCAST is set in a unicast packet.\n");
@@ -482,6 +505,7 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 		if (V_udp_blackhole)
 			goto badunlocked;
 		icmp6_error(m, ICMP6_DST_UNREACH, ICMP6_DST_UNREACH_NOPORT, 0);
+		*mp = NULL;
 		return (IPPROTO_DONE);
 	}
 	INP_RLOCK_ASSERT(inp);
@@ -490,19 +514,22 @@ udp6_input(struct mbuf **mp, int *offp, int proto)
 		if (up->u_rxcslen == 0 || up->u_rxcslen > ulen) {
 			INP_RUNLOCK(inp);
 			m_freem(m);
+			*mp = NULL;
 			return (IPPROTO_DONE);
 		}
 	}
-	UDP_PROBE(receive, NULL, inp, ip6, inp, uh);
+	if (nxt == IPPROTO_UDPLITE)
+		UDPLITE_PROBE(receive, NULL, inp, ip6, inp, uh);
+	else
+		UDP_PROBE(receive, NULL, inp, ip6, inp, uh);
 	if (udp6_append(inp, m, off, fromsa) == 0)
 		INP_RUNLOCK(inp);
+	*mp = NULL;
 	return (IPPROTO_DONE);
 
-badheadlocked:
-	INP_INFO_RUNLOCK(pcbinfo);
 badunlocked:
-	if (m)
-		m_freem(m);
+	m_freem(m);
+	*mp = NULL;
 	return (IPPROTO_DONE);
 }
 
@@ -614,6 +641,7 @@ udp6_getcred(SYSCTL_HANDLER_ARGS)
 {
 	struct xucred xuc;
 	struct sockaddr_in6 addrs[2];
+	struct epoch_tracker et;
 	struct inpcb *inp;
 	int error;
 
@@ -632,9 +660,11 @@ udp6_getcred(SYSCTL_HANDLER_ARGS)
 	    (error = sa6_embedscope(&addrs[1], V_ip6_use_defzone)) != 0) {
 		return (error);
 	}
+	NET_EPOCH_ENTER(et);
 	inp = in6_pcblookup(&V_udbinfo, &addrs[1].sin6_addr,
 	    addrs[1].sin6_port, &addrs[0].sin6_addr, addrs[0].sin6_port,
 	    INPLOOKUP_WILDCARD | INPLOOKUP_RLOCKPCB, NULL);
+	NET_EPOCH_EXIT(et);
 	if (inp != NULL) {
 		INP_RLOCK_ASSERT(inp);
 		if (inp->inp_socket == NULL)
@@ -652,38 +682,39 @@ udp6_getcred(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_net_inet6_udp6, OID_AUTO, getcred, CTLTYPE_OPAQUE|CTLFLAG_RW, 0,
-    0, udp6_getcred, "S,xucred", "Get the xucred of a UDP6 connection");
+SYSCTL_PROC(_net_inet6_udp6, OID_AUTO, getcred,
+    CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    0, 0, udp6_getcred, "S,xucred",
+    "Get the xucred of a UDP6 connection");
 
 static int
-udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
-    struct mbuf *control, struct thread *td)
+udp6_output(struct socket *so, int flags_arg, struct mbuf *m,
+    struct sockaddr *addr6, struct mbuf *control, struct thread *td)
 {
-	u_int32_t ulen = m->m_pkthdr.len;
-	u_int32_t plen = sizeof(struct udphdr) + ulen;
+	struct inpcb *inp;
 	struct ip6_hdr *ip6;
 	struct udphdr *udp6;
 	struct in6_addr *laddr, *faddr, in6a;
-	struct sockaddr_in6 *sin6 = NULL;
-	int cscov_partial = 0;
-	int scope_ambiguous = 0;
-	u_short fport;
-	int error = 0;
-	uint8_t nxt;
-	uint16_t cscov = 0;
 	struct ip6_pktopts *optp, opt;
-	int af = AF_INET6, hlen = sizeof(struct ip6_hdr);
-	int flags;
-	struct sockaddr_in6 tmp;
+	struct sockaddr_in6 *sin6, tmp;
+	struct epoch_tracker et;
+	int cscov_partial, error, flags, hlen, scope_ambiguous;
+	u_int32_t ulen, plen;
+	uint16_t cscov;
+	u_short fport;
+	uint8_t nxt;
 
-	INP_WLOCK_ASSERT(inp);
-	INP_HASH_WLOCK_ASSERT(inp->inp_pcbinfo);
+	/* addr6 has been validated in udp6_send(). */
+	sin6 = (struct sockaddr_in6 *)addr6;
 
-	if (addr6) {
-		/* addr6 has been validated in udp6_send(). */
-		sin6 = (struct sockaddr_in6 *)addr6;
+	/*
+	 * In contrast to to IPv4 we do not validate the max. packet length
+	 * here due to IPv6 Jumbograms (RFC2675).
+	 */
 
-		/* protect *sin6 from overwrites */
+	scope_ambiguous = 0;
+	if (sin6) {
+		/* Protect *addr6 from overwrites. */
 		tmp = *sin6;
 		sin6 = &tmp;
 
@@ -697,22 +728,95 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
 		 */
 		if (sin6->sin6_scope_id == 0 && !V_ip6_use_defzone)
 			scope_ambiguous = 1;
-		if ((error = sa6_embedscope(sin6, V_ip6_use_defzone)) != 0)
+		if ((error = sa6_embedscope(sin6, V_ip6_use_defzone)) != 0) {
+			if (control)
+				m_freem(control);
+			m_freem(m);
 			return (error);
+		}
 	}
+
+	inp = sotoinpcb(so);
+	KASSERT(inp != NULL, ("%s: inp == NULL", __func__));
+	/*
+	 * In the following cases we want a write lock on the inp for either
+	 * local operations or for possible route cache updates in the IPv6
+	 * output path:
+	 * - on connected sockets (sin6 is NULL) for route cache updates,
+	 * - when we are not bound to an address and source port (it is
+	 *   in6_pcbsetport() which will require the write lock).
+	 *
+	 * We check the inp fields before actually locking the inp, so
+	 * here exists a race, and we may WLOCK the inp and end with already
+	 * bound one by other thread. This is fine.
+	 */
+	if (sin6 == NULL || (IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_laddr) &&
+	    inp->inp_lport == 0))
+		INP_WLOCK(inp);
+	else
+		INP_RLOCK(inp);
 
 	nxt = (inp->inp_socket->so_proto->pr_protocol == IPPROTO_UDP) ?
 	    IPPROTO_UDP : IPPROTO_UDPLITE;
+
+#ifdef INET
+	if ((inp->inp_flags & IN6P_IPV6_V6ONLY) == 0) {
+		int hasv4addr;
+
+		if (sin6 == NULL)
+			hasv4addr = (inp->inp_vflag & INP_IPV4);
+		else
+			hasv4addr = IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)
+			    ? 1 : 0;
+		if (hasv4addr) {
+			struct pr_usrreqs *pru;
+
+			/*
+			 * XXXRW: We release UDP-layer locks before calling
+			 * udp_send() in order to avoid recursion.  However,
+			 * this does mean there is a short window where inp's
+			 * fields are unstable.  Could this lead to a
+			 * potential race in which the factors causing us to
+			 * select the UDPv4 output routine are invalidated?
+			 */
+			INP_UNLOCK(inp);
+			if (sin6)
+				in6_sin6_2_sin_in_sock((struct sockaddr *)sin6);
+			pru = inetsw[ip_protox[nxt]].pr_usrreqs;
+			/* addr will just be freed in sendit(). */
+			return ((*pru->pru_send)(so, flags_arg | PRUS_IPV6, m,
+			    (struct sockaddr *)sin6, control, td));
+		}
+	} else
+#endif
+	if (sin6 && IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+		/*
+		 * Given this is either an IPv6-only socket or no INET is
+		 * supported we will fail the send if the given destination
+		 * address is a v4mapped address.
+		 *
+		 * XXXGL: do we leak m and control?
+		 */
+		INP_UNLOCK(inp);
+		return (EINVAL);
+	}
+
 	if (control) {
 		if ((error = ip6_setpktopts(control, &opt,
-		    inp->in6p_outputopts, td->td_ucred, nxt)) != 0)
-			goto release;
+		    inp->in6p_outputopts, td->td_ucred, nxt)) != 0) {
+			INP_UNLOCK(inp);
+			ip6_clearpktopts(&opt, -1);
+			if (control)
+				m_freem(control);
+			m_freem(m);
+			return (error);
+		}
 		optp = &opt;
 	} else
 		optp = inp->in6p_outputopts;
 
+	NET_EPOCH_ENTER(et);
 	if (sin6) {
-		faddr = &sin6->sin6_addr;
 
 		/*
 		 * Since we saw no essential reason for calling in_pcbconnect,
@@ -731,85 +835,52 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
 			goto release;
 		}
 
+		/*
+		 * Given we handle the v4mapped case in the INET block above
+		 * assert here that it must not happen anymore.
+		 */
+		KASSERT(!IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr),
+		    ("%s: sin6(%p)->sin6_addr is v4mapped which we "
+		    "should have handled.", __func__, sin6));
+
+		/* This only requires read-locking. */
+		error = in6_selectsrc_socket(sin6, optp, inp,
+		    td->td_ucred, scope_ambiguous, &in6a, NULL);
+		if (error)
+			goto release;
+		laddr = &in6a;
+
+		if (inp->inp_lport == 0) {
+			struct inpcbinfo *pcbinfo;
+
+			INP_WLOCK_ASSERT(inp);
+
+			pcbinfo = udp_get_inpcbinfo(so->so_proto->pr_protocol);
+			INP_HASH_WLOCK(pcbinfo);
+			error = in6_pcbsetport(laddr, inp, td->td_ucred);
+			INP_HASH_WUNLOCK(pcbinfo);
+			if (error != 0) {
+				/* Undo an address bind that may have occurred. */
+				inp->in6p_laddr = in6addr_any;
+				goto release;
+			}
+		}
+		faddr = &sin6->sin6_addr;
 		fport = sin6->sin6_port; /* allow 0 port */
 
-		if (IN6_IS_ADDR_V4MAPPED(faddr)) {
-			if ((inp->inp_flags & IN6P_IPV6_V6ONLY)) {
-				/*
-				 * I believe we should explicitly discard the
-				 * packet when mapped addresses are disabled,
-				 * rather than send the packet as an IPv6 one.
-				 * If we chose the latter approach, the packet
-				 * might be sent out on the wire based on the
-				 * default route, the situation which we'd
-				 * probably want to avoid.
-				 * (20010421 jinmei@kame.net)
-				 */
-				error = EINVAL;
-				goto release;
-			}
-			if (!IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_laddr) &&
-			    !IN6_IS_ADDR_V4MAPPED(&inp->in6p_laddr)) {
-				/*
-				 * when remote addr is an IPv4-mapped address,
-				 * local addr should not be an IPv6 address,
-				 * since you cannot determine how to map IPv6
-				 * source address to IPv4.
-				 */
-				error = EINVAL;
-				goto release;
-			}
-
-			af = AF_INET;
-		}
-
-		if (!IN6_IS_ADDR_V4MAPPED(faddr)) {
-			error = in6_selectsrc_socket(sin6, optp, inp,
-			    td->td_ucred, scope_ambiguous, &in6a, NULL);
-			if (error)
-				goto release;
-			laddr = &in6a;
-		} else
-			laddr = &inp->in6p_laddr;	/* XXX */
-		if (laddr == NULL) {
-			if (error == 0)
-				error = EADDRNOTAVAIL;
-			goto release;
-		}
-		if (inp->inp_lport == 0 &&
-		    (error = in6_pcbsetport(laddr, inp, td->td_ucred)) != 0) {
-			/* Undo an address bind that may have occurred. */
-			inp->in6p_laddr = in6addr_any;
-			goto release;
-		}
 	} else {
 		if (IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_faddr)) {
 			error = ENOTCONN;
 			goto release;
-		}
-		if (IN6_IS_ADDR_V4MAPPED(&inp->in6p_faddr)) {
-			if ((inp->inp_flags & IN6P_IPV6_V6ONLY)) {
-				/*
-				 * XXX: this case would happen when the
-				 * application sets the V6ONLY flag after
-				 * connecting the foreign address.
-				 * Such applications should be fixed,
-				 * so we bark here.
-				 */
-				log(LOG_INFO, "udp6_output: IPV6_V6ONLY "
-				    "option was set for a connected socket\n");
-				error = EINVAL;
-				goto release;
-			} else
-				af = AF_INET;
 		}
 		laddr = &inp->in6p_laddr;
 		faddr = &inp->in6p_faddr;
 		fport = inp->inp_fport;
 	}
 
-	if (af == AF_INET)
-		hlen = sizeof(struct ip);
+	ulen = m->m_pkthdr.len;
+	plen = sizeof(struct udphdr) + ulen;
+	hlen = sizeof(struct ip6_hdr);
 
 	/*
 	 * Calculate data length and get a mbuf
@@ -824,6 +895,7 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
 	/*
 	 * Stuff checksum and output datagram.
 	 */
+	cscov = cscov_partial = 0;
 	udp6 = (struct udphdr *)(mtod(m, caddr_t) + hlen);
 	udp6->uh_sport = inp->inp_lport; /* lport is always set in the PCB */
 	udp6->uh_dport = fport;
@@ -846,59 +918,59 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
 		udp6->uh_ulen = 0;
 	udp6->uh_sum = 0;
 
-	switch (af) {
-	case AF_INET6:
-		ip6 = mtod(m, struct ip6_hdr *);
-		ip6->ip6_flow	= inp->inp_flow & IPV6_FLOWINFO_MASK;
-		ip6->ip6_vfc	&= ~IPV6_VERSION_MASK;
-		ip6->ip6_vfc	|= IPV6_VERSION;
-		ip6->ip6_plen	= htons((u_short)plen);
-		ip6->ip6_nxt	= nxt;
-		ip6->ip6_hlim	= in6_selecthlim(inp, NULL);
-		ip6->ip6_src	= *laddr;
-		ip6->ip6_dst	= *faddr;
+	ip6 = mtod(m, struct ip6_hdr *);
+	ip6->ip6_flow	= inp->inp_flow & IPV6_FLOWINFO_MASK;
+	ip6->ip6_vfc	&= ~IPV6_VERSION_MASK;
+	ip6->ip6_vfc	|= IPV6_VERSION;
+	ip6->ip6_plen	= htons((u_short)plen);
+	ip6->ip6_nxt	= nxt;
+	ip6->ip6_hlim	= in6_selecthlim(inp, NULL);
+	ip6->ip6_src	= *laddr;
+	ip6->ip6_dst	= *faddr;
 
-		if (cscov_partial) {
-			if ((udp6->uh_sum = in6_cksum_partial(m, nxt,
-			    sizeof(struct ip6_hdr), plen, cscov)) == 0)
-				udp6->uh_sum = 0xffff;
-		} else {
-			udp6->uh_sum = in6_cksum_pseudo(ip6, plen, nxt, 0);
-			m->m_pkthdr.csum_flags = CSUM_UDP_IPV6;
-			m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
-		}
-
-#ifdef	RSS
-		{
-			uint32_t hash_val, hash_type;
-			uint8_t pr;
-
-			pr = inp->inp_socket->so_proto->pr_protocol;
-			/*
-			 * Calculate an appropriate RSS hash for UDP and
-			 * UDP Lite.
-			 *
-			 * The called function will take care of figuring out
-			 * whether a 2-tuple or 4-tuple hash is required based
-			 * on the currently configured scheme.
-			 *
-			 * Later later on connected socket values should be
-			 * cached in the inpcb and reused, rather than constantly
-			 * re-calculating it.
-			 *
-			 * UDP Lite is a different protocol number and will
-			 * likely end up being hashed as a 2-tuple until
-			 * RSS / NICs grow UDP Lite protocol awareness.
-			 */
-			if (rss_proto_software_hash_v6(faddr, laddr, fport,
-			    inp->inp_lport, pr, &hash_val, &hash_type) == 0) {
-				m->m_pkthdr.flowid = hash_val;
-				M_HASHTYPE_SET(m, hash_type);
-			}
-		}
+#ifdef MAC
+	mac_inpcb_create_mbuf(inp, m);
 #endif
-		flags = 0;
+
+	if (cscov_partial) {
+		if ((udp6->uh_sum = in6_cksum_partial(m, nxt,
+		    sizeof(struct ip6_hdr), plen, cscov)) == 0)
+			udp6->uh_sum = 0xffff;
+	} else {
+		udp6->uh_sum = in6_cksum_pseudo(ip6, plen, nxt, 0);
+		m->m_pkthdr.csum_flags = CSUM_UDP_IPV6;
+		m->m_pkthdr.csum_data = offsetof(struct udphdr, uh_sum);
+	}
+
+	flags = 0;
 #ifdef	RSS
+	{
+		uint32_t hash_val, hash_type;
+		uint8_t pr;
+
+		pr = inp->inp_socket->so_proto->pr_protocol;
+		/*
+		 * Calculate an appropriate RSS hash for UDP and
+		 * UDP Lite.
+		 *
+		 * The called function will take care of figuring out
+		 * whether a 2-tuple or 4-tuple hash is required based
+		 * on the currently configured scheme.
+		 *
+		 * Later later on connected socket values should be
+		 * cached in the inpcb and reused, rather than constantly
+		 * re-calculating it.
+		 *
+		 * UDP Lite is a different protocol number and will
+		 * likely end up being hashed as a 2-tuple until
+		 * RSS / NICs grow UDP Lite protocol awareness.
+		 */
+		if (rss_proto_software_hash_v6(faddr, laddr, fport,
+		    inp->inp_lport, pr, &hash_val, &hash_type) == 0) {
+			m->m_pkthdr.flowid = hash_val;
+			M_HASHTYPE_SET(m, hash_type);
+		}
+
 		/*
 		 * Don't override with the inp cached flowid.
 		 *
@@ -906,27 +978,35 @@ udp6_output(struct inpcb *inp, struct mbuf *m, struct sockaddr *addr6,
 		 * be incorrect.
 		 */
 		flags |= IP_NODEFAULTFLOWID;
+	}
 #endif
 
+	UDPSTAT_INC(udps_opackets);
+	if (nxt == IPPROTO_UDPLITE)
+		UDPLITE_PROBE(send, NULL, inp, ip6, inp, udp6);
+	else
 		UDP_PROBE(send, NULL, inp, ip6, inp, udp6);
-		UDPSTAT_INC(udps_opackets);
-		error = ip6_output(m, optp, &inp->inp_route6, flags,
-		    inp->in6p_moptions, NULL, inp);
-		break;
-	case AF_INET:
-		error = EAFNOSUPPORT;
-		goto release;
-	}
-	goto releaseopt;
+	error = ip6_output(m, optp,
+	    INP_WLOCKED(inp) ? &inp->inp_route6 : NULL, flags,
+	    inp->in6p_moptions, NULL, inp);
+	INP_UNLOCK(inp);
+	NET_EPOCH_EXIT(et);
 
-release:
-	m_freem(m);
-
-releaseopt:
 	if (control) {
 		ip6_clearpktopts(&opt, -1);
 		m_freem(control);
 	}
+	return (error);
+
+release:
+	INP_UNLOCK(inp);
+	NET_EPOCH_EXIT(et);
+	if (control) {
+		ip6_clearpktopts(&opt, -1);
+		m_freem(control);
+	}
+	m_freem(m);
+
 	return (error);
 }
 
@@ -1019,6 +1099,7 @@ udp6_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 	struct inpcb *inp;
 	struct inpcbinfo *pcbinfo;
 	int error;
+	u_char vflagsav;
 
 	pcbinfo = udp_get_inpcbinfo(so->so_proto->pr_protocol);
 	inp = sotoinpcb(so);
@@ -1026,6 +1107,7 @@ udp6_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	INP_WLOCK(inp);
 	INP_HASH_WLOCK(pcbinfo);
+	vflagsav = inp->inp_vflag;
 	inp->inp_vflag &= ~INP_IPV4;
 	inp->inp_vflag |= INP_IPV6;
 	if ((inp->inp_flags & IN6P_IPV6_V6ONLY) == 0) {
@@ -1053,6 +1135,8 @@ udp6_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 #ifdef INET
 out:
 #endif
+	if (error != 0)
+		inp->inp_vflag = vflagsav;
 	INP_HASH_WUNLOCK(pcbinfo);
 	INP_WUNLOCK(inp);
 	return (error);
@@ -1095,10 +1179,14 @@ udp6_close(struct socket *so)
 static int
 udp6_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 {
+#ifdef INET
+	struct epoch_tracker et;
+#endif
 	struct inpcb *inp;
 	struct inpcbinfo *pcbinfo;
 	struct sockaddr_in6 *sin6;
 	int error;
+	u_char vflagsav;
 
 	pcbinfo = udp_get_inpcbinfo(so->so_proto->pr_protocol);
 	inp = sotoinpcb(so);
@@ -1126,17 +1214,28 @@ udp6_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 			goto out;
 		}
 		in6_sin6_2_sin(&sin, sin6);
-		inp->inp_vflag |= INP_IPV4;
-		inp->inp_vflag &= ~INP_IPV6;
 		error = prison_remote_ip4(td->td_ucred, &sin.sin_addr);
 		if (error != 0)
 			goto out;
+		vflagsav = inp->inp_vflag;
+		inp->inp_vflag |= INP_IPV4;
+		inp->inp_vflag &= ~INP_IPV6;
+		NET_EPOCH_ENTER(et);
 		INP_HASH_WLOCK(pcbinfo);
 		error = in_pcbconnect(inp, (struct sockaddr *)&sin,
 		    td->td_ucred);
 		INP_HASH_WUNLOCK(pcbinfo);
+		NET_EPOCH_EXIT(et);
+		/*
+		 * If connect succeeds, mark socket as connected. If
+		 * connect fails and socket is unbound, reset inp_vflag
+		 * field.
+		 */
 		if (error == 0)
 			soisconnected(so);
+		else if (inp->inp_laddr.s_addr == INADDR_ANY &&
+		    inp->inp_lport == 0)
+			inp->inp_vflag = vflagsav;
 		goto out;
 	} else {
 		if ((inp->inp_vflag & INP_IPV6) == 0) {
@@ -1149,16 +1248,25 @@ udp6_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 		error = EISCONN;
 		goto out;
 	}
-	inp->inp_vflag &= ~INP_IPV4;
-	inp->inp_vflag |= INP_IPV6;
 	error = prison_remote_ip6(td->td_ucred, &sin6->sin6_addr);
 	if (error != 0)
 		goto out;
+	vflagsav = inp->inp_vflag;
+	inp->inp_vflag &= ~INP_IPV4;
+	inp->inp_vflag |= INP_IPV6;
 	INP_HASH_WLOCK(pcbinfo);
 	error = in6_pcbconnect(inp, nam, td->td_ucred);
 	INP_HASH_WUNLOCK(pcbinfo);
+	/*
+	 * If connect succeeds, mark socket as connected. If
+	 * connect fails and socket is unbound, reset inp_vflag
+	 * field.
+	 */
 	if (error == 0)
 		soisconnected(so);
+	else if (IN6_IS_ADDR_UNSPECIFIED(&inp->in6p_laddr) &&
+	    inp->inp_lport == 0)
+		inp->inp_vflag = vflagsav;
 out:
 	INP_WUNLOCK(inp);
 	return (error);
@@ -1230,15 +1338,8 @@ static int
 udp6_send(struct socket *so, int flags, struct mbuf *m,
     struct sockaddr *addr, struct mbuf *control, struct thread *td)
 {
-	struct inpcb *inp;
-	struct inpcbinfo *pcbinfo;
-	int error = 0;
+	int error;
 
-	pcbinfo = udp_get_inpcbinfo(so->so_proto->pr_protocol);
-	inp = sotoinpcb(so);
-	KASSERT(inp != NULL, ("udp6_send: inp == NULL"));
-
-	INP_WLOCK(inp);
 	if (addr) {
 		if (addr->sa_len != sizeof(struct sockaddr_in6)) {
 			error = EINVAL;
@@ -1250,53 +1351,11 @@ udp6_send(struct socket *so, int flags, struct mbuf *m,
 		}
 	}
 
-#ifdef INET
-	if ((inp->inp_flags & IN6P_IPV6_V6ONLY) == 0) {
-		int hasv4addr;
-		struct sockaddr_in6 *sin6 = NULL;
-
-		if (addr == NULL)
-			hasv4addr = (inp->inp_vflag & INP_IPV4);
-		else {
-			sin6 = (struct sockaddr_in6 *)addr;
-			hasv4addr = IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)
-			    ? 1 : 0;
-		}
-		if (hasv4addr) {
-			struct pr_usrreqs *pru;
-			uint8_t nxt;
-
-			nxt = (inp->inp_socket->so_proto->pr_protocol ==
-			    IPPROTO_UDP) ? IPPROTO_UDP : IPPROTO_UDPLITE;
-			/*
-			 * XXXRW: We release UDP-layer locks before calling
-			 * udp_send() in order to avoid recursion.  However,
-			 * this does mean there is a short window where inp's
-			 * fields are unstable.  Could this lead to a
-			 * potential race in which the factors causing us to
-			 * select the UDPv4 output routine are invalidated?
-			 */
-			INP_WUNLOCK(inp);
-			if (sin6)
-				in6_sin6_2_sin_in_sock(addr);
-			pru = inetsw[ip_protox[nxt]].pr_usrreqs;
-			/* addr will just be freed in sendit(). */
-			return ((*pru->pru_send)(so, flags, m, addr, control,
-			    td));
-		}
-	}
-#endif
-#ifdef MAC
-	mac_inpcb_create_mbuf(inp, m);
-#endif
-	INP_HASH_WLOCK(pcbinfo);
-	error = udp6_output(inp, m, addr, control, td);
-	INP_HASH_WUNLOCK(pcbinfo);
-	INP_WUNLOCK(inp);
-	return (error);
+	return (udp6_output(so, flags, m, addr, control, td));
 
 bad:
-	INP_WUNLOCK(inp);
+	if (control)
+		m_freem(control);
 	m_freem(m);
 	return (error);
 }

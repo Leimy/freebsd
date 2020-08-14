@@ -16,7 +16,7 @@
 # require the ATF libraries.
 #
 # Test programs registered in this manner are set to be installed into TESTSDIR
-# (which should be overriden by the Makefile) and are not required to provide a
+# (which should be overridden by the Makefile) and are not required to provide a
 # manpage.
 ATF_TESTS_C?=
 ATF_TESTS_CXX?=
@@ -55,6 +55,8 @@ LDADD.${_T}+= ${LIBATF_CXX} ${LIBATF_C}
 .endif
 TEST_INTERFACE.${_T}= atf
 .endfor
+# Silence warnings about usage of deprecated std::auto_ptr
+CXXWARNFLAGS+=	-Wno-deprecated-declarations
 .endif
 
 .if !empty(ATF_TESTS_SH)

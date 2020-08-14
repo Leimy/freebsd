@@ -1,8 +1,8 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2001 M. Warner Losh.  All rights reserved.
  * Copyright (c) 2003 Norikatsu Shigemura, Takenori Watanabe All rights reserved.
+ * Copyright (c) 2001 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -95,7 +95,7 @@ uart_pccard_attach(device_t dev)
 	sc = device_get_softc(dev);
 	sc->sc_class = &uart_ns8250_class;
 
-	error = uart_bus_probe(dev, 0, 0, 0, 0, 0);
+	error = uart_bus_probe(dev, 0, 0, 0, 0, 0, 0);
 	if (error > 0)
 		return (error);
 	return (uart_bus_attach(dev));
@@ -103,4 +103,4 @@ uart_pccard_attach(device_t dev)
 
 DRIVER_MODULE(uart, pccard, uart_pccard_driver, uart_devclass, 0, 0);
 MODULE_PNP_INFO("U32:function_type;", pccard, uart, &uart_pccard_function,
-    sizeof(uart_pccard_function), 1);
+    1);

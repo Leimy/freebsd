@@ -24,8 +24,6 @@ include 	"std.armv6"
 include 	"../broadcom/bcm2835/std.rpi"
 include 	"../broadcom/bcm2835/std.bcm2835"
 
-options 	INTRNG
-
 options 	SCHED_4BSD		# 4BSD scheduler
 options 	PLATFORM
 
@@ -67,7 +65,6 @@ device		iicbus
 device		bcm2835_bsc
 
 device		md
-device		random			# Entropy device
 
 # USB support
 device		usb
@@ -79,7 +76,7 @@ device		da
 device		umass
 
 # USB ethernet support
-device		smcphy
+device		smscphy
 device		mii
 device		smsc
 
@@ -89,6 +86,8 @@ device		bcm2835_spi
 
 device		vchiq
 device		sound
+
+device		fdt_pinctrl
 
 # Flattened Device Tree
 options 	FDT			# Configure using FDT/DTB data

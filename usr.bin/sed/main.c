@@ -102,6 +102,7 @@ FILE *outfile;			/* Current output file */
 
 int aflag, eflag, nflag;
 int rflags = 0;
+int quit = 0;
 static int rval;		/* Exit status */
 
 static int ispan;		/* Whether inplace editing spans across files */
@@ -115,7 +116,7 @@ const char *fname;		/* File name. */
 const char *outfname;		/* Output file name */
 static char oldfname[PATH_MAX];	/* Old file name (for in-place editing) */
 static char tmpfname[PATH_MAX];	/* Temporary file name (for in-place editing) */
-static const char *inplace;	/* Inplace edit file extension. */
+const char *inplace;		/* Inplace edit file extension. */
 u_long linenum;
 
 static void add_compunit(enum e_cut, char *);
@@ -125,12 +126,13 @@ static void usage(void);
 int
 main(int argc, char *argv[])
 {
-	int c, fflag;
+	int c, fflag, fflagstdin;
 	char *temp_arg;
 
 	(void) setlocale(LC_ALL, "");
 
 	fflag = 0;
+	fflagstdin = 0;
 	inplace = NULL;
 
 	while ((c = getopt(argc, argv, "EI:ae:f:i:lnru")) != -1)
@@ -156,6 +158,8 @@ main(int argc, char *argv[])
 			break;
 		case 'f':
 			fflag = 1;
+			if (strcmp(optarg, "-") == 0)
+				fflagstdin = 1;
 			add_compunit(CU_FILE, optarg);
 			break;
 		case 'i':
@@ -192,6 +196,8 @@ main(int argc, char *argv[])
 	if (*argv)
 		for (; *argv; argv++)
 			add_file(*argv);
+	else if (fflagstdin)
+		exit(rval);
 	else
 		add_file(NULL);
 	process();
@@ -235,9 +241,14 @@ again:
 		linenum = 0;
 		switch (script->type) {
 		case CU_FILE:
-			if ((f = fopen(script->s, "r")) == NULL)
-				err(1, "%s", script->s);
-			fname = script->s;
+			if (strcmp(script->s, "-") == 0) {
+				f = stdin;
+				fname = "stdin";
+			} else {
+				if ((f = fopen(script->s, "r")) == NULL)
+				        err(1, "%s", script->s);
+				fname = script->s;
+			}
 			state = ST_FILE;
 			goto again;
 		case CU_STRING:
@@ -250,6 +261,8 @@ again:
 			s = script->s;
 			state = ST_STRING;
 			goto again;
+		default:
+			__unreachable();
 		}
 	case ST_FILE:
 		if ((p = fgets(buf, n, f)) != NULL) {
@@ -336,7 +349,7 @@ mf_fgets(SPACE *sp, enum e_spflag spflag)
 	}
 
 	for (;;) {
-		if (infile != NULL && (c = getc(infile)) != EOF) {
+		if (infile != NULL && (c = getc(infile)) != EOF && !quit) {
 			(void)ungetc(c, infile);
 			break;
 		}

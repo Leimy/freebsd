@@ -55,13 +55,13 @@ static const char rcsid[] =
  *	primes [-h] [start [stop]]
  *
  *	Print primes >= start and < stop.  If stop is omitted,
- *	the value 4294967295 (2^32-1) is assumed.  If start is
- *	omitted, start is read from standard input.
+ *	the value 18446744073709551615 (2^64-1) is assumed.  If
+ *	start is omitted, start is read from standard input.
  *
  * validation check: there are 664579 primes between 0 and 10^7
  */
 
-#include <sys/capsicum.h>
+#include <capsicum_helpers.h>
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
@@ -101,10 +101,8 @@ main(int argc, char *argv[])
 	int ch;
 	char *p;
 
-	/* Cache NLS data, for strerror, for err(3), before cap_enter. */
-	(void)catopen("libc", NL_CAT_LOCALE);
-
-	if (cap_enter() < 0 && errno != ENOSYS)
+	caph_cache_catpages();
+	if (caph_enter() < 0)
 		err(1, "cap_enter");
 
 	while ((ch = getopt(argc, argv, "h")) != -1)

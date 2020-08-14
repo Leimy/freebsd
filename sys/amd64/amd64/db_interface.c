@@ -37,6 +37,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/pcpu.h>
 
 #include <machine/cpufunc.h>
+#include <machine/md_var.h>
 #include <machine/specialreg.h>
 
 #include <ddb/ddb.h>
@@ -75,19 +76,19 @@ db_write_bytes(vm_offset_t addr, size_t size, char *data)
 	jmp_buf jb;
 	void *prev_jb;
 	char *dst;
-	u_long cr0save;
+	bool old_wp;
 	int ret;
 
-	cr0save = rcr0();
+	old_wp = false;
 	prev_jb = kdb_jmpbuf(jb);
 	ret = setjmp(jb);
 	if (ret == 0) {
-		load_cr0(cr0save & ~CR0_WP);
+		old_wp = disable_wp();
 		dst = (char *)addr;
 		while (size-- > 0)
 			*dst++ = *data++;
 	}
-	load_cr0(cr0save);
+	restore_wp(old_wp);
 	(void)kdb_jmpbuf(prev_jb);
 	return (ret);
 }
@@ -96,10 +97,13 @@ void
 db_show_mdpcpu(struct pcpu *pc)
 {
 
+	db_printf("self         = %p\n", pc->pc_prvspace);
 	db_printf("curpmap      = %p\n", pc->pc_curpmap);
 	db_printf("tssp         = %p\n", pc->pc_tssp);
-	db_printf("commontssp   = %p\n", pc->pc_commontssp);
 	db_printf("rsp0         = 0x%lx\n", pc->pc_rsp0);
+	db_printf("kcr3         = 0x%lx\n", pc->pc_kcr3);
+	db_printf("ucr3         = 0x%lx\n", pc->pc_ucr3);
+	db_printf("scr3         = 0x%lx\n", pc->pc_saved_ucr3);
 	db_printf("gs32p        = %p\n", pc->pc_gs32p);
 	db_printf("ldt          = %p\n", pc->pc_ldt);
 	db_printf("tss          = %p\n", pc->pc_tss);

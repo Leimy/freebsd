@@ -42,6 +42,7 @@ typedef struct {
 } atomic_long_t;
 
 #define	atomic_long_add(i, v)		atomic_long_add_return((i), (v))
+#define	atomic_long_sub(i, v)		atomic_long_add_return(-(i), (v))
 #define	atomic_long_inc_return(v)	atomic_long_add_return(1, (v))
 #define	atomic_long_inc_not_zero(v)	atomic_long_add_unless((v), 1, 0)
 
@@ -81,19 +82,46 @@ atomic_long_xchg(atomic_long_t *v, long val)
 	return atomic_swap_long(&v->counter, val);
 }
 
+static inline long
+atomic_long_cmpxchg(atomic_long_t *v, long old, long new)
+{
+	long ret = old;
+
+	for (;;) {
+		if (atomic_fcmpset_long(&v->counter, &ret, new))
+			break;
+		if (ret != old)
+			break;
+	}
+	return (ret);
+}
+
 static inline int
 atomic_long_add_unless(atomic_long_t *v, long a, long u)
 {
-	long c;
+	long c = atomic_long_read(v);
 
 	for (;;) {
-		c = atomic_long_read(v);
 		if (unlikely(c == u))
 			break;
-		if (likely(atomic_cmpset_long(&v->counter, c, c + a)))
+		if (likely(atomic_fcmpset_long(&v->counter, &c, c + a)))
 			break;
 	}
 	return (c != u);
+}
+
+static inline long
+atomic_long_fetch_add_unless(atomic_long_t *v, long a, long u)
+{
+	long c = atomic_long_read(v);
+
+	for (;;) {
+		if (unlikely(c == u))
+			break;
+		if (likely(atomic_fcmpset_long(&v->counter, &c, c + a)))
+			break;
+	}
+	return (c);
 }
 
 static inline long

@@ -189,9 +189,6 @@ static const uint32_t rt2560_rf2525e_r2[]   = RT2560_RF2525E_R2;
 static const uint32_t rt2560_rf2526_r2[]    = RT2560_RF2526_R2;
 static const uint32_t rt2560_rf2526_hi_r2[] = RT2560_RF2526_HI_R2;
 
-static const uint8_t rt2560_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-
 static const uint8_t rt2560_chan_5ghz[] =
 	{ 36, 40, 44, 48, 52, 56, 60, 64,
 	  100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
@@ -1089,6 +1086,7 @@ rt2560_prio_intr(struct rt2560_softc *sc)
 static void
 rt2560_decryption_intr(struct rt2560_softc *sc)
 {
+	struct epoch_tracker et;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct rt2560_rx_desc *desc;
 	struct rt2560_rx_data *data;
@@ -1199,12 +1197,13 @@ rt2560_decryption_intr(struct rt2560_softc *sc)
 		wh = mtod(m, struct ieee80211_frame *);
 		ni = ieee80211_find_rxnode(ic,
 		    (struct ieee80211_frame_min *)wh);
+		NET_EPOCH_ENTER(et);
 		if (ni != NULL) {
 			(void) ieee80211_input(ni, m, rssi, nf);
 			ieee80211_free_node(ni);
 		} else
 			(void) ieee80211_input_all(ic, m, rssi, nf);
-
+		NET_EPOCH_EXIT(et);
 		RAL_LOCK(sc);
 		sc->sc_flags &= ~RT2560_F_INPUT_RUNNING;
 skip:		desc->flags = htole32(RT2560_RX_BUSY);
@@ -2137,8 +2136,7 @@ rt2560_getradiocaps(struct ieee80211com *ic,
 	memset(bands, 0, sizeof(bands));
 	setbit(bands, IEEE80211_MODE_11B);
 	setbit(bands, IEEE80211_MODE_11G);
-	ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
-	    rt2560_chan_2ghz, nitems(rt2560_chan_2ghz), bands, 0);
+	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
 
 	if (sc->rf_rev == RT2560_RF_5222) {
 		setbit(bands, IEEE80211_MODE_11A);

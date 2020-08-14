@@ -93,11 +93,6 @@
 #define	IFM_40G_CR4 IFM_UNKNOWN
 #endif
 
-#if (__FreeBSD_version >= 800501 && __FreeBSD_version < 900000) || \
-	__FreeBSD_version >= 900003
-#define	SFXGE_HAVE_DESCRIBE_INTR
-#endif
-
 #ifdef IFM_ETH_RXPAUSE
 #define	SFXGE_HAVE_PAUSE_MEDIAOPTS
 #endif
@@ -184,6 +179,10 @@ struct sfxge_evq {
 	unsigned int		buf_base_id;
 	unsigned int		entries;
 	char			lock_name[SFXGE_LOCK_NAME_MAX];
+#if EFSYS_OPT_QSTATS
+	clock_t			stats_update_time;
+	uint64_t		stats[EV_NQSTATS];
+#endif
 } __aligned(CACHE_LINE_SIZE);
 
 #define	SFXGE_NDESCS	1024
@@ -275,15 +274,22 @@ struct sfxge_softc {
 	struct ifnet			*ifnet;
 	unsigned int			if_flags;
 	struct sysctl_oid		*stats_node;
+#if EFSYS_OPT_QSTATS
+	struct sysctl_oid		*evqs_stats_node;
+#endif
 	struct sysctl_oid		*txqs_node;
 
 	struct task			task_reset;
 
 	efx_family_t			family;
+	unsigned int			mem_bar;
+
 	caddr_t				vpd_data;
 	size_t				vpd_size;
 	efx_nic_t			*enp;
 	efsys_lock_t			enp_lock;
+
+	boolean_t			txq_dynamic_cksum_toggle_supported;
 
 	unsigned int			rxq_entries;
 	unsigned int			txq_entries;

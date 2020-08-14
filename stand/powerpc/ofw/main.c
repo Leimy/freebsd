@@ -38,7 +38,6 @@ __FBSDID("$FreeBSD$");
 struct arch_switch	archsw;		/* MI/MD interface boundary */
 
 extern char end[];
-extern char bootprog_info[];
 
 uint32_t	acells, scells;
 
@@ -89,6 +88,21 @@ memsize(void)
 
 	return (memsz);
 }
+
+#ifdef CAS
+extern int ppc64_cas(void);
+
+static int
+ppc64_autoload(void)
+{
+	const char *cas;
+
+	if ((cas = getenv("cas")) && cas[0] == '1')
+		if (ppc64_cas() != 0)
+			return (-1);
+	return (ofw_autoload());
+}
+#endif
 
 int
 main(int (*openfirm)(void *))
@@ -170,7 +184,12 @@ main(int (*openfirm)(void *))
 	archsw.arch_copyin = ofw_copyin;
 	archsw.arch_copyout = ofw_copyout;
 	archsw.arch_readin = ofw_readin;
+#ifdef CAS
+	setenv("cas", "1", 0);
+	archsw.arch_autoload = ppc64_autoload;
+#else
 	archsw.arch_autoload = ofw_autoload;
+#endif
 
 	interact();				/* doesn't return */
 

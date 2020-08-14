@@ -93,6 +93,7 @@ map_object(int fd, const char *path, const struct stat *sb)
     Elf_Addr note_end;
     char *note_map;
     size_t note_map_len;
+    Elf_Addr text_end;
 
     hdr = get_elf_header(fd, path, sb);
     if (hdr == NULL)
@@ -103,7 +104,7 @@ map_object(int fd, const char *path, const struct stat *sb)
      *
      * We expect that the loadable segments are ordered by load address.
      */
-    phdr = (Elf_Phdr *) ((char *)hdr + hdr->e_phoff);
+    phdr = (Elf_Phdr *)((char *)hdr + hdr->e_phoff);
     phsize  = hdr->e_phnum * sizeof (phdr[0]);
     phlimit = phdr + hdr->e_phnum;
     nsegs = -1;
@@ -114,8 +115,10 @@ map_object(int fd, const char *path, const struct stat *sb)
     note_start = 0;
     note_end = 0;
     note_map = NULL;
+    note_map_len = 0;
     segs = alloca(sizeof(segs[0]) * hdr->e_phnum);
     stack_flags = RTLD_DEFAULT_STACK_PF_EXEC | PF_R | PF_W;
+    text_end = 0;
     while (phdr < phlimit) {
 	switch (phdr->p_type) {
 
@@ -129,6 +132,10 @@ map_object(int fd, const char *path, const struct stat *sb)
 		_rtld_error("%s: PT_LOAD segment %d not page-aligned",
 		    path, nsegs);
 		goto error;
+	    }
+	    if ((segs[nsegs]->p_flags & PF_X) == PF_X) {
+		text_end = MAX(text_end,
+		    round_page(segs[nsegs]->p_vaddr + segs[nsegs]->p_memsz));
 	    }
 	    break;
 
@@ -202,7 +209,7 @@ map_object(int fd, const char *path, const struct stat *sb)
 	base_flags |= MAP_FIXED | MAP_EXCL;
 
     mapbase = mmap(base_addr, mapsize, PROT_NONE, base_flags, -1, 0);
-    if (mapbase == (caddr_t) -1) {
+    if (mapbase == MAP_FAILED) {
 	_rtld_error("%s: mmap of entire address space failed: %s",
 	  path, rtld_strerror(errno));
 	goto error;
@@ -221,11 +228,12 @@ map_object(int fd, const char *path, const struct stat *sb)
 	data_addr = mapbase + (data_vaddr - base_vaddr);
 	data_prot = convert_prot(segs[i]->p_flags);
 	data_flags = convert_flags(segs[i]->p_flags) | MAP_FIXED;
-	if (mmap(data_addr, data_vlimit - data_vaddr, data_prot,
-	  data_flags | MAP_PREFAULT_READ, fd, data_offset) == (caddr_t) -1) {
-	    _rtld_error("%s: mmap of data failed: %s", path,
-		rtld_strerror(errno));
-	    goto error1;
+	if (data_vlimit != data_vaddr &&
+	    mmap(data_addr, data_vlimit - data_vaddr, data_prot, 
+	    data_flags | MAP_PREFAULT_READ, fd, data_offset) == MAP_FAILED) {
+		_rtld_error("%s: mmap of data failed: %s", path,
+		    rtld_strerror(errno));
+		goto error1;
 	}
 
 	/* Do BSS setup */
@@ -258,7 +266,7 @@ map_object(int fd, const char *path, const struct stat *sb)
 	    bss_addr = mapbase +  (bss_vaddr - base_vaddr);
 	    if (bss_vlimit > bss_vaddr) {	/* There is something to do */
 		if (mmap(bss_addr, bss_vlimit - bss_vaddr, data_prot,
-		    data_flags | MAP_ANON, -1, 0) == (caddr_t)-1) {
+		    data_flags | MAP_ANON, -1, 0) == MAP_FAILED) {
 		    _rtld_error("%s: mmap of bss failed: %s", path,
 			rtld_strerror(errno));
 		    goto error1;
@@ -280,15 +288,13 @@ map_object(int fd, const char *path, const struct stat *sb)
     }
     obj->mapbase = mapbase;
     obj->mapsize = mapsize;
-    obj->textsize = round_page(segs[0]->p_vaddr + segs[0]->p_memsz) -
-      base_vaddr;
     obj->vaddrbase = base_vaddr;
     obj->relocbase = mapbase - base_vaddr;
-    obj->dynamic = (const Elf_Dyn *) (obj->relocbase + phdyn->p_vaddr);
+    obj->dynamic = (const Elf_Dyn *)(obj->relocbase + phdyn->p_vaddr);
     if (hdr->e_entry != 0)
-	obj->entry = (caddr_t) (obj->relocbase + hdr->e_entry);
+	obj->entry = (caddr_t)(obj->relocbase + hdr->e_entry);
     if (phdr_vaddr != 0) {
-	obj->phdr = (const Elf_Phdr *) (obj->relocbase + phdr_vaddr);
+	obj->phdr = (const Elf_Phdr *)(obj->relocbase + phdr_vaddr);
     } else {
 	obj->phdr = malloc(phsize);
 	if (obj->phdr == NULL) {
@@ -296,17 +302,18 @@ map_object(int fd, const char *path, const struct stat *sb)
 	    _rtld_error("%s: cannot allocate program header", path);
 	    goto error1;
 	}
-	memcpy((char *)obj->phdr, (char *)hdr + hdr->e_phoff, phsize);
+	memcpy(__DECONST(char *, obj->phdr), (char *)hdr + hdr->e_phoff, phsize);
 	obj->phdr_alloc = true;
     }
     obj->phsize = phsize;
     if (phinterp != NULL)
-	obj->interp = (const char *) (obj->relocbase + phinterp->p_vaddr);
+	obj->interp = (const char *)(obj->relocbase + phinterp->p_vaddr);
     if (phtls != NULL) {
 	tls_dtv_generation++;
 	obj->tlsindex = ++tls_max_index;
 	obj->tlssize = phtls->p_memsz;
 	obj->tlsalign = phtls->p_align;
+	obj->tlspoffset = phtls->p_offset;
 	obj->tlsinitsize = phtls->p_filesz;
 	obj->tlsinit = mapbase + phtls->p_vaddr;
     }
@@ -335,14 +342,14 @@ get_elf_header(int fd, const char *path, const struct stat *sbp)
 	Elf_Ehdr *hdr;
 
 	/* Make sure file has enough data for the ELF header */
-	if (sbp != NULL && sbp->st_size < sizeof(Elf_Ehdr)) {
+	if (sbp != NULL && sbp->st_size < (off_t)sizeof(Elf_Ehdr)) {
 		_rtld_error("%s: invalid file format", path);
 		return (NULL);
 	}
 
 	hdr = mmap(NULL, PAGE_SIZE, PROT_READ, MAP_PRIVATE | MAP_PREFAULT_READ,
 	    fd, 0);
-	if (hdr == (Elf_Ehdr *)MAP_FAILED) {
+	if (hdr == MAP_FAILED) {
 		_rtld_error("%s: read error: %s", path, rtld_strerror(errno));
 		return (NULL);
 	}
@@ -425,13 +432,13 @@ obj_free(Obj_Entry *obj)
     if (obj->origin_path)
 	free(obj->origin_path);
     if (obj->z_origin)
-	free(obj->rpath);
+	free(__DECONST(void*, obj->rpath));
     if (obj->priv)
 	free(obj->priv);
     if (obj->path)
 	free(obj->path);
     if (obj->phdr_alloc)
-	free((void *)obj->phdr);
+	free(__DECONST(void *, obj->phdr));
     free(obj);
 }
 

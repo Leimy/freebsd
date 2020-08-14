@@ -108,6 +108,61 @@ found:
 	return (e);
 }
 
+static struct l2t_entry *
+find_or_alloc_l2e(struct l2t_data *d, uint16_t vlan, uint8_t port, uint8_t *dmac)
+{
+	struct l2t_entry *end, *e, **p;
+	struct l2t_entry *first_free = NULL;
+
+	for (e = &d->l2tab[0], end = &d->l2tab[d->l2t_size]; e != end; ++e) {
+		if (atomic_load_acq_int(&e->refcnt) == 0) {
+			if (!first_free)
+				first_free = e;
+		} else if (e->state == L2T_STATE_SWITCHING &&
+		    memcmp(e->dmac, dmac, ETHER_ADDR_LEN) == 0 &&
+		    e->vlan == vlan && e->lport == port)
+			return (e);	/* Found existing entry that matches. */
+	}
+
+	if (first_free == NULL)
+		return (NULL);	/* No match and no room for a new entry. */
+
+	/*
+	 * The entry we found may be an inactive entry that is
+	 * presently in the hash table.  We need to remove it.
+	 */
+	e = first_free;
+	if (e->state < L2T_STATE_SWITCHING) {
+		for (p = &d->l2tab[e->hash].first; *p; p = &(*p)->next) {
+			if (*p == e) {
+				*p = e->next;
+				e->next = NULL;
+				break;
+			}
+		}
+	}
+	e->state = L2T_STATE_UNUSED;
+	return (e);
+}
+
+static void
+mk_write_l2e(struct adapter *sc, struct l2t_entry *e, int sync, int reply,
+    void *dst)
+{
+	struct cpl_l2t_write_req *req;
+	int idx;
+
+	req = dst;
+	idx = e->idx + sc->vres.l2t.start;
+	INIT_TP_WR(req, 0);
+	OPCODE_TID(req) = htonl(MK_OPCODE_TID(CPL_L2T_WRITE_REQ, idx |
+	    V_SYNC_WR(sync) | V_TID_QID(e->iqid)));
+	req->params = htons(V_L2T_W_PORT(e->lport) | V_L2T_W_NOREPLY(!reply));
+	req->l2t_idx = htons(idx);
+	req->vlan = htons(e->vlan);
+	memcpy(req->dst_mac, e->dmac, sizeof(req->dst_mac));
+}
+
 /*
  * Write an L2T entry.  Must be called with the entry locked.
  * The write may be synchronous or asynchronous.
@@ -119,7 +174,6 @@ t4_write_l2e(struct l2t_entry *e, int sync)
 	struct adapter *sc;
 	struct wrq_cookie cookie;
 	struct cpl_l2t_write_req *req;
-	int idx;
 
 	mtx_assert(&e->lock, MA_OWNED);
 	MPASS(e->wrq != NULL);
@@ -131,14 +185,7 @@ t4_write_l2e(struct l2t_entry *e, int sync)
 	if (req == NULL)
 		return (ENOMEM);
 
-	idx = e->idx + sc->vres.l2t.start;
-	INIT_TP_WR(req, 0);
-	OPCODE_TID(req) = htonl(MK_OPCODE_TID(CPL_L2T_WRITE_REQ, idx |
-	    V_SYNC_WR(sync) | V_TID_QID(e->iqid)));
-	req->params = htons(V_L2T_W_PORT(e->lport) | V_L2T_W_NOREPLY(!sync));
-	req->l2t_idx = htons(idx);
-	req->vlan = htons(e->vlan);
-	memcpy(req->dst_mac, e->dmac, sizeof(req->dst_mac));
+	mk_write_l2e(sc, e, sync, sync, req);
 
 	commit_wrq_wr(wrq, req, &cookie);
 
@@ -149,46 +196,127 @@ t4_write_l2e(struct l2t_entry *e, int sync)
 }
 
 /*
+ * Allocate an L2T entry for use by a TLS connection.  These entries are
+ * associated with a specific VLAN and destination MAC that never changes.
+ * However, multiple TLS connections might share a single entry.
+ *
+ * If a new L2T entry is allocated, a work request to initialize it is
+ * written to 'txq' and 'ndesc' will be set to 1.  Otherwise, 'ndesc'
+ * will be set to 0.
+ *
+ * To avoid races, separate L2T entries are reserved for individual
+ * queues since the L2T entry update is written to a txq just prior to
+ * TLS work requests that will depend on it being written.
+ */
+struct l2t_entry *
+t4_l2t_alloc_tls(struct adapter *sc, struct sge_txq *txq, void *dst,
+    int *ndesc, uint16_t vlan, uint8_t port, uint8_t *eth_addr)
+{
+	struct l2t_data *d;
+	struct l2t_entry *e;
+	int i;
+
+	TXQ_LOCK_ASSERT_OWNED(txq);
+
+	d = sc->l2t;
+	*ndesc = 0;
+
+	rw_rlock(&d->lock);
+
+	/* First, try to find an existing entry. */
+	for (i = 0; i < d->l2t_size; i++) {
+		e = &d->l2tab[i];
+		if (e->state != L2T_STATE_TLS)
+			continue;
+		if (e->vlan == vlan && e->lport == port &&
+		    e->wrq == (struct sge_wrq *)txq &&
+		    memcmp(e->dmac, eth_addr, ETHER_ADDR_LEN) == 0) {
+			if (atomic_fetchadd_int(&e->refcnt, 1) == 0) {
+				/*
+				 * This entry wasn't held but is still
+				 * valid, so decrement nfree.
+				 */
+				atomic_subtract_int(&d->nfree, 1);
+			}
+			KASSERT(e->refcnt > 0,
+			    ("%s: refcount overflow", __func__));
+			rw_runlock(&d->lock);
+			return (e);
+		}
+	}
+
+	/*
+	 * Don't bother rechecking if the upgrade fails since the txq is
+	 * already locked.
+	 */
+	if (!rw_try_upgrade(&d->lock)) {
+		rw_runlock(&d->lock);
+		rw_wlock(&d->lock);
+	}
+
+	/* Match not found, allocate a new entry. */
+	e = t4_alloc_l2e(d);
+	if (e == NULL) {
+		rw_wunlock(&d->lock);
+		return (e);
+	}
+
+	/* Initialize the entry. */
+	e->state = L2T_STATE_TLS;
+	e->vlan = vlan;
+	e->lport = port;
+	e->iqid = sc->sge.fwq.abs_id;
+	e->wrq = (struct sge_wrq *)txq;
+	memcpy(e->dmac, eth_addr, ETHER_ADDR_LEN);
+	atomic_store_rel_int(&e->refcnt, 1);
+	rw_wunlock(&d->lock);
+
+	/* Write out the work request. */
+	*ndesc = howmany(sizeof(struct cpl_l2t_write_req), EQ_ESIZE);
+	MPASS(*ndesc == 1);
+	mk_write_l2e(sc, e, 1, 0, dst);
+
+	return (e);
+}
+
+/*
  * Allocate an L2T entry for use by a switching rule.  Such need to be
  * explicitly freed and while busy they are not on any hash chain, so normal
  * address resolution updates do not see them.
  */
 struct l2t_entry *
-t4_l2t_alloc_switching(struct l2t_data *d)
+t4_l2t_alloc_switching(struct adapter *sc, uint16_t vlan, uint8_t port,
+    uint8_t *eth_addr)
 {
+	struct l2t_data *d = sc->l2t;
 	struct l2t_entry *e;
-
-	rw_wlock(&d->lock);
-	e = t4_alloc_l2e(d);
-	if (e) {
-		mtx_lock(&e->lock);          /* avoid race with t4_l2t_free */
-		e->state = L2T_STATE_SWITCHING;
-		atomic_store_rel_int(&e->refcnt, 1);
-		mtx_unlock(&e->lock);
-	}
-	rw_wunlock(&d->lock);
-	return e;
-}
-
-/*
- * Sets/updates the contents of a switching L2T entry that has been allocated
- * with an earlier call to @t4_l2t_alloc_switching.
- */
-int
-t4_l2t_set_switching(struct adapter *sc, struct l2t_entry *e, uint16_t vlan,
-    uint8_t port, uint8_t *eth_addr)
-{
 	int rc;
 
-	e->vlan = vlan;
-	e->lport = port;
-	e->wrq = &sc->sge.mgmtq;
-	e->iqid = sc->sge.fwq.abs_id;
-	memcpy(e->dmac, eth_addr, ETHER_ADDR_LEN);
-	mtx_lock(&e->lock);
-	rc = t4_write_l2e(e, 0);
-	mtx_unlock(&e->lock);
-	return (rc);
+	rw_wlock(&d->lock);
+	e = find_or_alloc_l2e(d, vlan, port, eth_addr);
+	if (e) {
+		if (atomic_load_acq_int(&e->refcnt) == 0) {
+			mtx_lock(&e->lock);    /* avoid race with t4_l2t_free */
+			e->wrq = &sc->sge.ctrlq[0];
+			e->iqid = sc->sge.fwq.abs_id;
+			e->state = L2T_STATE_SWITCHING;
+			e->vlan = vlan;
+			e->lport = port;
+			memcpy(e->dmac, eth_addr, ETHER_ADDR_LEN);
+			atomic_store_rel_int(&e->refcnt, 1);
+			atomic_subtract_int(&d->nfree, 1);
+			rc = t4_write_l2e(e, 0);
+			mtx_unlock(&e->lock);
+			if (rc != 0)
+				e = NULL;
+		} else {
+			MPASS(e->vlan == vlan);
+			MPASS(e->lport == port);
+			atomic_add_int(&e->refcnt, 1);
+		}
+	}
+	rw_wunlock(&d->lock);
+	return (e);
 }
 
 int
@@ -257,7 +385,6 @@ do_l2t_write_rpl(struct sge_iq *iq, const struct rss_header *rss,
 	return (0);
 }
 
-#ifdef SBUF_DRAIN
 static inline unsigned int
 vlan_prio(const struct l2t_entry *e)
 {
@@ -273,6 +400,7 @@ l2e_state(const struct l2t_entry *e)
 	case L2T_STATE_SYNC_WRITE: return 'W';
 	case L2T_STATE_RESOLVING: return STAILQ_EMPTY(&e->wr_list) ? 'R' : 'A';
 	case L2T_STATE_SWITCHING: return 'X';
+	case L2T_STATE_TLS: return 'T';
 	default: return 'U';
 	}
 }
@@ -309,7 +437,7 @@ sysctl_l2t(SYSCTL_HANDLER_ARGS)
 			    "Ethernet address  VLAN/P LP State Users Port");
 			header = 1;
 		}
-		if (e->state == L2T_STATE_SWITCHING)
+		if (e->state >= L2T_STATE_SWITCHING)
 			ip[0] = 0;
 		else {
 			inet_ntop(e->ipv6 ? AF_INET6 : AF_INET, &e->addr[0],
@@ -335,4 +463,3 @@ skip:
 
 	return (rc);
 }
-#endif

@@ -27,7 +27,6 @@
  * $FreeBSD$
  */
 
-#include <sys/linker_set.h>
 #include <sys/queue.h>
 
 #define	FOLLOWFORKS		0x00000001
@@ -59,13 +58,9 @@ struct extra_syscall {
 struct procabi {
 	const char *type;
 	enum sysdecode_abi abi;
-	int (*fetch_args)(struct trussinfo *, u_int);
-	int (*fetch_retval)(struct trussinfo *, long *, int *);
 	STAILQ_HEAD(, extra_syscall) extra_syscalls;
 	struct syscall *syscalls[SYSCALL_NORMAL_COUNT];
 };
-
-#define	PROCABI(abi)	DATA_SET(procabi, abi)
 
 /*
  * This is confusingly named.  It holds per-thread state about the
@@ -119,23 +114,3 @@ struct trussinfo
 
 	LIST_HEAD(, procinfo) proclist;
 };
-
-#define	timespecsubt(tvp, uvp, vvp)					\
-	do {								\
-		(vvp)->tv_sec = (tvp)->tv_sec - (uvp)->tv_sec;		\
-		(vvp)->tv_nsec = (tvp)->tv_nsec - (uvp)->tv_nsec;	\
-		if ((vvp)->tv_nsec < 0) {				\
-			(vvp)->tv_sec--;				\
-			(vvp)->tv_nsec += 1000000000;			\
-		}							\
-	} while (0)
-
-#define	timespecadd(tvp, uvp, vvp)					\
-	do {								\
-		(vvp)->tv_sec = (tvp)->tv_sec + (uvp)->tv_sec;		\
-		(vvp)->tv_nsec = (tvp)->tv_nsec + (uvp)->tv_nsec;	\
-		if ((vvp)->tv_nsec > 1000000000) {				\
-			(vvp)->tv_sec++;				\
-			(vvp)->tv_nsec -= 1000000000;			\
-		}							\
-	} while (0)

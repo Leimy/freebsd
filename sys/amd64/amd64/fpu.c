@@ -38,6 +38,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/domainset.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
@@ -61,6 +62,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/specialreg.h>
 #include <machine/segments.h>
 #include <machine/ucontext.h>
+#include <x86/ifunc.h>
 
 /*
  * Floating point support.
@@ -99,6 +101,17 @@ xsave(char *addr, uint64_t mask)
 	    "memory");
 }
 
+static __inline void
+xsaveopt(char *addr, uint64_t mask)
+{
+	uint32_t low, hi;
+
+	low = mask;
+	hi = mask >> 32;
+	__asm __volatile("xsaveopt %0" : "=m" (*addr) : "a" (low), "d" (hi) :
+	    "memory");
+}
+
 #else	/* !(__GNUCLIKE_ASM && !lint) */
 
 void	fldcw(u_short cw);
@@ -112,6 +125,7 @@ void	ldmxcsr(u_int csr);
 void	stmxcsr(u_int *csr);
 void	xrstor(char *addr, uint64_t mask);
 void	xsave(char *addr, uint64_t mask);
+void	xsaveopt(char *addr, uint64_t mask);
 
 #endif	/* __GNUCLIKE_ASM && !lint */
 
@@ -146,29 +160,73 @@ uint64_t xsave_mask;		/* the same */
 static	uma_zone_t fpu_save_area_zone;
 static	struct savefpu *fpu_initialstate;
 
-struct xsave_area_elm_descr {
+static struct xsave_area_elm_descr {
 	u_int	offset;
 	u_int	size;
 } *xsave_area_desc;
 
-void
-fpusave(void *addr)
+static void
+fpusave_xsaveopt(void *addr)
 {
 
-	if (use_xsave)
-		xsave((char *)addr, xsave_mask);
-	else
-		fxsave((char *)addr);
+	xsaveopt((char *)addr, xsave_mask);
 }
 
-void
-fpurestore(void *addr)
+static void
+fpusave_xsave(void *addr)
+{
+
+	xsave((char *)addr, xsave_mask);
+}
+
+static void
+fpurestore_xrstor(void *addr)
+{
+
+	xrstor((char *)addr, xsave_mask);
+}
+
+static void
+fpusave_fxsave(void *addr)
+{
+
+	fxsave((char *)addr);
+}
+
+static void
+fpurestore_fxrstor(void *addr)
+{
+
+	fxrstor((char *)addr);
+}
+
+static void
+init_xsave(void)
 {
 
 	if (use_xsave)
-		xrstor((char *)addr, xsave_mask);
-	else
-		fxrstor((char *)addr);
+		return;
+	if ((cpu_feature2 & CPUID2_XSAVE) == 0)
+		return;
+	use_xsave = 1;
+	TUNABLE_INT_FETCH("hw.use_xsave", &use_xsave);
+}
+
+DEFINE_IFUNC(, void, fpusave, (void *))
+{
+
+	init_xsave();
+	if (use_xsave)
+		return ((cpu_stdext_feature & CPUID_EXTSTATE_XSAVEOPT) != 0 ?
+		    fpusave_xsaveopt : fpusave_xsave);
+	return (fpusave_fxsave);
+}
+
+DEFINE_IFUNC(, void, fpurestore, (void *))
+{
+
+	init_xsave();
+	return (use_xsave ? fpurestore_xrstor : fpurestore_fxrstor);
 }
 
 void
@@ -205,14 +263,10 @@ fpuinit_bsp1(void)
 {
 	u_int cp[4];
 	uint64_t xsave_mask_user;
+	bool old_wp;
 
-	if ((cpu_feature2 & CPUID2_XSAVE) != 0) {
-		use_xsave = 1;
-		TUNABLE_INT_FETCH("hw.use_xsave", &use_xsave);
-	}
 	if (!use_xsave)
 		return;
-
 	cpuid_count(0xd, 0x0, cp);
 	xsave_mask = XFEATURE_ENABLED_X87 | XFEATURE_ENABLED_SSE;
 	if ((cp[0] & xsave_mask) != xsave_mask)
@@ -233,8 +287,14 @@ fpuinit_bsp1(void)
 		 * Patch the XSAVE instruction in the cpu_switch code
 		 * to XSAVEOPT.  We assume that XSAVE encoding used
 		 * REX byte, and set the bit 4 of the r/m byte.
+		 *
+		 * It seems that some BIOSes give control to the OS
+		 * with CR0.WP already set, making the kernel text
+		 * read-only before cpu_startup().
 		 */
+		old_wp = disable_wp();
 		ctx_switch_xsave[3] |= 0x10;
+		restore_wp(old_wp);
 	}
 }
 
@@ -305,15 +365,25 @@ fpuinit(void)
 static void
 fpuinitstate(void *arg __unused)
 {
+	uint64_t *xstate_bv;
 	register_t saveintr;
 	int cp[4], i, max_ext_n;
 
-	fpu_initialstate = malloc(cpu_max_ext_state_size, M_DEVBUF,
-	    M_WAITOK | M_ZERO);
+	/* Do potentially blocking operations before disabling interrupts. */
+	fpu_save_area_zone = uma_zcreate("FPU_save_area",
+	    cpu_max_ext_state_size, NULL, NULL, NULL, NULL,
+	    XSAVE_AREA_ALIGN - 1, 0);
+	fpu_initialstate = uma_zalloc(fpu_save_area_zone, M_WAITOK | M_ZERO);
+	if (use_xsave) {
+		max_ext_n = flsl(xsave_mask);
+		xsave_area_desc = malloc(max_ext_n * sizeof(struct
+		    xsave_area_elm_descr), M_DEVBUF, M_WAITOK | M_ZERO);
+	}
+
 	saveintr = intr_disable();
 	stop_emulating();
 
-	fpusave(fpu_initialstate);
+	fpusave_fxsave(fpu_initialstate);
 	if (fpu_initialstate->sv_env.en_mxcsr_mask)
 		cpu_mxcsr_mask = fpu_initialstate->sv_env.en_mxcsr_mask;
 	else
@@ -335,9 +405,10 @@ fpuinitstate(void *arg __unused)
 	 * Save Area.
 	 */
 	if (use_xsave) {
-		max_ext_n = flsl(xsave_mask);
-		xsave_area_desc = malloc(max_ext_n * sizeof(struct
-		    xsave_area_elm_descr), M_DEVBUF, M_WAITOK | M_ZERO);
+		xstate_bv = (uint64_t *)((char *)(fpu_initialstate + 1) +
+		    offsetof(struct xstate_hdr, xstate_bv));
+		*xstate_bv = XFEATURE_ENABLED_X87 | XFEATURE_ENABLED_SSE;
+
 		/* x87 state */
 		xsave_area_desc[0].offset = 0;
 		xsave_area_desc[0].size = 160;
@@ -352,14 +423,11 @@ fpuinitstate(void *arg __unused)
 		}
 	}
 
-	fpu_save_area_zone = uma_zcreate("FPU_save_area",
-	    cpu_max_ext_state_size, NULL, NULL, NULL, NULL,
-	    XSAVE_AREA_ALIGN - 1, 0);
-
 	start_emulating();
 	intr_restore(saveintr);
 }
-SYSINIT(fpuinitstate, SI_SUB_DRIVERS, SI_ORDER_ANY, fpuinitstate, NULL);
+/* EFIRT needs this to be initialized before we can enter our EFI environment */
+SYSINIT(fpuinitstate, SI_SUB_DRIVERS, SI_ORDER_FIRST, fpuinitstate, NULL);
 
 /*
  * Free coprocessor (if we have it).
@@ -613,6 +681,45 @@ fputrap_sse(void)
 	return (fpetable[(mxcsr & (~mxcsr >> 7)) & 0x3f]);
 }
 
+static void
+restore_fpu_curthread(struct thread *td)
+{
+	struct pcb *pcb;
+
+	/*
+	 * Record new context early in case frstor causes a trap.
+	 */
+	PCPU_SET(fpcurthread, td);
+
+	stop_emulating();
+	fpu_clean_state();
+	pcb = td->td_pcb;
+
+	if ((pcb->pcb_flags & PCB_FPUINITDONE) == 0) {
+		/*
+		 * This is the first time this thread has used the FPU or
+		 * the PCB doesn't contain a clean FPU state.  Explicitly
+		 * load an initial state.
+		 *
+		 * We prefer to restore the state from the actual save
+		 * area in PCB instead of directly loading from
+		 * fpu_initialstate, to ignite the XSAVEOPT
+		 * tracking engine.
+		 */
+		bcopy(fpu_initialstate, pcb->pcb_save,
+		    cpu_max_ext_state_size);
+		fpurestore(pcb->pcb_save);
+		if (pcb->pcb_initial_fpucw != __INITIAL_FPUCW__)
+			fldcw(pcb->pcb_initial_fpucw);
+		if (PCB_USER_FPU(pcb))
+			set_pcb_flags(pcb, PCB_FPUINITDONE |
+			    PCB_USERFPUINITDONE);
+		else
+			set_pcb_flags(pcb, PCB_FPUINITDONE);
+	} else
+		fpurestore(pcb->pcb_save);
+}
+
 /*
  * Device Not Available (DNA, #NM) exception handler.
  *
@@ -623,7 +730,9 @@ fputrap_sse(void)
 void
 fpudna(void)
 {
+	struct thread *td;
 
+	td = curthread;
 	/*
 	 * This handler is entered with interrupts enabled, so context
 	 * switches may occur before critical_enter() is executed.  If
@@ -637,49 +746,37 @@ fpudna(void)
 
 	KASSERT((curpcb->pcb_flags & PCB_FPUNOSAVE) == 0,
 	    ("fpudna while in fpu_kern_enter(FPU_KERN_NOCTX)"));
-	if (PCPU_GET(fpcurthread) == curthread) {
-		printf("fpudna: fpcurthread == curthread\n");
-		stop_emulating();
-		critical_exit();
-		return;
-	}
-	if (PCPU_GET(fpcurthread) != NULL) {
-		panic("fpudna: fpcurthread = %p (%d), curthread = %p (%d)\n",
-		    PCPU_GET(fpcurthread), PCPU_GET(fpcurthread)->td_tid,
-		    curthread, curthread->td_tid);
-	}
-	stop_emulating();
-	/*
-	 * Record new context early in case frstor causes a trap.
-	 */
-	PCPU_SET(fpcurthread, curthread);
-
-	fpu_clean_state();
-
-	if ((curpcb->pcb_flags & PCB_FPUINITDONE) == 0) {
+	if (__predict_false(PCPU_GET(fpcurthread) == td)) {
 		/*
-		 * This is the first time this thread has used the FPU or
-		 * the PCB doesn't contain a clean FPU state.  Explicitly
-		 * load an initial state.
-		 *
-		 * We prefer to restore the state from the actual save
-		 * area in PCB instead of directly loading from
-		 * fpu_initialstate, to ignite the XSAVEOPT
-		 * tracking engine.
+		 * Some virtual machines seems to set %cr0.TS at
+		 * arbitrary moments.  Silently clear the TS bit
+		 * regardless of the eager/lazy FPU context switch
+		 * mode.
 		 */
-		bcopy(fpu_initialstate, curpcb->pcb_save,
-		    cpu_max_ext_state_size);
-		fpurestore(curpcb->pcb_save);
-		if (curpcb->pcb_initial_fpucw != __INITIAL_FPUCW__)
-			fldcw(curpcb->pcb_initial_fpucw);
-		if (PCB_USER_FPU(curpcb))
-			set_pcb_flags(curpcb,
-			    PCB_FPUINITDONE | PCB_USERFPUINITDONE);
-		else
-			set_pcb_flags(curpcb, PCB_FPUINITDONE);
-	} else
-		fpurestore(curpcb->pcb_save);
+		stop_emulating();
+	} else {
+		if (__predict_false(PCPU_GET(fpcurthread) != NULL)) {
+			panic(
+		    "fpudna: fpcurthread = %p (%d), curthread = %p (%d)\n",
+			    PCPU_GET(fpcurthread),
+			    PCPU_GET(fpcurthread)->td_tid, td, td->td_tid);
+		}
+		restore_fpu_curthread(td);
+	}
 	critical_exit();
+}
+
+void fpu_activate_sw(struct thread *td); /* Called from the context switch */
+void
+fpu_activate_sw(struct thread *td)
+{
+
+	if ((td->td_pflags & TDP_KTHREAD) != 0 || !PCB_USER_FPU(td->td_pcb)) {
+		PCPU_SET(fpcurthread, NULL);
+		start_emulating();
+	} else if (PCPU_GET(fpcurthread) != td) {
+		restore_fpu_curthread(td);
+	}
 }
 
 void
@@ -709,22 +806,22 @@ fpugetregs(struct thread *td)
 	int max_ext_n, i, owned;
 
 	pcb = td->td_pcb;
+	critical_enter();
 	if ((pcb->pcb_flags & PCB_USERFPUINITDONE) == 0) {
 		bcopy(fpu_initialstate, get_pcb_user_save_pcb(pcb),
 		    cpu_max_ext_state_size);
 		get_pcb_user_save_pcb(pcb)->sv_env.en_cw =
 		    pcb->pcb_initial_fpucw;
 		fpuuserinited(td);
+		critical_exit();
 		return (_MC_FPOWNED_PCB);
 	}
-	critical_enter();
 	if (td == PCPU_GET(fpcurthread) && PCB_USER_FPU(pcb)) {
 		fpusave(get_pcb_user_save_pcb(pcb));
 		owned = _MC_FPOWNED_FPU;
 	} else {
 		owned = _MC_FPOWNED_PCB;
 	}
-	critical_exit();
 	if (use_xsave) {
 		/*
 		 * Handle partially saved state.
@@ -744,6 +841,7 @@ fpugetregs(struct thread *td)
 			*xstate_bv |= bit;
 		}
 	}
+	critical_exit();
 	return (owned);
 }
 
@@ -752,6 +850,7 @@ fpuuserinited(struct thread *td)
 {
 	struct pcb *pcb;
 
+	CRITICAL_ASSERT(td);
 	pcb = td->td_pcb;
 	if (PCB_USER_FPU(pcb))
 		set_pcb_flags(pcb,
@@ -810,26 +909,25 @@ fpusetregs(struct thread *td, struct savefpu *addr, char *xfpustate,
 
 	addr->sv_env.en_mxcsr &= cpu_mxcsr_mask;
 	pcb = td->td_pcb;
+	error = 0;
 	critical_enter();
 	if (td == PCPU_GET(fpcurthread) && PCB_USER_FPU(pcb)) {
 		error = fpusetxstate(td, xfpustate, xfpustate_size);
-		if (error != 0) {
-			critical_exit();
-			return (error);
+		if (error == 0) {
+			bcopy(addr, get_pcb_user_save_td(td), sizeof(*addr));
+			fpurestore(get_pcb_user_save_td(td));
+			set_pcb_flags(pcb, PCB_FPUINITDONE |
+			    PCB_USERFPUINITDONE);
 		}
-		bcopy(addr, get_pcb_user_save_td(td), sizeof(*addr));
-		fpurestore(get_pcb_user_save_td(td));
-		critical_exit();
-		set_pcb_flags(pcb, PCB_FPUINITDONE | PCB_USERFPUINITDONE);
 	} else {
-		critical_exit();
 		error = fpusetxstate(td, xfpustate, xfpustate_size);
-		if (error != 0)
-			return (error);
-		bcopy(addr, get_pcb_user_save_td(td), sizeof(*addr));
-		fpuuserinited(td);
+		if (error == 0) {
+			bcopy(addr, get_pcb_user_save_td(td), sizeof(*addr));
+			fpuuserinited(td);
+		}
 	}
-	return (0);
+	critical_exit();
+	return (error);
 }
 
 /*
@@ -933,17 +1031,31 @@ struct fpu_kern_ctx {
 	char hwstate1[];
 };
 
+static inline size_t __pure2
+fpu_kern_alloc_sz(u_int max_est)
+{
+	return (sizeof(struct fpu_kern_ctx) + XSAVE_AREA_ALIGN + max_est);
+}
+
+static inline int __pure2
+fpu_kern_malloc_flags(u_int fpflags)
+{
+	return (((fpflags & FPU_KERN_NOWAIT) ? M_NOWAIT : M_WAITOK) | M_ZERO);
+}
+
+struct fpu_kern_ctx *
+fpu_kern_alloc_ctx_domain(int domain, u_int flags)
+{
+	return (malloc_domainset(fpu_kern_alloc_sz(cpu_max_ext_state_size),
+	    M_FPUKERN_CTX, DOMAINSET_PREF(domain),
+	    fpu_kern_malloc_flags(flags)));
+}
+
 struct fpu_kern_ctx *
 fpu_kern_alloc_ctx(u_int flags)
 {
-	struct fpu_kern_ctx *res;
-	size_t sz;
-
-	sz = sizeof(struct fpu_kern_ctx) + XSAVE_AREA_ALIGN +
-	    cpu_max_ext_state_size;
-	res = malloc(sz, M_FPUKERN_CTX, ((flags & FPU_KERN_NOWAIT) ?
-	    M_NOWAIT : M_WAITOK) | M_ZERO);
-	return (res);
+	return (malloc(fpu_kern_alloc_sz(cpu_max_ext_state_size),
+	    M_FPUKERN_CTX, fpu_kern_malloc_flags(flags)));
 }
 
 void
@@ -1003,6 +1115,7 @@ fpu_kern_enter(struct thread *td, struct fpu_kern_ctx *ctx, u_int flags)
 		ctx->flags = FPU_KERN_CTX_DUMMY | FPU_KERN_CTX_INUSE;
 		return;
 	}
+	critical_enter();
 	KASSERT(!PCB_USER_FPU(pcb) || pcb->pcb_save ==
 	    get_pcb_user_save_pcb(pcb), ("mangled pcb_save"));
 	ctx->flags = FPU_KERN_CTX_INUSE;
@@ -1013,7 +1126,7 @@ fpu_kern_enter(struct thread *td, struct fpu_kern_ctx *ctx, u_int flags)
 	pcb->pcb_save = fpu_kern_ctx_savefpu(ctx);
 	set_pcb_flags(pcb, PCB_KERNFPU);
 	clear_pcb_flags(pcb, PCB_FPUINITDONE);
-	return;
+	critical_exit();
 }
 
 int
@@ -1031,7 +1144,6 @@ fpu_kern_leave(struct thread *td, struct fpu_kern_ctx *ctx)
 
 		clear_pcb_flags(pcb,  PCB_FPUNOSAVE | PCB_FPUINITDONE);
 		start_emulating();
-		critical_exit();
 	} else {
 		KASSERT((ctx->flags & FPU_KERN_CTX_INUSE) != 0,
 		    ("leaving not inuse ctx"));
@@ -1045,7 +1157,6 @@ fpu_kern_leave(struct thread *td, struct fpu_kern_ctx *ctx)
 		critical_enter();
 		if (curthread == PCPU_GET(fpcurthread))
 			fpudrop();
-		critical_exit();
 		pcb->pcb_save = ctx->prev;
 	}
 
@@ -1062,6 +1173,7 @@ fpu_kern_leave(struct thread *td, struct fpu_kern_ctx *ctx)
 			clear_pcb_flags(pcb, PCB_FPUINITDONE);
 		KASSERT(!PCB_USER_FPU(pcb), ("unpaired fpu_kern_leave"));
 	}
+	critical_exit();
 	return (0);
 }
 
@@ -1095,7 +1207,7 @@ struct savefpu *
 fpu_save_area_alloc(void)
 {
 
-	return (uma_zalloc(fpu_save_area_zone, 0));
+	return (uma_zalloc(fpu_save_area_zone, M_WAITOK));
 }
 
 void

@@ -1,4 +1,4 @@
-/*	$OpenBSD: diff.c,v 1.65 2015/12/29 19:04:46 gsoares Exp $	*/
+/*	$OpenBSD: diff.c,v 1.67 2019/06/28 13:35:00 deraadt Exp $	*/
 
 /*
  * Copyright (c) 2003 Todd C. Miller <Todd.Miller@courtesan.com>
@@ -27,6 +27,7 @@ __FBSDID("$FreeBSD$");
 
 #include <ctype.h>
 #include <err.h>
+#include <errno.h>
 #include <getopt.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -37,16 +38,16 @@ __FBSDID("$FreeBSD$");
 #include "diff.h"
 #include "xmalloc.h"
 
-int	 lflag, Nflag, Pflag, rflag, sflag, Tflag, cflag;
-int	 diff_format, diff_context, status, ignore_file_case;
-int	 tabsize = 8;
+int	 lflag, Nflag, Pflag, rflag, sflag, Tflag, cflag, Wflag;
+int	 diff_format, diff_context, status, ignore_file_case, suppress_common;
+int	 tabsize = 8, width = 130;
 char	*start, *ifdefname, *diffargs, *label[2], *ignore_pats;
 char	*group_format = NULL;
 struct stat stb1, stb2;
 struct excludes *excludes_list;
 regex_t	 ignore_re;
 
-#define	OPTIONS	"0123456789aBbC:cdD:efHhI:iL:lnNPpqrS:sTtU:uwX:x:"
+#define	OPTIONS	"0123456789aBbC:cdD:efHhI:iL:lnNPpqrS:sTtU:uwW:X:x:y"
 enum {
 	OPT_TSIZE = CHAR_MAX + 1,
 	OPT_STRIPCR,
@@ -55,6 +56,7 @@ enum {
 	OPT_NORMAL,
 	OPT_HORIZON_LINES,
 	OPT_CHANGED_GROUP_FORMAT,
+	OPT_SUPPRESS_COMMON,
 };
 
 static struct option longopts[] = {
@@ -66,6 +68,7 @@ static struct option longopts[] = {
 	{ "ed",				no_argument,		0,	'e' },
 	{ "forward-ed",			no_argument,		0,	'f' },
 	{ "speed-large-files",		no_argument,		NULL,	'H' },
+	{ "ignore-blank-lines",		no_argument,		0,	'B' },
 	{ "ignore-matching-lines",	required_argument,	0,	'I' },
 	{ "ignore-case",		no_argument,		0,	'i' },
 	{ "paginate",			no_argument,		NULL,	'l' },
@@ -82,19 +85,23 @@ static struct option longopts[] = {
 	{ "initial-tab",		no_argument,		0,	'T' },
 	{ "unified",			optional_argument,	0,	'U' },
 	{ "ignore-all-space",		no_argument,		0,	'w' },
+	{ "width",			required_argument,	0,	'W' },
 	{ "exclude",			required_argument,	0,	'x' },
 	{ "exclude-from",		required_argument,	0,	'X' },
+	{ "side-by-side",		no_argument,		NULL,	'y' },
 	{ "ignore-file-name-case",	no_argument,		NULL,	OPT_IGN_FN_CASE },
 	{ "horizon-lines",		required_argument,	NULL,	OPT_HORIZON_LINES },
 	{ "no-ignore-file-name-case",	no_argument,		NULL,	OPT_NO_IGN_FN_CASE },
 	{ "normal",			no_argument,		NULL,	OPT_NORMAL },
 	{ "strip-trailing-cr",		no_argument,		NULL,	OPT_STRIPCR },
-	{ "tabsize",			optional_argument,	NULL,	OPT_TSIZE },
+	{ "tabsize",			required_argument,	NULL,	OPT_TSIZE },
 	{ "changed-group-format",	required_argument,	NULL,	OPT_CHANGED_GROUP_FORMAT},
+	{ "suppress-common-lines",	no_argument,		NULL,	OPT_SUPPRESS_COMMON },
 	{ NULL,				0,			0,	'\0'}
 };
 
 void usage(void) __dead2;
+void conflicting_format(void) __dead2;
 void push_excludes(char *);
 void push_ignore_pats(char *);
 void read_excludes_file(char *file);
@@ -115,7 +122,9 @@ main(int argc, char **argv)
 	prevoptind = 1;
 	newarg = 1;
 	diff_context = 3;
-	diff_format = 0;
+	diff_format = D_UNSET;
+#define	FORMAT_MISMATCHED(type)	\
+	(diff_format != D_UNSET && diff_format != (type))
 	while ((ch = getopt_long(argc, argv, OPTIONS, longopts, NULL)) != -1) {
 		switch (ch) {
 		case '0': case '1': case '2': case '3': case '4':
@@ -136,6 +145,8 @@ main(int argc, char **argv)
 			break;
 		case 'C':
 		case 'c':
+			if (FORMAT_MISMATCHED(D_CONTEXT))
+				conflicting_format();
 			cflag = 1;
 			diff_format = D_CONTEXT;
 			if (optarg != NULL) {
@@ -149,13 +160,19 @@ main(int argc, char **argv)
 			dflags |= D_MINIMAL;
 			break;
 		case 'D':
+			if (FORMAT_MISMATCHED(D_IFDEF))
+				conflicting_format();
 			diff_format = D_IFDEF;
 			ifdefname = optarg;
 			break;
 		case 'e':
+			if (FORMAT_MISMATCHED(D_EDIT))
+				conflicting_format();
 			diff_format = D_EDIT;
 			break;
 		case 'f':
+			if (FORMAT_MISMATCHED(D_REVERSE))
+				conflicting_format();
 			diff_format = D_REVERSE;
 			break;
 		case 'H':
@@ -163,6 +180,9 @@ main(int argc, char **argv)
 			break;
 		case 'h':
 			/* silently ignore for backwards compatibility */
+			break;
+		case 'B':
+			dflags |= D_SKIPBLANKLINES;
 			break;
 		case 'I':
 			push_ignore_pats(optarg);
@@ -185,10 +205,21 @@ main(int argc, char **argv)
 			Nflag = 1;
 			break;
 		case 'n':
+			if (FORMAT_MISMATCHED(D_NREVERSE))
+				conflicting_format();
 			diff_format = D_NREVERSE;
 			break;
 		case 'p':
-			if (diff_format == 0)
+			/*
+			 * If it's not unset and it's not set to context or
+			 * unified, we'll error out here as a conflicting
+			 * format.  If it's unset, we'll go ahead and set it to
+			 * context.
+			 */
+			if (FORMAT_MISMATCHED(D_CONTEXT) &&
+			    FORMAT_MISMATCHED(D_UNIFIED))
+				conflicting_format();
+			if (diff_format == D_UNSET)
 				diff_format = D_CONTEXT;
 			dflags |= D_PROTOTYPE;
 			break;
@@ -199,6 +230,8 @@ main(int argc, char **argv)
 			rflag = 1;
 			break;
 		case 'q':
+			if (FORMAT_MISMATCHED(D_BRIEF))
+				conflicting_format();
 			diff_format = D_BRIEF;
 			break;
 		case 'S':
@@ -215,6 +248,8 @@ main(int argc, char **argv)
 			break;
 		case 'U':
 		case 'u':
+			if (FORMAT_MISMATCHED(D_UNIFIED))
+				conflicting_format();
 			diff_format = D_UNIFIED;
 			if (optarg != NULL) {
 				l = strtol(optarg, &ep, 10);
@@ -226,13 +261,28 @@ main(int argc, char **argv)
 		case 'w':
 			dflags |= D_IGNOREBLANKS;
 			break;
+		case 'W':
+			Wflag = 1;
+			width = (int) strtonum(optarg, 1, INT_MAX, &errstr);
+			if (errstr) {
+				warnx("Invalid argument for width");
+				usage();
+			}
+			break;
 		case 'X':
 			read_excludes_file(optarg);
 			break;
 		case 'x':
 			push_excludes(optarg);
 			break;
+		case 'y':
+			if (FORMAT_MISMATCHED(D_SIDEBYSIDE))
+				conflicting_format();
+			diff_format = D_SIDEBYSIDE;
+			break;
 		case OPT_CHANGED_GROUP_FORMAT:
+			if (FORMAT_MISMATCHED(D_GFORMAT))
+				conflicting_format();
 			diff_format = D_GFORMAT;
 			group_format = optarg;
 			break;
@@ -245,6 +295,8 @@ main(int argc, char **argv)
 			ignore_file_case = 0;
 			break;
 		case OPT_NORMAL:
+			if (FORMAT_MISMATCHED(D_NORMAL))
+				conflicting_format();
 			diff_format = D_NORMAL;
 			break;
 		case OPT_TSIZE:
@@ -257,6 +309,9 @@ main(int argc, char **argv)
 		case OPT_STRIPCR:
 			dflags |= D_STRIPCR;
 			break;
+		case OPT_SUPPRESS_COMMON:
+			suppress_common = 1;
+			break;
 		default:
 			usage();
 			break;
@@ -265,6 +320,8 @@ main(int argc, char **argv)
 		newarg = optind != prevoptind;
 		prevoptind = optind;
 	}
+	if (diff_format == D_UNSET)
+		diff_format = D_NORMAL;
 	argc -= optind;
 	argv += optind;
 
@@ -295,13 +352,33 @@ main(int argc, char **argv)
 	if (strcmp(argv[0], "-") == 0) {
 		fstat(STDIN_FILENO, &stb1);
 		gotstdin = 1;
-	} else if (stat(argv[0], &stb1) != 0)
-		err(2, "%s", argv[0]);
+	} else if (stat(argv[0], &stb1) != 0) {
+		if (!Nflag || errno != ENOENT)
+			err(2, "%s", argv[0]);
+		dflags |= D_EMPTY1;
+		memset(&stb1, 0, sizeof(struct stat));
+	}
+
 	if (strcmp(argv[1], "-") == 0) {
 		fstat(STDIN_FILENO, &stb2);
 		gotstdin = 1;
-	} else if (stat(argv[1], &stb2) != 0)
-		err(2, "%s", argv[1]);
+	} else if (stat(argv[1], &stb2) != 0) {
+		if (!Nflag || errno != ENOENT)
+			err(2, "%s", argv[1]);
+		dflags |= D_EMPTY2;
+		memset(&stb2, 0, sizeof(stb2));
+		stb2.st_mode = stb1.st_mode;
+	}
+
+	if (dflags & D_EMPTY1 && dflags & D_EMPTY2){
+		warn("%s", argv[0]);	
+		warn("%s", argv[1]);
+		exit(2);	
+	}
+
+	if (stb1.st_mode == 0)
+		stb1.st_mode = stb2.st_mode;
+
 	if (gotstdin && (S_ISDIR(stb1.st_mode) || S_ISDIR(stb2.st_mode)))
 		errx(2, "can't compare - to a directory");
 	set_argstr(oargv, argv);
@@ -312,12 +389,12 @@ main(int argc, char **argv)
 	} else {
 		if (S_ISDIR(stb1.st_mode)) {
 			argv[0] = splice(argv[0], argv[1]);
-			if (stat(argv[0], &stb1) < 0)
+			if (stat(argv[0], &stb1) == -1)
 				err(2, "%s", argv[0]);
 		}
 		if (S_ISDIR(stb2.st_mode)) {
 			argv[1] = splice(argv[1], argv[0]);
-			if (stat(argv[1], &stb2) < 0)
+			if (stat(argv[1], &stb2) == -1)
 				err(2, "%s", argv[1]);
 		}
 		print_status(diffreg(argv[0], argv[1], dflags, 1), argv[0],
@@ -409,6 +486,9 @@ print_only(const char *path, size_t dirlen, const char *entry)
 void
 print_status(int val, char *path1, char *path2, const char *entry)
 {
+	if (label[0] != NULL) path1 = label[0];
+	if (label[1] != NULL) path2 = label[1];
+
 	switch (val) {
 	case D_BINARY:
 		printf("Binary files %s%s and %s%s differ\n",
@@ -447,20 +527,33 @@ void
 usage(void)
 {
 	(void)fprintf(stderr,
-	    "usage: diff [-abdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n"
+	    "usage: diff [-aBbdilpTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n"
 	    "            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]\n"
 	    "            [-I pattern] [-L label] file1 file2\n"
-	    "       diff [-abdilpTtw] [-I pattern] [-L label] [--ignore-case]\n"
+	    "       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]\n"
 	    "            [--no-ignore-case] [--normal] [--strip-trailing-cr] [--tabsize]\n"
 	    "            -C number file1 file2\n"
-	    "       diff [-abdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]\n"
+	    "       diff [-aBbdiltw] [-I pattern] [--ignore-case] [--no-ignore-case]\n"
 	    "            [--normal] [--strip-trailing-cr] [--tabsize] -D string file1 file2\n"
-	    "       diff [-abdilpTtw] [-I pattern] [-L label] [--ignore-case]\n"
+	    "       diff [-aBbdilpTtw] [-I pattern] [-L label] [--ignore-case]\n"
 	    "            [--no-ignore-case] [--normal] [--tabsize] [--strip-trailing-cr]\n"
 	    "            -U number file1 file2\n"
-	    "       diff [-abdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n"
+	    "       diff [-aBbdilNPprsTtw] [-c | -e | -f | -n | -q | -u] [--ignore-case]\n"
 	    "            [--no-ignore-case] [--normal] [--tabsize] [-I pattern] [-L label]\n"
-	    "            [-S name] [-X file] [-x pattern] dir1 dir2\n");
+	    "            [-S name] [-X file] [-x pattern] dir1 dir2\n"
+	    "       diff [-aBbditwW] [--expand-tabs] [--ignore-all-blanks]\n"
+            "            [--ignore-blank-lines] [--ignore-case] [--minimal]\n"
+            "            [--no-ignore-file-name-case] [--strip-trailing-cr]\n"
+            "            [--suppress-common-lines] [--tabsize] [--text] [--width]\n"
+            "            -y | --side-by-side file1 file2\n");
 
 	exit(2);
+}
+
+void
+conflicting_format(void)
+{
+
+	fprintf(stderr, "error: conflicting output format options.\n");
+	usage();
 }

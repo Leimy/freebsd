@@ -30,6 +30,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/module.h>
 #include <sys/systm.h>
+#include <sys/eventhandler.h>
 #include <sys/consio.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
@@ -43,8 +44,12 @@ __FBSDID("$FreeBSD$");
 #include <sys/cons.h>
 #include <sys/kdb.h>
 #include <sys/proc.h>
+#include <sys/reboot.h>
 
 #include <machine/stdarg.h>
+
+#include <vm/vm.h>
+#include <vm/pmap.h>
 
 #include <xen/xen-os.h>
 #include <xen/hypervisor.h>
@@ -129,12 +134,6 @@ static struct xencons_priv main_cons;
 
 #define XC_POLLTIME 	(hz/10)
 
-/*
- * Virtual address of the shared console page (only for PV guest)
- * TODO: Introduce a function to set it
- */
-char *console_page;
-
 /*----------------------------- Debug function ------------------------------*/
 struct putchar_arg {
 	char	*buf;
@@ -201,7 +200,7 @@ xc_printf(const char *fmt, ...)
 static inline void xencons_lock(struct xencons_priv *cons)
 {
 
-	if (panicstr == NULL)
+	if (!KERNEL_PANICKED())
 		mtx_lock_spin(&cons->mtx);
 
 }
@@ -209,7 +208,7 @@ static inline void xencons_lock(struct xencons_priv *cons)
 static inline void xencons_unlock(struct xencons_priv *cons)
 {
 
-	if (panicstr == NULL)
+	if (!KERNEL_PANICKED())
 		mtx_unlock_spin(&cons->mtx);
 }
 
@@ -273,9 +272,9 @@ static const struct xencons_ops xencons_hypervisor_ops = {
 static void
 xencons_early_init_ring(struct xencons_priv *cons)
 {
-	/* The shared page for PV is already mapped by the boot code */
-	cons->intf = (struct xencons_interface *)console_page;
-	cons->evtchn = HYPERVISOR_start_info->console.domU.evtchn;
+	cons->intf = pmap_mapdev_attr(ptoa(xen_get_console_mfn()), PAGE_SIZE,
+	    PAT_WRITE_BACK);
+	cons->evtchn = xen_get_console_evtchn();
 }
 
 static int
@@ -400,7 +399,7 @@ xencons_early_init(void)
 
 	mtx_init(&main_cons.mtx, "XCONS LOCK", NULL, MTX_SPIN);
 
-	if (xen_initial_domain())
+	if (xen_get_console_evtchn() == 0)
 		main_cons.ops = &xencons_hypervisor_ops;
 	else
 		main_cons.ops = &xencons_ring_ops;
@@ -516,7 +515,7 @@ xencons_tx(struct tty *tp)
 
 	cons = tty_softc(tp);
 
-	tty_lock_assert(tp, MA_OWNED);
+	tty_assert_locked(tp);
 
 	/*
 	 * Don't transmit any character if the buffer is full. Otherwise,
@@ -589,10 +588,10 @@ static void
 xencons_cnprobe(struct consdev *cp)
 {
 
-	if (!xen_pv_domain())
+	if (!xen_domain())
 		return;
 
-	cp->cn_pri = CN_REMOTE;
+	cp->cn_pri = (boothowto & RB_SERIAL) ? CN_REMOTE : CN_NORMAL;
 	sprintf(cp->cn_name, "%s0", driver_name);
 }
 
@@ -704,13 +703,8 @@ xencons_identify(driver_t *driver, device_t parent)
 {
 	device_t child;
 
-#if defined(__arm__) || defined(__aarch64__)
-	if (!xen_domain())
+	if (main_cons.ops == NULL)
 		return;
-#else
-	if (!xen_pv_domain())
-		return;
-#endif
 
 	child = BUS_ADD_CHILD(parent, 0, driver_name, 0);
 }

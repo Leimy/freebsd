@@ -27,19 +27,15 @@
  * $FreeBSD$
  */
 
-/* Note: Must match the 'struct devdesc' in stand.h */
-struct uboot_devdesc {
-	struct devdesc		dd;
-	union {
-		struct {
-			int	slice;
-			int	partition;
-			off_t	offset;
-		} disk;
-	} d_kind;
-};
+#include <disk.h>
+#include <readin.h>
 
-#define d_disk d_kind.disk
+struct uboot_devdesc {
+	union {
+		struct devdesc      dd;
+		struct disk_devdesc d_disk;
+	};
+};
 
 /*
  * Default network packet alignment in memory.  On arm arches packets must be
@@ -67,7 +63,7 @@ extern uintptr_t uboot_heap_end;
 uint64_t uboot_loadaddr(u_int type, void *data, uint64_t addr);
 ssize_t	uboot_copyin(const void *src, vm_offset_t dest, const size_t len);
 ssize_t	uboot_copyout(const vm_offset_t src, void *dest, const size_t len);
-ssize_t	uboot_readin(const int fd, vm_offset_t dest, const size_t len);
+ssize_t	uboot_readin(readin_handle_t fd, vm_offset_t dest, const size_t len);
 extern int uboot_autoload(void);
 
 struct preloaded_file;

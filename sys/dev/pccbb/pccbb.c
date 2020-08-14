@@ -1,9 +1,8 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2002-2004 M. Warner Losh.
- * Copyright (c) 2000-2001 Jonathan Chen.
- * All rights reserved.
+ * Copyright (c) 2000-2001 Jonathan Chen All rights reserved.
+ * Copyright (c) 2002-2004 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -60,9 +59,6 @@
 
 /*
  * Driver for PCI to CardBus Bridge chips
- * and PCI to PCMCIA Bridge chips
- * and ISA to PCMCIA host adapters
- * and C Bus to PCMCIA host adapters
  *
  * References:
  *  TI Datasheets:
@@ -86,7 +82,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/kernel.h>
 #include <sys/module.h>
 #include <sys/kthread.h>
-#include <sys/interrupt.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
@@ -132,7 +127,8 @@ __FBSDID("$FreeBSD$");
 devclass_t cbb_devclass;
 
 /* sysctl vars */
-static SYSCTL_NODE(_hw, OID_AUTO, cbb, CTLFLAG_RD, 0, "CBB parameters");
+static SYSCTL_NODE(_hw, OID_AUTO, cbb, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "CBB parameters");
 
 /* There's no way to say TUNEABLE_LONG to get the right types */
 u_long cbb_start_mem = CBB_START_MEM;
@@ -255,9 +251,9 @@ cbb_disable_func_intr(struct cbb_softc *sc)
 #if 0
 	uint8_t reg;
 
-	reg = (exca_getb(&sc->exca[0], EXCA_INTR) & ~EXCA_INTR_IRQ_MASK) | 
+	reg = (exca_getb(&sc->exca, EXCA_INTR) & ~EXCA_INTR_IRQ_MASK) | 
 	    EXCA_INTR_IRQ_RESERVED1;
-	exca_putb(&sc->exca[0], EXCA_INTR, reg);
+	exca_putb(&sc->exca, EXCA_INTR, reg);
 #endif
 }
 
@@ -273,9 +269,11 @@ cbb_enable_func_intr(struct cbb_softc *sc)
 {
 	uint8_t reg;
 
-	reg = (exca_getb(&sc->exca[0], EXCA_INTR) & ~EXCA_INTR_IRQ_MASK) | 
+	reg = (exca_getb(&sc->exca, EXCA_INTR) & ~EXCA_INTR_IRQ_MASK) | 
 	    EXCA_INTR_IRQ_NONE;
-	exca_putb(&sc->exca[0], EXCA_INTR, reg);
+	PCI_MASK_CONFIG(sc->dev, CBBR_BRIDGECTRL,
+	    & ~CBBM_BRIDGECTRL_INTR_IREQ_ISA_EN, 2);
+	exca_putb(&sc->exca, EXCA_INTR, reg);
 }
 
 int
@@ -322,7 +320,7 @@ cbb_detach(device_t brdev)
 	cbb_set(sc, CBB_SOCKET_MASK, 0);
 
 	/* reset 16-bit pcmcia bus */
-	exca_clrb(&sc->exca[0], EXCA_INTR, EXCA_INTR_RESET);
+	exca_clrb(&sc->exca, EXCA_INTR, EXCA_INTR_RESET);
 
 	/* turn off power */
 	cbb_power(brdev, CARD_OFF);
@@ -442,7 +440,7 @@ cbb_child_detached(device_t brdev, device_t child)
 	struct cbb_softc *sc = device_get_softc(brdev);
 
 	/* I'm not sure we even need this */
-	if (child != sc->cbdev && child != sc->exca[0].pccarddev)
+	if (child != sc->cbdev && child != sc->exca.pccarddev)
 		device_printf(brdev, "Unknown child detached: %s\n",
 		    device_get_nameunit(child));
 }
@@ -470,14 +468,6 @@ cbb_event_thread(void *arg)
 	sc->flags |= CBB_KTHREAD_RUNNING;
 	while ((sc->flags & CBB_KTHREAD_DONE) == 0) {
 		mtx_unlock(&sc->mtx);
-		/*
-		 * We take out Giant here because we need it deep,
-		 * down in the bowels of the vm system for mapping the
-		 * memory we need to read the CIS.  In addition, since
-		 * we are adding/deleting devices from the dev tree,
-		 * and that code isn't MP safe, we have to hold Giant.
-		 */
-		mtx_lock(&Giant);
 		status = cbb_get(sc, CBB_SOCKET_STATE);
 		DPRINTF(("Status is 0x%x\n", status));
 		if (!CBB_CARD_PRESENT(status)) {
@@ -503,7 +493,6 @@ cbb_event_thread(void *arg)
 			not_a_card = 0;		/* We know card type */
 			cbb_insert(sc);
 		}
-		mtx_unlock(&Giant);
 
 		/*
 		 * First time through we need to tell mountroot that we're
@@ -558,9 +547,9 @@ cbb_insert(struct cbb_softc *sc)
 	    sockevent, sockstate));
 
 	if (sockstate & CBB_STATE_R2_CARD) {
-		if (device_is_attached(sc->exca[0].pccarddev)) {
+		if (device_is_attached(sc->exca.pccarddev)) {
 			sc->flags |= CBB_16BIT_CARD;
-			exca_insert(&sc->exca[0]);
+			exca_insert(&sc->exca);
 		} else {
 			device_printf(sc->dev,
 			    "16-bit card inserted, but no pccard bus.\n");
@@ -587,7 +576,7 @@ cbb_removal(struct cbb_softc *sc)
 {
 	sc->cardok = 0;
 	if (sc->flags & CBB_16BIT_CARD) {
-		exca_removal(&sc->exca[0]);
+		exca_removal(&sc->exca);
 	} else {
 		if (device_is_attached(sc->cbdev))
 			CARD_DETACH_CARD(sc->cbdev);
@@ -717,8 +706,8 @@ cbb_o2micro_power_hack(struct cbb_softc *sc)
 	 * keyboard controller's interrupts being suppressed occurred when
 	 * we did this.
 	 */
-	reg = exca_getb(&sc->exca[0], EXCA_INTR);
-	exca_putb(&sc->exca[0], EXCA_INTR, (reg & 0xf0) | 1);
+	reg = exca_getb(&sc->exca, EXCA_INTR);
+	exca_putb(&sc->exca, EXCA_INTR, (reg & 0xf0) | 1);
 	return (reg);
 }
 
@@ -730,7 +719,7 @@ cbb_o2micro_power_hack(struct cbb_softc *sc)
 static void
 cbb_o2micro_power_hack2(struct cbb_softc *sc, uint8_t reg)
 {
-	exca_putb(&sc->exca[0], EXCA_INTR, reg);
+	exca_putb(&sc->exca, EXCA_INTR, reg);
 }
 
 int
@@ -883,8 +872,6 @@ cbb_power(device_t brdev, int volts)
 			reg_ctrl &= ~TOPIC97_REG_CTRL_CLKRUN_ENA;
 		pci_write_config(sc->dev, TOPIC_REG_CTRL, reg_ctrl, 4);
 	}
-	PCI_MASK_CONFIG(brdev, CBBR_BRIDGECTRL,
-	    & ~CBBM_BRIDGECTRL_INTR_IREQ_ISA_EN, 2);
 	retval = 1;
 done:;
 	if (volts != 0 && sc->chipset == CB_O2MICRO)
@@ -932,7 +919,7 @@ cbb_do_power(device_t brdev)
 	uint32_t status;
 
 	/* Don't enable OE (output enable) until power stable */
-	exca_clrb(&sc->exca[0], EXCA_PWRCTL, EXCA_PWRCTL_OE);
+	exca_clrb(&sc->exca, EXCA_PWRCTL, EXCA_PWRCTL_OE);
 
 	voltage = cbb_detect_voltage(brdev);
 	curpwr = cbb_current_voltage(brdev);
@@ -1323,7 +1310,7 @@ cbb_pcic_power_enable_socket(device_t brdev, device_t child)
 	err = cbb_do_power(brdev);
 	if (err)
 		return (err);
-	exca_reset(&sc->exca[0], child);
+	exca_reset(&sc->exca, child);
 
 	return (0);
 }
@@ -1336,18 +1323,18 @@ cbb_pcic_power_disable_socket(device_t brdev, device_t child)
 	DPRINTF(("cbb_pcic_socket_disable\n"));
 
 	/* Turn off the card's interrupt and leave it in reset, wait 10ms */
-	exca_putb(&sc->exca[0], EXCA_INTR, 0);
+	exca_putb(&sc->exca, EXCA_INTR, 0);
 	pause("cbbP1", hz / 100);
 
 	/* power down the socket */
 	cbb_power(brdev, CARD_OFF);
-	exca_putb(&sc->exca[0], EXCA_PWRCTL, 0);
+	exca_putb(&sc->exca, EXCA_PWRCTL, 0);
 
 	/* wait 300ms until power fails (Tpf). */
 	pause("cbbP2", hz * 300 / 1000);
 
 	/* enable CSC interrupts */
-	exca_putb(&sc->exca[0], EXCA_INTR, EXCA_INTR_ENABLE);
+	exca_putb(&sc->exca, EXCA_INTR, EXCA_INTR_ENABLE);
 	return (0);
 }
 
@@ -1381,7 +1368,7 @@ cbb_pcic_activate_resource(device_t brdev, device_t child, int type, int rid,
 	struct cbb_softc *sc = device_get_softc(brdev);
 	int error;
 
-	error = exca_activate_resource(&sc->exca[0], child, type, rid, res);
+	error = exca_activate_resource(&sc->exca, child, type, rid, res);
 	if (error == 0)
 		cbb_activate_window(brdev, type);
 	return (error);
@@ -1392,7 +1379,7 @@ cbb_pcic_deactivate_resource(device_t brdev, device_t child, int type,
     int rid, struct resource *res)
 {
 	struct cbb_softc *sc = device_get_softc(brdev);
-	return (exca_deactivate_resource(&sc->exca[0], child, type, rid, res));
+	return (exca_deactivate_resource(&sc->exca, child, type, rid, res));
 }
 
 static struct resource *
@@ -1487,7 +1474,7 @@ cbb_pcic_set_res_flags(device_t brdev, device_t child, int type, int rid,
 		    "set_res_flags: specified rid not found\n");
 		return (ENOENT);
 	}
-	return (exca_mem_set_flags(&sc->exca[0], res, flags));
+	return (exca_mem_set_flags(&sc->exca, res, flags));
 }
 
 int
@@ -1503,7 +1490,7 @@ cbb_pcic_set_memory_offset(device_t brdev, device_t child, int rid,
 		    "set_memory_offset: specified rid not found\n");
 		return (ENOENT);
 	}
-	return (exca_mem_set_offset(&sc->exca[0], res, cardaddr, deltap));
+	return (exca_mem_set_offset(&sc->exca, res, cardaddr, deltap));
 }
 
 /************************************************************************/
@@ -1578,6 +1565,9 @@ cbb_read_ivar(device_t brdev, device_t child, int which, uintptr_t *result)
 	case PCIB_IVAR_BUS:
 		*result = sc->bus.sec;
 		return (0);
+	case EXCA_IVAR_SLOT:
+		*result = 0;
+		return (0);
 	}
 	return (ENOENT);
 }
@@ -1590,6 +1580,8 @@ cbb_write_ivar(device_t brdev, device_t child, int which, uintptr_t value)
 	case PCIB_IVAR_DOMAIN:
 		return (EINVAL);
 	case PCIB_IVAR_BUS:
+		return (EINVAL);
+	case EXCA_IVAR_SLOT:
 		return (EINVAL);
 	}
 	return (ENOENT);

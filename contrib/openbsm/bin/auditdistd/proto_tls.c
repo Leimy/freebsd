@@ -379,7 +379,7 @@ tls_exec_client(const char *user, int startfd, const char *srcaddr,
 	 *       libcrypto use sysctl kern.arandom to obtain random data
 	 *       instead of /dev/urandom and friends.
 	 */
-	sslctx = SSL_CTX_new(TLSv1_client_method());
+	sslctx = SSL_CTX_new(TLS_client_method());
 	if (sslctx == NULL)
 		pjdlog_exitx(EX_TEMPFAIL, "SSL_CTX_new() failed.");
 
@@ -413,7 +413,7 @@ tls_exec_client(const char *user, int startfd, const char *srcaddr,
 	tls_certificate_verify(ssl, fingerprint);
 
 	/*
-	 * The following byte is send to make proto_connect_wait() to work.
+	 * The following byte is sent to make proto_connect_wait() work.
 	 */
 	connected = 1;
 	for (;;) {
@@ -460,7 +460,7 @@ tls_call_exec_client(struct proto_conn *sock, const char *srcaddr,
 		proto_close(sock);
 	} else {
 		/*
-		 * The FD_CLOEXEC is cleared by dup2(2), so when we not
+		 * The FD_CLOEXEC is cleared by dup2(2), so when we do not
 		 * call it, we have to clear it by hand in case it is set.
 		 */
 		if (fcntl(startfd, F_SETFD, 0) == -1)
@@ -666,7 +666,7 @@ tls_exec_server(const char *user, int startfd, const char *privkey,
 	SSL_load_error_strings();
 	SSL_library_init();
 
-	sslctx = SSL_CTX_new(TLSv1_server_method());
+	sslctx = SSL_CTX_new(TLS_server_method());
 	if (sslctx == NULL)
 		pjdlog_exitx(EX_TEMPFAIL, "SSL_CTX_new() failed.");
 

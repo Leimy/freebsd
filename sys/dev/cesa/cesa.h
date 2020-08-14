@@ -193,9 +193,7 @@ struct cesa_sa_desc {
 };
 
 struct cesa_session {
-	uint32_t			cs_sid;
 	uint32_t			cs_config;
-	unsigned int			cs_klen;
 	unsigned int			cs_ivlen;
 	unsigned int			cs_hlen;
 	unsigned int			cs_mblen;
@@ -203,16 +201,12 @@ struct cesa_session {
 	uint8_t				cs_aes_dkey[CESA_MAX_KEY_LEN];
 	uint8_t				cs_hiv_in[CESA_MAX_HASH_LEN];
 	uint8_t				cs_hiv_out[CESA_MAX_HASH_LEN];
-
-	STAILQ_ENTRY(cesa_session)	cs_stq;
 };
 
 struct cesa_request {
 	struct cesa_sa_data		*cr_csd;
 	bus_addr_t			cr_csd_paddr;
 	struct cryptop			*cr_crp;
-	struct cryptodesc		*cr_enc;
-	struct cryptodesc		*cr_mac;
 	struct cesa_session		*cr_cs;
 	bus_dmamap_t			cr_dmap;
 	int				cr_dmap_loaded;
@@ -239,6 +233,7 @@ struct cesa_softc {
 	bus_dma_tag_t			sc_data_dtag;
 	int				sc_error;
 	int				sc_tperr;
+	uint8_t				sc_cesa_engine_id;
 
 	struct mtx			sc_sc_lock;
 	int				sc_blocked;
@@ -263,10 +258,7 @@ struct cesa_softc {
 	STAILQ_HEAD(, cesa_request)	sc_ready_requests;
 	STAILQ_HEAD(, cesa_request)	sc_queued_requests;
 
-	/* Sessions pool */
 	struct mtx			sc_sessions_lock;
-	struct cesa_session		sc_sessions[CESA_SESSIONS];
-	STAILQ_HEAD(, cesa_session)	sc_free_sessions;
 
 	/* CESA SRAM Address */
 	bus_addr_t			sc_sram_base_pa;
@@ -277,8 +269,6 @@ struct cesa_softc {
 struct cesa_chain_info {
 	struct cesa_softc		*cci_sc;
 	struct cesa_request		*cci_cr;
-	struct cryptodesc		*cci_enc;
-	struct cryptodesc		*cci_mac;
 	uint32_t			cci_config;
 	int				cci_error;
 };
@@ -367,4 +357,10 @@ struct cesa_chain_info {
 #define CESA_SA_SR			0x0E0C
 #define CESA_SA_SR_ACTIVE		(1 << 0)
 
+#define CESA_TDMA_SIZE			0x1000
+#define CESA_CESA_SIZE			0x1000
+#define CESA0_TDMA_ADDR			0x90000
+#define CESA0_CESA_ADDR			0x9D000
+#define CESA1_TDMA_ADDR			0x92000
+#define CESA1_CESA_ADDR			0x9F000
 #endif

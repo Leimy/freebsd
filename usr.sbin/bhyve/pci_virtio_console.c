@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (c) 2016 iXsystems Inc.
  * All rights reserved.
  *
@@ -41,6 +43,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#ifndef WITHOUT_CAPSICUM
+#include <capsicum_helpers.h>
+#endif
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -55,6 +60,7 @@ __FBSDID("$FreeBSD$");
 #include <sysexits.h>
 
 #include "bhyverun.h"
+#include "debug.h"
 #include "pci_emul.h"
 #include "virtio.h"
 #include "mevent.h"
@@ -80,8 +86,8 @@ __FBSDID("$FreeBSD$");
     (VTCON_F_SIZE | VTCON_F_MULTIPORT | VTCON_F_EMERG_WRITE)
 
 static int pci_vtcon_debug;
-#define DPRINTF(params) if (pci_vtcon_debug) printf params
-#define WPRINTF(params) printf params
+#define DPRINTF(params) if (pci_vtcon_debug) PRINTLN params
+#define WPRINTF(params) PRINTLN params
 
 struct pci_vtcon_softc;
 struct pci_vtcon_port;
@@ -182,7 +188,7 @@ pci_vtcon_reset(void *vsc)
 
 	sc = vsc;
 
-	DPRINTF(("vtcon: device reset requested!\n"));
+	DPRINTF(("vtcon: device reset requested!"));
 	vi_reset_dev(&sc->vsc_vs);
 }
 
@@ -306,7 +312,7 @@ pci_vtcon_sock_add(struct pci_vtcon_softc *sc, const char *name,
 	sun.sun_family = AF_UNIX;
 	sun.sun_len = sizeof(struct sockaddr_un);
 	strcpy(pathcopy, path);
-	strncpy(sun.sun_path, basename(pathcopy), sizeof(sun.sun_path));
+	strlcpy(sun.sun_path, basename(pathcopy), sizeof(sun.sun_path));
 	free(pathcopy);
 
 	if (bindat(fd, s, (struct sockaddr *)&sun, sun.sun_len) < 0) {
@@ -326,7 +332,7 @@ pci_vtcon_sock_add(struct pci_vtcon_softc *sc, const char *name,
 
 #ifndef WITHOUT_CAPSICUM
 	cap_rights_init(&rights, CAP_ACCEPT, CAP_EVENT, CAP_READ, CAP_WRITE);
-	if (cap_rights_limit(s, &rights) == -1 && errno != ENOSYS)
+	if (caph_rights_limit(s, &rights) == -1)
 		errx(EX_OSERR, "Unable to apply rights for sandbox");
 #endif
 
@@ -351,8 +357,11 @@ out:
 	if (fd != -1)
 		close(fd);
 
-	if (error != 0 && s != -1)
-		close(s);
+	if (error != 0) {
+		if (s != -1)
+			close(s);
+		free(sock);
+	}
 
 	return (error);
 }
@@ -415,7 +424,7 @@ pci_vtcon_sock_rx(int fd __unused, enum ev_type t __unused, void *arg)
 		len = readv(sock->vss_conn_fd, &iov, n);
 
 		if (len == 0 || (len < 0 && errno == EWOULDBLOCK)) {
-			vq_retchain(vq);
+			vq_retchains(vq, 1);
 			vq_endchains(vq, 0);
 			if (len == 0)
 				goto close;
@@ -490,7 +499,7 @@ pci_vtcon_control_tx(struct pci_vtcon_port *port, void *arg, struct iovec *iov,
 
 	case VTCON_PORT_READY:
 		if (ctrl->id >= sc->vsc_nports) {
-			WPRINTF(("VTCON_PORT_READY event for unknown port %d\n",
+			WPRINTF(("VTCON_PORT_READY event for unknown port %d",
 			    ctrl->id));
 			return;
 		}
@@ -579,6 +588,7 @@ pci_vtcon_notify_tx(void *vsc, struct vqueue_info *vq)
 
 	while (vq_has_descs(vq)) {
 		n = vq_getchain(vq, &idx, iov, 1, flags);
+		assert(n >= 1);
 		if (port != NULL)
 			port->vsp_cb(port, port->vsp_arg, iov, 1);
 
@@ -601,7 +611,7 @@ pci_vtcon_notify_rx(void *vsc, struct vqueue_info *vq)
 
 	if (!port->vsp_rx_ready) {
 		port->vsp_rx_ready = 1;
-		vq->vq_used->vu_flags |= VRING_USED_F_NO_NOTIFY;
+		vq_kick_disable(vq);
 	}
 }
 
@@ -650,11 +660,11 @@ pci_vtcon_init(struct vmctx *ctx, struct pci_devinst *pi, char *opts)
 
 	while ((opt = strsep(&opts, ",")) != NULL) {
 		portname = strsep(&opt, "=");
-		portpath = strdup(opt);
+		portpath = opt;
 
 		/* create port */
 		if (pci_vtcon_sock_add(sc, portname, portpath) < 0) {
-			fprintf(stderr, "cannot create port %s: %s\n",
+			EPRINTLN("cannot create port %s: %s",
 			    portname, strerror(errno));
 			return (1);
 		}

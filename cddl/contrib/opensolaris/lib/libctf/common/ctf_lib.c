@@ -27,6 +27,7 @@
 #pragma ident	"%Z%%M%	%I%	%E% SMI"
 
 #include <sys/types.h>
+#include <sys/endian.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/zmod.h>
@@ -230,12 +231,12 @@ ctf_fdopen(int fd, int *errp)
 	bzero(&ctfsect, sizeof (ctf_sect_t));
 	bzero(&symsect, sizeof (ctf_sect_t));
 	bzero(&strsect, sizeof (ctf_sect_t));
-	bzero(&hdr.ctf, sizeof (hdr));
+	bzero(&hdr, sizeof (hdr));
 
 	if (fstat64(fd, &st) == -1)
 		return (ctf_set_open_errno(errp, errno));
 
-	if ((nbytes = pread64(fd, &hdr.ctf, sizeof (hdr), 0)) <= 0)
+	if ((nbytes = pread64(fd, &hdr, sizeof (hdr), 0)) <= 0)
 		return (ctf_set_open_errno(errp, nbytes < 0? errno : ECTF_FMT));
 
 	/*

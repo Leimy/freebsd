@@ -170,6 +170,7 @@ emac_get_hwaddr(struct emac_softc *sc, uint8_t *hwaddr)
 {
 	uint32_t val0, val1, rnd;
 	u_char rootkey[16];
+	size_t rootkey_size;
 
 	/*
 	 * Try to get MAC address from running hardware.
@@ -193,7 +194,9 @@ emac_get_hwaddr(struct emac_softc *sc, uint8_t *hwaddr)
 		hwaddr[4] = (val0 >> 8) & 0xff;
 		hwaddr[5] = (val0 >> 0) & 0xff;
 	} else {
-		if (aw_sid_get_rootkey(rootkey) == 0) {
+		rootkey_size = sizeof(rootkey);
+		if (aw_sid_get_fuse(AW_SID_FUSE_ROOTKEY, rootkey,
+		    &rootkey_size) == 0) {
 			hwaddr[0] = 0x2;
 			hwaddr[1] = rootkey[3];
 			hwaddr[2] = rootkey[12];
@@ -215,12 +218,22 @@ emac_get_hwaddr(struct emac_softc *sc, uint8_t *hwaddr)
 		printf("MAC address: %s\n", ether_sprintf(hwaddr));
 }
 
+static u_int
+emac_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	uint32_t h, *hashes = arg;
+
+	h = ether_crc32_be(LLADDR(sdl), ETHER_ADDR_LEN) >> 26;
+	hashes[h >> 5] |= 1 << (h & 0x1f);
+
+	return (1);
+}
+
 static void
 emac_set_rx_mode(struct emac_softc *sc)
 {
 	struct ifnet *ifp;
-	struct ifmultiaddr *ifma;
-	uint32_t h, hashes[2];
+	uint32_t hashes[2];
 	uint32_t rcr = 0;
 
 	EMAC_ASSERT_LOCKED(sc);
@@ -238,17 +251,8 @@ emac_set_rx_mode(struct emac_softc *sc)
 	if (ifp->if_flags & IFF_ALLMULTI) {
 		hashes[0] = 0xffffffff;
 		hashes[1] = 0xffffffff;
-	} else {
-		if_maddr_rlock(ifp);
-		TAILQ_FOREACH(ifma, &sc->emac_ifp->if_multiaddrs, ifma_link) {
-			if (ifma->ifma_addr->sa_family != AF_LINK)
-				continue;
-			h = ether_crc32_be(LLADDR((struct sockaddr_dl *)
-			    ifma->ifma_addr), ETHER_ADDR_LEN) >> 26;
-			hashes[h >> 5] |= 1 << (h & 0x1f);
-		}
-		if_maddr_runlock(ifp);
-	}
+	} else
+		if_foreach_llmaddr(ifp, emac_hash_maddr, hashes);
 	rcr |= EMAC_RX_MCO;
 	rcr |= EMAC_RX_MHF;
 	EMAC_WRITE_REG(sc, EMAC_RX_HASH0, hashes[0]);
@@ -919,7 +923,8 @@ emac_attach(device_t dev)
 	/* Create device sysctl node. */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
-	    OID_AUTO, "process_limit", CTLTYPE_INT | CTLFLAG_RW,
+	    OID_AUTO, "process_limit",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
 	    &sc->emac_rx_process_limit, 0, sysctl_hw_emac_proc_limit, "I",
 	    "max number of Rx events to process");
 

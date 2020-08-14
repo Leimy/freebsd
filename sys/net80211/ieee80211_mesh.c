@@ -106,27 +106,32 @@ uint32_t	mesh_airtime_calc(struct ieee80211_node *);
 /*
  * Timeout values come from the specification and are in milliseconds.
  */
-static SYSCTL_NODE(_net_wlan, OID_AUTO, mesh, CTLFLAG_RD, 0,
+static SYSCTL_NODE(_net_wlan, OID_AUTO, mesh, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "IEEE 802.11s parameters");
 static int	ieee80211_mesh_gateint = -1;
-SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, gateint, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, gateint,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
     &ieee80211_mesh_gateint, 0, ieee80211_sysctl_msecs_ticks, "I",
     "mesh gate interval (ms)");
 static int ieee80211_mesh_retrytimeout = -1;
-SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, retrytimeout, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, retrytimeout,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
     &ieee80211_mesh_retrytimeout, 0, ieee80211_sysctl_msecs_ticks, "I",
     "Retry timeout (msec)");
 static int ieee80211_mesh_holdingtimeout = -1;
 
-SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, holdingtimeout, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, holdingtimeout,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
     &ieee80211_mesh_holdingtimeout, 0, ieee80211_sysctl_msecs_ticks, "I",
     "Holding state timeout (msec)");
 static int ieee80211_mesh_confirmtimeout = -1;
-SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, confirmtimeout, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, confirmtimeout,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
     &ieee80211_mesh_confirmtimeout, 0, ieee80211_sysctl_msecs_ticks, "I",
     "Confirm state timeout (msec)");
 static int ieee80211_mesh_backofftimeout = -1;
-SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, backofftimeout, CTLTYPE_INT | CTLFLAG_RW,
+SYSCTL_PROC(_net_wlan_mesh, OID_AUTO, backofftimeout,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
     &ieee80211_mesh_backofftimeout, 0, ieee80211_sysctl_msecs_ticks, "I",
     "Backoff timeout (msec). This is to throutles peering forever when "
     "not receiving answer or is rejected by a neighbor");
@@ -1225,6 +1230,7 @@ mesh_forward(struct ieee80211vap *vap, struct mbuf *m,
 	M_WME_SETAC(mcopy, WME_AC_BE);
 
 	/* XXX do we know m_nextpkt is NULL? */
+	MPASS((mcopy->m_pkthdr.csum_flags & CSUM_SND_TAG) == 0);
 	mcopy->m_pkthdr.rcvif = (void *) ni;
 
 	/*
@@ -1655,12 +1661,7 @@ mesh_input(struct ieee80211_node *ni, struct mbuf *m,
 		 * in the Mesh Control field and a 3 address qos frame
 		 * is used.
 		 */
-		if (IEEE80211_IS_DSTODS(wh))
-			*(uint16_t *)qos = *(uint16_t *)
-			    ((struct ieee80211_qosframe_addr4 *)wh)->i_qos;
-		else
-			*(uint16_t *)qos = *(uint16_t *)
-			    ((struct ieee80211_qosframe *)wh)->i_qos;
+		*(uint16_t *)qos = *(uint16_t *)ieee80211_getqos(wh);
 
 		/*
 		 * NB: The mesh STA sets the Mesh Control Present
@@ -3574,16 +3575,21 @@ mesh_ioctl_set80211(struct ieee80211vap *vap, struct ieee80211req *ireq)
 			ieee80211_mesh_rt_flush(vap);
 			break;
 		case IEEE80211_MESH_RTCMD_ADD:
-			if (IEEE80211_ADDR_EQ(vap->iv_myaddr, ireq->i_data) ||
-			    IEEE80211_ADDR_EQ(broadcastaddr, ireq->i_data))
-				return EINVAL;
-			error = copyin(ireq->i_data, &tmpaddr,
+			error = copyin(ireq->i_data, tmpaddr,
 			    IEEE80211_ADDR_LEN);
-			if (error == 0)
-				ieee80211_mesh_discover(vap, tmpaddr, NULL);
+			if (error != 0)
+				break;
+			if (IEEE80211_ADDR_EQ(vap->iv_myaddr, tmpaddr) ||
+			    IEEE80211_ADDR_EQ(broadcastaddr, tmpaddr))
+				return EINVAL;
+			ieee80211_mesh_discover(vap, tmpaddr, NULL);
 			break;
 		case IEEE80211_MESH_RTCMD_DELETE:
-			ieee80211_mesh_rt_del(vap, ireq->i_data);
+			error = copyin(ireq->i_data, tmpaddr,
+			    IEEE80211_ADDR_LEN);
+			if (error != 0)
+				break;
+			ieee80211_mesh_rt_del(vap, tmpaddr);
 			break;
 		default:
 			return ENOSYS;

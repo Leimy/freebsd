@@ -84,8 +84,7 @@ static const struct ibdiag_opt *opts_map[256];
 
 static const char *get_build_version(void)
 {
-	return "BUILD VERSION: " IBDIAG_VERSION " Build date: " __DATE__ " "
-	    __TIME__;
+	return "BUILD VERSION: " IBDIAG_VERSION;
 }
 
 static void pretty_print(int start, int width, const char *str)
@@ -121,6 +120,7 @@ static inline int val_str_true(const char *val_str)
 void read_ibdiag_config(const char *file)
 {
 	char buf[1024];
+	char orig_buf[1024];
 	FILE *config_fd = NULL;
 	char *p_prefix, *p_last;
 	char *name;
@@ -143,8 +143,14 @@ void read_ibdiag_config(const char *file)
 		if (*p_prefix == '#')
 			continue; /* ignore comment lines */
 
+		strlcpy(orig_buf, buf, sizeof(orig_buf));
 		name = strtok_r(p_prefix, "=", &p_last);
 		val_str = strtok_r(NULL, "\n", &p_last);
+		if (!name || !val_str) {
+			fprintf(stderr, "%s: malformed line in \"%s\":\n%s\n",
+			    prog_name, file, orig_buf);
+			continue;
+		}
 
 		if (strncmp(name, "CA", strlen("CA")) == 0) {
 			free(ibd_ca);
@@ -166,6 +172,7 @@ void read_ibdiag_config(const char *file)
 			ibd_sakey = strtoull(val_str, 0, 0);
 		} else if (strncmp(name, "nd_format",
 				   strlen("nd_format")) == 0) {
+			free(ibd_nd_format);
 			ibd_nd_format = strdup(val_str);
 		}
 	}

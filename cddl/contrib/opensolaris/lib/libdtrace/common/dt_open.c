@@ -343,13 +343,13 @@ static const dt_ident_t _dtrace_globals[] = {
 	&dt_idops_func, "void(@)" },
 { "mod", DT_IDENT_ACTFUNC, 0, DT_ACT_MOD, DT_ATTR_STABCMN,
 	DT_VERS_1_2, &dt_idops_func, "_symaddr(uintptr_t)" },
+#ifdef illumos
 { "msgdsize", DT_IDENT_FUNC, 0, DIF_SUBR_MSGDSIZE,
 	DT_ATTR_STABCMN, DT_VERS_1_0,
 	&dt_idops_func, "size_t(mblk_t *)" },
 { "msgsize", DT_IDENT_FUNC, 0, DIF_SUBR_MSGSIZE,
 	DT_ATTR_STABCMN, DT_VERS_1_0,
 	&dt_idops_func, "size_t(mblk_t *)" },
-#ifdef illumos
 { "mutex_owned", DT_IDENT_FUNC, 0, DIF_SUBR_MUTEX_OWNED,
 	DT_ATTR_EVOLCMN, DT_VERS_1_0,
 	&dt_idops_func, "int(genunix`kmutex_t *)" },
@@ -1105,7 +1105,7 @@ dt_vopen(int version, int flags, int *errp,
 	dt_provmod_open(&provmod, &df);
 
 	dtfd = open("/dev/dtrace/dtrace", O_RDWR | O_CLOEXEC);
-	err = errno; /* save errno from opening dtfd */
+	err = dtfd == -1 ? errno : 0; /* save errno from opening dtfd */
 #if defined(__FreeBSD__)
 	/*
 	 * Automatically load the 'dtraceall' module if we couldn't open the

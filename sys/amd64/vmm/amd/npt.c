@@ -1,4 +1,6 @@
 /*-
+ * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+ *
  * Copyright (c) 2013 Anish Gupta (akgupt3@gmail.com)
  * All rights reserved.
  *
@@ -39,7 +41,8 @@ __FBSDID("$FreeBSD$");
 #include "npt.h"
 
 SYSCTL_DECL(_hw_vmm);
-SYSCTL_NODE(_hw_vmm, OID_AUTO, npt, CTLFLAG_RW, NULL, NULL);
+SYSCTL_NODE(_hw_vmm, OID_AUTO, npt, CTLFLAG_RW | CTLFLAG_MPSAFE, NULL,
+    NULL);
 
 static int npt_flags;
 SYSCTL_INT(_hw_vmm_npt, OID_AUTO, pmap_flags, CTLFLAG_RD,

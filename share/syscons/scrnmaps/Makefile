@@ -12,6 +12,7 @@ CLEANFILES+= ${SCRMAPS_MK} ${SCRMAPS}
 FILES=	${SCRMAPS}
 FILESDIR= ${SHAREDIR}/syscons/scrnmaps
 
+DEPENDOBJS+= ${SCRMAPS_MK}
 build-tools: ${SCRMAPS_MK}
 
 ${SCRMAPS}: ${.TARGET:R}.mk
@@ -20,7 +21,7 @@ ${SCRMAPS}: ${.TARGET:R}.mk
 	rm -f ${.TARGET:R}.tmp
 
 ${SCRMAPS_MK}: ${.TARGET:R} mkscrfil.c ${BUILD_TOOLS_META}
-	${CC} ${CFLAGS} -I${.CURDIR} -DFIL=\"${.TARGET:R}\" ${LDFLAGS} \
-	    -o ${.TARGET} ${.CURDIR}/mkscrfil.c
+	${CC:N${CCACHE_BIN}} ${CFLAGS} -I${.CURDIR} -DFIL=\"${.TARGET:R}\" \
+	    ${LDFLAGS} -o ${.TARGET} ${.CURDIR}/mkscrfil.c
 
 .include <bsd.prog.mk>

@@ -26,7 +26,8 @@
  * Copyright 2013 Martin Matuska <mm@FreeBSD.org>. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright 2016 Toomas Soome <tsoome@me.com>
- * Copyright 2017 Joyent, Inc.
+ * Copyright 2019 Joyent, Inc.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #include <sys/zfs_context.h>
@@ -51,9 +52,11 @@
 #include <sys/dsl_scan.h>
 #include <sys/abd.h>
 #include <sys/trim_map.h>
+#include <sys/vdev_initialize.h>
 
 SYSCTL_DECL(_vfs_zfs);
-SYSCTL_NODE(_vfs_zfs, OID_AUTO, vdev, CTLFLAG_RW, 0, "ZFS VDEV");
+SYSCTL_NODE(_vfs_zfs, OID_AUTO, vdev, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "ZFS VDEV");
 
 /*
  * Virtual device management.
@@ -162,16 +165,68 @@ static vdev_ops_t *vdev_ops_table[] = {
 };
 
 
-/*
- * When a vdev is added, it will be divided into approximately (but no
- * more than) this number of metaslabs.
- */
-int metaslabs_per_vdev = 200;
-SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, metaslabs_per_vdev, CTLFLAG_RDTUN,
-    &metaslabs_per_vdev, 0,
-    "When a vdev is added, how many metaslabs the vdev should be divided into");
+/* default target for number of metaslabs per top-level vdev */
+int zfs_vdev_default_ms_count = 200;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, default_ms_count, CTLFLAG_RWTUN,
+    &zfs_vdev_default_ms_count, 0,
+    "Target number of metaslabs per top-level vdev");
+
+/* minimum number of metaslabs per top-level vdev */
+int zfs_vdev_min_ms_count = 16;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, min_ms_count, CTLFLAG_RWTUN,
+    &zfs_vdev_min_ms_count, 0,
+    "Minimum number of metaslabs per top-level vdev");
+
+/* practical upper limit of total metaslabs per top-level vdev */
+int zfs_vdev_ms_count_limit = 1ULL << 17;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, max_ms_count_limit, CTLFLAG_RWTUN,
+    &zfs_vdev_ms_count_limit, 0,
+    "Maximum number of metaslabs per top-level vdev");
+
+/* lower limit for metaslab size (512M) */
+int zfs_vdev_default_ms_shift = 29;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, default_ms_shift, CTLFLAG_RWTUN,
+    &zfs_vdev_default_ms_shift, 0,
+    "Default shift between vdev size and number of metaslabs");
+
+/* upper limit for metaslab size (16G) */
+int zfs_vdev_max_ms_shift = 34;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, max_ms_shift, CTLFLAG_RWTUN,
+    &zfs_vdev_max_ms_shift, 0,
+    "Maximum shift between vdev size and number of metaslabs");
 
 boolean_t vdev_validate_skip = B_FALSE;
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, validate_skip, CTLFLAG_RWTUN,
+    &vdev_validate_skip, 0,
+    "Bypass vdev validation");
+
+/*
+ * Since the DTL space map of a vdev is not expected to have a lot of
+ * entries, we default its block size to 4K.
+ */
+int vdev_dtl_sm_blksz = (1 << 12);
+SYSCTL_INT(_vfs_zfs, OID_AUTO, dtl_sm_blksz, CTLFLAG_RDTUN,
+    &vdev_dtl_sm_blksz, 0,
+    "Block size for DTL space map.  Power of 2 and greater than 4096.");
+
+/*
+ * vdev-wide space maps that have lots of entries written to them at
+ * the end of each transaction can benefit from a higher I/O bandwidth
+ * (e.g. vdev_obsolete_sm), thus we default their block size to 128K.
+ */
+int vdev_standard_sm_blksz = (1 << 17);
+SYSCTL_INT(_vfs_zfs, OID_AUTO, standard_sm_blksz, CTLFLAG_RDTUN,
+    &vdev_standard_sm_blksz, 0,
+    "Block size for standard space map.  Power of 2 and greater than 4096.");
+
+/*
+ * Tunable parameter for debugging or performance analysis. Setting this
+ * will cause pool corruption on power loss if a volatile out-of-order
+ * write cache is enabled.
+ */
+boolean_t zfs_nocacheflush = B_FALSE;
+SYSCTL_INT(_vfs_zfs, OID_AUTO, cache_flush_disable, CTLFLAG_RWTUN,
+    &zfs_nocacheflush, 0, "Disable cache flush");
 
 /*PRINTFLIKE2*/
 void
@@ -237,7 +292,7 @@ vdev_dbgmsg_print_tree(vdev_t *vd, int indent)
 	}
 
 	zfs_dbgmsg("%*svdev %u: %s%s, guid: %llu, path: %s, %s", indent,
-	    "", vd->vdev_id, vd->vdev_ops->vdev_op_type,
+	    "", (int)vd->vdev_id, vd->vdev_ops->vdev_op_type,
 	    vd->vdev_islog ? " (log)" : "",
 	    (u_longlong_t)vd->vdev_guid,
 	    vd->vdev_path ? vd->vdev_path : "N/A", state);
@@ -259,6 +314,33 @@ vdev_getops(const char *type)
 			break;
 
 	return (ops);
+}
+
+/*
+ * Derive the enumerated alloction bias from string input.
+ * String origin is either the per-vdev zap or zpool(1M).
+ */
+static vdev_alloc_bias_t
+vdev_derive_alloc_bias(const char *bias)
+{
+	vdev_alloc_bias_t alloc_bias = VDEV_BIAS_NONE;
+
+	if (strcmp(bias, VDEV_ALLOC_BIAS_LOG) == 0)
+		alloc_bias = VDEV_BIAS_LOG;
+	else if (strcmp(bias, VDEV_ALLOC_BIAS_SPECIAL) == 0)
+		alloc_bias = VDEV_BIAS_SPECIAL;
+	else if (strcmp(bias, VDEV_ALLOC_BIAS_DEDUP) == 0)
+		alloc_bias = VDEV_BIAS_DEDUP;
+
+	return (alloc_bias);
+}
+
+/* ARGSUSED */
+void
+vdev_default_xlate(vdev_t *vd, const range_seg_t *in, range_seg_t *res)
+{
+	res->rs_start = in->rs_start;
+	res->rs_end = in->rs_end;
 }
 
 /*
@@ -414,6 +496,11 @@ vdev_add_child(vdev_t *pvd, vdev_t *cvd)
 	 */
 	for (; pvd != NULL; pvd = pvd->vdev_parent)
 		pvd->vdev_guid_sum += cvd->vdev_guid_sum;
+
+	if (cvd->vdev_ops->vdev_op_leaf) {
+		list_insert_head(&cvd->vdev_spa->spa_leaf_list, cvd);
+		cvd->vdev_spa->spa_leaf_list_gen++;
+	}
 }
 
 void
@@ -443,6 +530,12 @@ vdev_remove_child(vdev_t *pvd, vdev_t *cvd)
 		pvd->vdev_children = 0;
 	}
 
+	if (cvd->vdev_ops->vdev_op_leaf) {
+		spa_t *spa = cvd->vdev_spa;
+		list_remove(&spa->spa_leaf_list, cvd);
+		spa->spa_leaf_list_gen++;
+	}
+
 	/*
 	 * Walk up all ancestors to update guid sum.
 	 */
@@ -462,17 +555,24 @@ vdev_compact_children(vdev_t *pvd)
 
 	ASSERT(spa_config_held(pvd->vdev_spa, SCL_ALL, RW_WRITER) == SCL_ALL);
 
+	if (oldc == 0)
+		return;
+
 	for (int c = newc = 0; c < oldc; c++)
 		if (pvd->vdev_child[c])
 			newc++;
 
-	newchild = kmem_alloc(newc * sizeof (vdev_t *), KM_SLEEP);
+	if (newc > 0) {
+		newchild = kmem_alloc(newc * sizeof (vdev_t *), KM_SLEEP);
 
-	for (int c = newc = 0; c < oldc; c++) {
-		if ((cvd = pvd->vdev_child[c]) != NULL) {
-			newchild[newc] = cvd;
-			cvd->vdev_id = newc++;
+		for (int c = newc = 0; c < oldc; c++) {
+			if ((cvd = pvd->vdev_child[c]) != NULL) {
+				newchild[newc] = cvd;
+				cvd->vdev_id = newc++;
+			}
 		}
+	} else {
+		newchild = NULL;
 	}
 
 	kmem_free(pvd->vdev_child, oldc * sizeof (vdev_t *));
@@ -527,10 +627,16 @@ vdev_alloc_common(spa_t *spa, uint_t id, uint64_t guid, vdev_ops_t *ops)
 	mutex_init(&vd->vdev_obsolete_lock, NULL, MUTEX_DEFAULT, NULL);
 	vd->vdev_obsolete_segments = range_tree_create(NULL, NULL);
 
+	list_link_init(&vd->vdev_leaf_node);
 	mutex_init(&vd->vdev_dtl_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vd->vdev_stat_lock, NULL, MUTEX_DEFAULT, NULL);
 	mutex_init(&vd->vdev_probe_lock, NULL, MUTEX_DEFAULT, NULL);
-	mutex_init(&vd->vdev_queue_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&vd->vdev_scan_io_queue_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&vd->vdev_initialize_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&vd->vdev_initialize_io_lock, NULL, MUTEX_DEFAULT, NULL);
+	cv_init(&vd->vdev_initialize_cv, NULL, CV_DEFAULT, NULL);
+	cv_init(&vd->vdev_initialize_io_cv, NULL, CV_DEFAULT, NULL);
+
 	for (int t = 0; t < DTL_TYPES; t++) {
 		vd->vdev_dtl[t] = range_tree_create(NULL, NULL);
 	}
@@ -559,6 +665,8 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	uint64_t guid = 0, islog, nparity;
 	vdev_t *vd;
 	vdev_indirect_config_t *vic;
+	vdev_alloc_bias_t alloc_bias = VDEV_BIAS_NONE;
+	boolean_t top_level = (parent && !parent->vdev_parent);
 
 	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
 
@@ -645,11 +753,33 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	}
 	ASSERT(nparity != -1ULL);
 
+	/*
+	 * If creating a top-level vdev, check for allocation classes input
+	 */
+	if (top_level && alloctype == VDEV_ALLOC_ADD) {
+		char *bias;
+
+		if (nvlist_lookup_string(nv, ZPOOL_CONFIG_ALLOCATION_BIAS,
+		    &bias) == 0) {
+			alloc_bias = vdev_derive_alloc_bias(bias);
+
+			/* spa_vdev_add() expects feature to be enabled */
+			if (alloc_bias != VDEV_BIAS_LOG &&
+			    spa->spa_load_state != SPA_LOAD_CREATE &&
+			    !spa_feature_is_enabled(spa,
+			    SPA_FEATURE_ALLOCATION_CLASSES)) {
+				return (SET_ERROR(ENOTSUP));
+			}
+		}
+	}
+
 	vd = vdev_alloc_common(spa, id, guid, ops);
 	vic = &vd->vdev_indirect_config;
 
 	vd->vdev_islog = islog;
 	vd->vdev_nparity = nparity;
+	if (top_level && alloc_bias != VDEV_BIAS_NONE)
+		vd->vdev_alloc_bias = alloc_bias;
 
 	if (nvlist_lookup_string(nv, ZPOOL_CONFIG_PATH, &vd->vdev_path) == 0)
 		vd->vdev_path = spa_strdup(vd->vdev_path);
@@ -700,7 +830,7 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 	/*
 	 * If we're a top-level vdev, try to load the allocation parameters.
 	 */
-	if (parent && !parent->vdev_parent &&
+	if (top_level &&
 	    (alloctype == VDEV_ALLOC_LOAD || alloctype == VDEV_ALLOC_SPLIT)) {
 		(void) nvlist_lookup_uint64(nv, ZPOOL_CONFIG_METASLAB_ARRAY,
 		    &vd->vdev_ms_array);
@@ -716,13 +846,12 @@ vdev_alloc(spa_t *spa, vdev_t **vdp, nvlist_t *nv, vdev_t *parent, uint_t id,
 		ASSERT0(vd->vdev_top_zap);
 	}
 
-	if (parent && !parent->vdev_parent && alloctype != VDEV_ALLOC_ATTACH) {
+	if (top_level && alloctype != VDEV_ALLOC_ATTACH) {
 		ASSERT(alloctype == VDEV_ALLOC_LOAD ||
 		    alloctype == VDEV_ALLOC_ADD ||
 		    alloctype == VDEV_ALLOC_SPLIT ||
 		    alloctype == VDEV_ALLOC_ROOTPOOL);
-		vd->vdev_mg = metaslab_group_create(islog ?
-		    spa_log_class(spa) : spa_normal_class(spa), vd);
+		/* Note: metaslab_group_create() is now deferred */
 	}
 
 	if (vd->vdev_ops->vdev_op_leaf &&
@@ -802,6 +931,19 @@ void
 vdev_free(vdev_t *vd)
 {
 	spa_t *spa = vd->vdev_spa;
+	ASSERT3P(vd->vdev_initialize_thread, ==, NULL);
+
+	/*
+	 * Scan queues are normally destroyed at the end of a scan. If the
+	 * queue exists here, that implies the vdev is being removed while
+	 * the scan is still running.
+	 */
+	if (vd->vdev_scan_io_queue != NULL) {
+		mutex_enter(&vd->vdev_scan_io_queue_lock);
+		dsl_scan_io_queue_destroy(vd->vdev_scan_io_queue);
+		vd->vdev_scan_io_queue = NULL;
+		mutex_exit(&vd->vdev_scan_io_queue_lock);
+	}
 
 	/*
 	 * vdev_free() implies closing the vdev first.  This is simpler than
@@ -820,6 +962,7 @@ vdev_free(vdev_t *vd)
 
 	ASSERT(vd->vdev_child == NULL);
 	ASSERT(vd->vdev_guid_sum == vd->vdev_guid);
+	ASSERT(vd->vdev_initialize_thread == NULL);
 
 	/*
 	 * Discard allocation state.
@@ -839,6 +982,7 @@ vdev_free(vdev_t *vd)
 	vdev_remove_child(vd->vdev_parent, vd);
 
 	ASSERT(vd->vdev_parent == NULL);
+	ASSERT(!list_link_active(&vd->vdev_leaf_node));
 
 	/*
 	 * Clean up vdev structure.
@@ -888,10 +1032,14 @@ vdev_free(vdev_t *vd)
 	rw_destroy(&vd->vdev_indirect_rwlock);
 	mutex_destroy(&vd->vdev_obsolete_lock);
 
-	mutex_destroy(&vd->vdev_queue_lock);
 	mutex_destroy(&vd->vdev_dtl_lock);
 	mutex_destroy(&vd->vdev_stat_lock);
 	mutex_destroy(&vd->vdev_probe_lock);
+	mutex_destroy(&vd->vdev_scan_io_queue_lock);
+	mutex_destroy(&vd->vdev_initialize_lock);
+	mutex_destroy(&vd->vdev_initialize_io_lock);
+	cv_destroy(&vd->vdev_initialize_io_cv);
+	cv_destroy(&vd->vdev_initialize_cv);
 
 	if (vd == spa->spa_root_vdev)
 		spa->spa_root_vdev = NULL;
@@ -933,6 +1081,12 @@ vdev_top_transfer(vdev_t *svd, vdev_t *tvd)
 	if (tvd->vdev_mg != NULL)
 		tvd->vdev_mg->mg_vd = tvd;
 
+	tvd->vdev_checkpoint_sm = svd->vdev_checkpoint_sm;
+	svd->vdev_checkpoint_sm = NULL;
+
+	tvd->vdev_alloc_bias = svd->vdev_alloc_bias;
+	svd->vdev_alloc_bias = VDEV_BIAS_NONE;
+
 	tvd->vdev_stat.vs_alloc = svd->vdev_stat.vs_alloc;
 	tvd->vdev_stat.vs_space = svd->vdev_stat.vs_space;
 	tvd->vdev_stat.vs_dspace = svd->vdev_stat.vs_dspace;
@@ -940,6 +1094,32 @@ vdev_top_transfer(vdev_t *svd, vdev_t *tvd)
 	svd->vdev_stat.vs_alloc = 0;
 	svd->vdev_stat.vs_space = 0;
 	svd->vdev_stat.vs_dspace = 0;
+
+	/*
+	 * State which may be set on a top-level vdev that's in the
+	 * process of being removed.
+	 */
+	ASSERT0(tvd->vdev_indirect_config.vic_births_object);
+	ASSERT0(tvd->vdev_indirect_config.vic_mapping_object);
+	ASSERT3U(tvd->vdev_indirect_config.vic_prev_indirect_vdev, ==, -1ULL);
+	ASSERT3P(tvd->vdev_indirect_mapping, ==, NULL);
+	ASSERT3P(tvd->vdev_indirect_births, ==, NULL);
+	ASSERT3P(tvd->vdev_obsolete_sm, ==, NULL);
+	ASSERT0(tvd->vdev_removing);
+	tvd->vdev_removing = svd->vdev_removing;
+	tvd->vdev_indirect_config = svd->vdev_indirect_config;
+	tvd->vdev_indirect_mapping = svd->vdev_indirect_mapping;
+	tvd->vdev_indirect_births = svd->vdev_indirect_births;
+	range_tree_swap(&svd->vdev_obsolete_segments,
+	    &tvd->vdev_obsolete_segments);
+	tvd->vdev_obsolete_sm = svd->vdev_obsolete_sm;
+	svd->vdev_indirect_config.vic_mapping_object = 0;
+	svd->vdev_indirect_config.vic_births_object = 0;
+	svd->vdev_indirect_config.vic_prev_indirect_vdev = -1ULL;
+	svd->vdev_indirect_mapping = NULL;
+	svd->vdev_indirect_births = NULL;
+	svd->vdev_obsolete_sm = NULL;
+	svd->vdev_removing = 0;
 
 	for (t = 0; t < TXG_SIZE; t++) {
 		while ((msp = txg_list_remove(&svd->vdev_ms_list, t)) != NULL)
@@ -965,6 +1145,8 @@ vdev_top_transfer(vdev_t *svd, vdev_t *tvd)
 
 	tvd->vdev_islog = svd->vdev_islog;
 	svd->vdev_islog = 0;
+
+	dsl_scan_io_queue_vdev_xfer(svd, tvd);
 }
 
 static void
@@ -1060,6 +1242,55 @@ vdev_remove_parent(vdev_t *cvd)
 	vdev_free(mvd);
 }
 
+static void
+vdev_metaslab_group_create(vdev_t *vd)
+{
+	spa_t *spa = vd->vdev_spa;
+
+	/*
+	 * metaslab_group_create was delayed until allocation bias was available
+	 */
+	if (vd->vdev_mg == NULL) {
+		metaslab_class_t *mc;
+
+		if (vd->vdev_islog && vd->vdev_alloc_bias == VDEV_BIAS_NONE)
+			vd->vdev_alloc_bias = VDEV_BIAS_LOG;
+
+		ASSERT3U(vd->vdev_islog, ==,
+		    (vd->vdev_alloc_bias == VDEV_BIAS_LOG));
+
+		switch (vd->vdev_alloc_bias) {
+		case VDEV_BIAS_LOG:
+			mc = spa_log_class(spa);
+			break;
+		case VDEV_BIAS_SPECIAL:
+			mc = spa_special_class(spa);
+			break;
+		case VDEV_BIAS_DEDUP:
+			mc = spa_dedup_class(spa);
+			break;
+		default:
+			mc = spa_normal_class(spa);
+		}
+
+		vd->vdev_mg = metaslab_group_create(mc, vd,
+		    spa->spa_alloc_count);
+
+		/*
+		 * The spa ashift values currently only reflect the
+		 * general vdev classes. Class destination is late
+		 * binding so ashift checking had to wait until now
+		 */
+		if (vd->vdev_top == vd && vd->vdev_ashift != 0 &&
+		    mc == spa_normal_class(spa) && vd->vdev_aux == NULL) {
+			if (vd->vdev_ashift > spa->spa_max_ashift)
+				spa->spa_max_ashift = vd->vdev_ashift;
+			if (vd->vdev_ashift < spa->spa_min_ashift)
+				spa->spa_min_ashift = vd->vdev_ashift;
+		}
+	}
+}
+
 int
 vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 {
@@ -1070,6 +1301,7 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 	uint64_t newc = vd->vdev_asize >> vd->vdev_ms_shift;
 	metaslab_t **mspp;
 	int error;
+	boolean_t expanding = (oldc != 0);
 
 	ASSERT(txg == 0 || spa_config_held(spa, SCL_ALLOC, RW_WRITER));
 
@@ -1085,14 +1317,13 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 
 	mspp = kmem_zalloc(newc * sizeof (*mspp), KM_SLEEP);
 
-	if (oldc != 0) {
+	if (expanding) {
 		bcopy(vd->vdev_ms, mspp, oldc * sizeof (*mspp));
 		kmem_free(vd->vdev_ms, oldc * sizeof (*mspp));
 	}
 
 	vd->vdev_ms = mspp;
 	vd->vdev_ms_count = newc;
-
 	for (m = oldc; m < newc; m++) {
 		uint64_t object = 0;
 
@@ -1112,6 +1343,17 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 			}
 		}
 
+#ifndef _KERNEL
+		/*
+		 * To accomodate zdb_leak_init() fake indirect
+		 * metaslabs, we allocate a metaslab group for
+		 * indirect vdevs which normally don't have one.
+		 */
+		if (vd->vdev_mg == NULL) {
+			ASSERT0(vdev_is_concrete(vd));
+			vdev_metaslab_group_create(vd);
+		}
+#endif
 		error = metaslab_init(vd->vdev_mg, m, object, txg,
 		    &(vd->vdev_ms[m]));
 		if (error != 0) {
@@ -1129,8 +1371,9 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 	 * the metaslabs since we want to ensure that no new
 	 * allocations are performed on this device.
 	 */
-	if (oldc == 0 && !vd->vdev_removing)
+	if (!expanding && !vd->vdev_removing) {
 		metaslab_group_activate(vd->vdev_mg);
+	}
 
 	if (txg == 0)
 		spa_config_exit(spa, SCL_ALLOC, FTAG);
@@ -1141,13 +1384,28 @@ vdev_metaslab_init(vdev_t *vd, uint64_t txg)
 void
 vdev_metaslab_fini(vdev_t *vd)
 {
-	if (vd->vdev_ms != NULL) {
-		uint64_t count = vd->vdev_ms_count;
+	if (vd->vdev_checkpoint_sm != NULL) {
+		ASSERT(spa_feature_is_active(vd->vdev_spa,
+		    SPA_FEATURE_POOL_CHECKPOINT));
+		space_map_close(vd->vdev_checkpoint_sm);
+		/*
+		 * Even though we close the space map, we need to set its
+		 * pointer to NULL. The reason is that vdev_metaslab_fini()
+		 * may be called multiple times for certain operations
+		 * (i.e. when destroying a pool) so we need to ensure that
+		 * this clause never executes twice. This logic is similar
+		 * to the one used for the vdev_ms clause below.
+		 */
+		vd->vdev_checkpoint_sm = NULL;
+	}
 
-		metaslab_group_passivate(vd->vdev_mg);
+	if (vd->vdev_ms != NULL) {
+		metaslab_group_t *mg = vd->vdev_mg;
+		metaslab_group_passivate(mg);
+
+		uint64_t count = vd->vdev_ms_count;
 		for (uint64_t m = 0; m < count; m++) {
 			metaslab_t *msp = vd->vdev_ms[m];
-
 			if (msp != NULL)
 				metaslab_fini(msp);
 		}
@@ -1155,6 +1413,9 @@ vdev_metaslab_fini(vdev_t *vd)
 		vd->vdev_ms = NULL;
 
 		vd->vdev_ms_count = 0;
+
+		for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++)
+			ASSERT0(mg->mg_histogram[i]);
 	}
 	ASSERT0(vd->vdev_ms_count);
 }
@@ -1305,7 +1566,7 @@ vdev_probe(vdev_t *vd, zio_t *zio)
 	for (int l = 1; l < VDEV_LABELS; l++) {
 		zio_nowait(zio_read_phys(pio, vd,
 		    vdev_label_offset(vd->vdev_psize, l,
-		    offsetof(vdev_label_t, vl_pad2)), VDEV_PAD_SIZE,
+		    offsetof(vdev_label_t, vl_be)), VDEV_PAD_SIZE,
 		    abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE),
 		    ZIO_CHECKSUM_OFF, vdev_probe_done, vps,
 		    ZIO_PRIORITY_SYNC_READ, vps->vps_flags, B_TRUE));
@@ -1346,15 +1607,19 @@ vdev_open_children(vdev_t *vd)
 	taskq_t *tq;
 	int children = vd->vdev_children;
 
+	vd->vdev_nonrot = B_TRUE;
+
 	/*
 	 * in order to handle pools on top of zvols, do the opens
 	 * in a single thread so that the same thread holds the
 	 * spa_namespace_lock
 	 */
 	if (B_TRUE || vdev_uses_zvols(vd)) {
-		for (int c = 0; c < children; c++)
+		for (int c = 0; c < children; c++) {
 			vd->vdev_child[c]->vdev_open_error =
 			    vdev_open(vd->vdev_child[c]);
+			vd->vdev_nonrot &= vd->vdev_child[c]->vdev_nonrot;
+		}
 		return;
 	}
 	tq = taskq_create("vdev_open", children, minclsyspri,
@@ -1365,6 +1630,9 @@ vdev_open_children(vdev_t *vd)
 		    TQ_SLEEP) != 0);
 
 	taskq_destroy(tq);
+
+	for (int c = 0; c < children; c++)
+		vd->vdev_nonrot &= vd->vdev_child[c]->vdev_nonrot;
 }
 
 /*
@@ -1589,19 +1857,15 @@ vdev_open(vdev_t *vd)
 		return (error);
 	}
 
-	if (vd->vdev_top == vd && vd->vdev_ashift != 0 &&
-	    !vd->vdev_isl2cache && !vd->vdev_islog) {
-		if (vd->vdev_ashift > spa->spa_max_ashift)
-			spa->spa_max_ashift = vd->vdev_ashift;
-		if (vd->vdev_ashift < spa->spa_min_ashift)
-			spa->spa_min_ashift = vd->vdev_ashift;
-	}
-
 	/*
 	 * Track the min and max ashift values for normal data devices.
+	 *
+	 * DJB - TBD these should perhaps be tracked per allocation class
+	 * (e.g. spa_min_ashift is used to round up post compression buffers)
 	 */
 	if (vd->vdev_top == vd && vd->vdev_ashift != 0 &&
-	    !vd->vdev_islog && vd->vdev_aux == NULL) {
+	    vd->vdev_alloc_bias == VDEV_BIAS_NONE &&
+	    vd->vdev_aux == NULL) {
 		if (vd->vdev_ashift > spa->spa_max_ashift)
 			spa->spa_max_ashift = vd->vdev_ashift;
 		if (vd->vdev_ashift < spa->spa_min_ashift)
@@ -1658,8 +1922,11 @@ vdev_validate(vdev_t *vd)
 	/*
 	 * If we are performing an extreme rewind, we allow for a label that
 	 * was modified at a point after the current txg.
+	 * If config lock is not held do not check for the txg. spa_sync could
+	 * be updating the vdev's label before updating spa_last_synced_txg.
 	 */
-	if (spa->spa_extreme_rewind || spa_last_synced_txg(spa) == 0)
+	if (spa->spa_extreme_rewind || spa_last_synced_txg(spa) == 0 ||
+	    spa_config_held(spa, SCL_CONFIG, RW_WRITER) != SCL_CONFIG)
 		txg = UINT64_MAX;
 	else
 		txg = spa_last_synced_txg(spa);
@@ -1667,7 +1934,8 @@ vdev_validate(vdev_t *vd)
 	if ((label = vdev_label_read_config(vd, txg)) == NULL) {
 		vdev_set_state(vd, B_TRUE, VDEV_STATE_CANT_OPEN,
 		    VDEV_AUX_BAD_LABEL);
-		vdev_dbgmsg(vd, "vdev_validate: failed reading config");
+		vdev_dbgmsg(vd, "vdev_validate: failed reading config for "
+		    "txg %llu", (u_longlong_t)txg);
 		return (0);
 	}
 
@@ -2062,11 +2330,72 @@ vdev_create(vdev_t *vd, uint64_t txg, boolean_t isreplacing)
 void
 vdev_metaslab_set_size(vdev_t *vd)
 {
+	uint64_t asize = vd->vdev_asize;
+	uint64_t ms_count = asize >> zfs_vdev_default_ms_shift;
+	uint64_t ms_shift;
+
 	/*
-	 * Aim for roughly metaslabs_per_vdev (default 200) metaslabs per vdev.
+	 * There are two dimensions to the metaslab sizing calculation:
+	 * the size of the metaslab and the count of metaslabs per vdev.
+	 *
+	 * The default values used below are a good balance between memory
+	 * usage (larger metaslab size means more memory needed for loaded
+	 * metaslabs; more metaslabs means more memory needed for the
+	 * metaslab_t structs), metaslab load time (larger metaslabs take
+	 * longer to load), and metaslab sync time (more metaslabs means
+	 * more time spent syncing all of them).
+	 *
+	 * In general, we aim for zfs_vdev_default_ms_count (200) metaslabs.
+	 * The range of the dimensions are as follows:
+	 *
+	 *	2^29 <= ms_size  <= 2^34
+	 *	  16 <= ms_count <= 131,072
+	 *
+	 * On the lower end of vdev sizes, we aim for metaslabs sizes of
+	 * at least 512MB (2^29) to minimize fragmentation effects when
+	 * testing with smaller devices.  However, the count constraint
+	 * of at least 16 metaslabs will override this minimum size goal.
+	 *
+	 * On the upper end of vdev sizes, we aim for a maximum metaslab
+	 * size of 16GB.  However, we will cap the total count to 2^17
+	 * metaslabs to keep our memory footprint in check and let the
+	 * metaslab size grow from there if that limit is hit.
+	 *
+	 * The net effect of applying above constrains is summarized below.
+	 *
+	 *   vdev size	    metaslab count
+	 *  --------------|-----------------
+	 *	< 8GB		~16
+	 *  8GB   - 100GB	one per 512MB
+	 *  100GB - 3TB		~200
+	 *  3TB   - 2PB		one per 16GB
+	 *	> 2PB		~131,072
+	 *  --------------------------------
+	 *
+	 *  Finally, note that all of the above calculate the initial
+	 *  number of metaslabs. Expanding a top-level vdev will result
+	 *  in additional metaslabs being allocated making it possible
+	 *  to exceed the zfs_vdev_ms_count_limit.
 	 */
-	vd->vdev_ms_shift = highbit64(vd->vdev_asize / metaslabs_per_vdev);
-	vd->vdev_ms_shift = MAX(vd->vdev_ms_shift, SPA_MAXBLOCKSHIFT);
+
+	if (ms_count < zfs_vdev_min_ms_count)
+		ms_shift = highbit64(asize / zfs_vdev_min_ms_count);
+	else if (ms_count > zfs_vdev_default_ms_count)
+		ms_shift = highbit64(asize / zfs_vdev_default_ms_count);
+	else
+		ms_shift = zfs_vdev_default_ms_shift;
+
+	if (ms_shift < SPA_MAXBLOCKSHIFT) {
+		ms_shift = SPA_MAXBLOCKSHIFT;
+	} else if (ms_shift > zfs_vdev_max_ms_shift) {
+		ms_shift = zfs_vdev_max_ms_shift;
+		/* cap the total count to constrain memory footprint */
+		if ((asize >> ms_shift) > zfs_vdev_ms_count_limit)
+			ms_shift = highbit64(asize / zfs_vdev_ms_count_limit);
+	}
+
+	vd->vdev_ms_shift = ms_shift;
+	ASSERT3U(vd->vdev_ms_shift, >=, SPA_MAXBLOCKSHIFT);
 }
 
 /*
@@ -2199,7 +2528,7 @@ vdev_dtl_contains(vdev_t *vd, vdev_dtl_type_t t, uint64_t txg, uint64_t size)
 		return (B_FALSE);
 
 	mutex_enter(&vd->vdev_dtl_lock);
-	if (range_tree_space(rt) != 0)
+	if (!range_tree_is_empty(rt))
 		dirty = range_tree_contains(rt, txg, size);
 	mutex_exit(&vd->vdev_dtl_lock);
 
@@ -2213,10 +2542,25 @@ vdev_dtl_empty(vdev_t *vd, vdev_dtl_type_t t)
 	boolean_t empty;
 
 	mutex_enter(&vd->vdev_dtl_lock);
-	empty = (range_tree_space(rt) == 0);
+	empty = range_tree_is_empty(rt);
 	mutex_exit(&vd->vdev_dtl_lock);
 
 	return (empty);
+}
+
+/*
+ * Returns B_TRUE if vdev determines offset needs to be resilvered.
+ */
+boolean_t
+vdev_dtl_need_resilver(vdev_t *vd, uint64_t offset, size_t psize)
+{
+        ASSERT(vd != vd->vdev_spa->spa_root_vdev);
+
+        if (vd->vdev_ops->vdev_op_need_resilver == NULL ||
+            vd->vdev_ops->vdev_op_leaf)
+                return (B_TRUE);
+
+        return (vd->vdev_ops->vdev_op_need_resilver(vd, offset, psize));
 }
 
 /*
@@ -2272,7 +2616,7 @@ vdev_dtl_should_excise(vdev_t *vd)
 		return (B_FALSE);
 
 	if (vd->vdev_resilver_txg == 0 ||
-	    range_tree_space(vd->vdev_dtl[DTL_MISSING]) == 0)
+	    range_tree_is_empty(vd->vdev_dtl[DTL_MISSING]))
 		return (B_TRUE);
 
 	/*
@@ -2370,8 +2714,8 @@ vdev_dtl_reassess(vdev_t *vd, uint64_t txg, uint64_t scrub_txg, int scrub_done)
 		 * the top level so that we persist the change.
 		 */
 		if (vd->vdev_resilver_txg != 0 &&
-		    range_tree_space(vd->vdev_dtl[DTL_MISSING]) == 0 &&
-		    range_tree_space(vd->vdev_dtl[DTL_OUTAGE]) == 0) {
+		    range_tree_is_empty(vd->vdev_dtl[DTL_MISSING]) &&
+		    range_tree_is_empty(vd->vdev_dtl[DTL_OUTAGE])) {
 			vd->vdev_resilver_txg = 0;
 			vdev_config_dirty(vd->vdev_top);
 		}
@@ -2425,13 +2769,6 @@ vdev_dtl_load(vdev_t *vd)
 		ASSERT(vd->vdev_dtl_sm != NULL);
 
 		mutex_enter(&vd->vdev_dtl_lock);
-
-		/*
-		 * Now that we've opened the space_map we need to update
-		 * the in-core DTL.
-		 */
-		space_map_update(vd->vdev_dtl_sm);
-
 		error = space_map_load(vd->vdev_dtl_sm,
 		    vd->vdev_dtl[DTL_MISSING], SM_ALLOC);
 		mutex_exit(&vd->vdev_dtl_lock);
@@ -2446,6 +2783,30 @@ vdev_dtl_load(vdev_t *vd)
 	}
 
 	return (error);
+}
+
+static void
+vdev_zap_allocation_data(vdev_t *vd, dmu_tx_t *tx)
+{
+	spa_t *spa = vd->vdev_spa;
+	objset_t *mos = spa->spa_meta_objset;
+	vdev_alloc_bias_t alloc_bias = vd->vdev_alloc_bias;
+	const char *string;
+
+	ASSERT(alloc_bias != VDEV_BIAS_NONE);
+
+	string =
+	    (alloc_bias == VDEV_BIAS_LOG) ? VDEV_ALLOC_BIAS_LOG :
+	    (alloc_bias == VDEV_BIAS_SPECIAL) ? VDEV_ALLOC_BIAS_SPECIAL :
+	    (alloc_bias == VDEV_BIAS_DEDUP) ? VDEV_ALLOC_BIAS_DEDUP : NULL;
+
+	ASSERT(string != NULL);
+	VERIFY0(zap_add(mos, vd->vdev_top_zap, VDEV_TOP_ZAP_ALLOCATION_BIAS,
+	    1, strlen(string) + 1, string, tx));
+
+	if (alloc_bias == VDEV_BIAS_SPECIAL || alloc_bias == VDEV_BIAS_DEDUP) {
+		spa_activate_allocation_classes(spa, tx);
+	}
 }
 
 void
@@ -2484,8 +2845,11 @@ vdev_construct_zaps(vdev_t *vd, dmu_tx_t *tx)
 		}
 		if (vd == vd->vdev_top && vd->vdev_top_zap == 0) {
 			vd->vdev_top_zap = vdev_create_link_zap(vd, tx);
+			if (vd->vdev_alloc_bias != VDEV_BIAS_NONE)
+				vdev_zap_allocation_data(vd, tx);
 		}
 	}
+
 	for (uint64_t i = 0; i < vd->vdev_children; i++) {
 		vdev_construct_zaps(vd->vdev_child[i], tx);
 	}
@@ -2531,7 +2895,7 @@ vdev_dtl_sync(vdev_t *vd, uint64_t txg)
 	if (vd->vdev_dtl_sm == NULL) {
 		uint64_t new_object;
 
-		new_object = space_map_alloc(mos, tx);
+		new_object = space_map_alloc(mos, vdev_dtl_sm_blksz, tx);
 		VERIFY3U(new_object, !=, 0);
 
 		VERIFY0(space_map_open(&vd->vdev_dtl_sm, mos, new_object,
@@ -2545,8 +2909,8 @@ vdev_dtl_sync(vdev_t *vd, uint64_t txg)
 	range_tree_walk(rt, range_tree_add, rtsync);
 	mutex_exit(&vd->vdev_dtl_lock);
 
-	space_map_truncate(vd->vdev_dtl_sm, tx);
-	space_map_write(vd->vdev_dtl_sm, rtsync, SM_ALLOC, tx);
+	space_map_truncate(vd->vdev_dtl_sm, vdev_dtl_sm_blksz, tx);
+	space_map_write(vd->vdev_dtl_sm, rtsync, SM_ALLOC, SM_NO_VDEVID, tx);
 	range_tree_vacate(rtsync, NULL, NULL);
 
 	range_tree_destroy(rtsync);
@@ -2564,10 +2928,6 @@ vdev_dtl_sync(vdev_t *vd, uint64_t txg)
 	}
 
 	dmu_tx_commit(tx);
-
-	mutex_enter(&vd->vdev_dtl_lock);
-	space_map_update(vd->vdev_dtl_sm);
-	mutex_exit(&vd->vdev_dtl_lock);
 }
 
 /*
@@ -2616,7 +2976,7 @@ vdev_resilver_needed(vdev_t *vd, uint64_t *minp, uint64_t *maxp)
 
 	if (vd->vdev_children == 0) {
 		mutex_enter(&vd->vdev_dtl_lock);
-		if (range_tree_space(vd->vdev_dtl[DTL_MISSING]) != 0 &&
+		if (!range_tree_is_empty(vd->vdev_dtl[DTL_MISSING]) &&
 		    vdev_writeable(vd)) {
 
 			thismin = vdev_dtl_min(vd);
@@ -2644,6 +3004,28 @@ vdev_resilver_needed(vdev_t *vd, uint64_t *minp, uint64_t *maxp)
 	return (needed);
 }
 
+/*
+ * Gets the checkpoint space map object from the vdev's ZAP.
+ * Returns the spacemap object, or 0 if it wasn't in the ZAP
+ * or the ZAP doesn't exist yet.
+ */
+int
+vdev_checkpoint_sm_object(vdev_t *vd)
+{
+	ASSERT0(spa_config_held(vd->vdev_spa, SCL_ALL, RW_WRITER));
+	if (vd->vdev_top_zap == 0) {
+		return (0);
+	}
+
+	uint64_t sm_obj = 0;
+	int err = zap_lookup(spa_meta_objset(vd->vdev_spa), vd->vdev_top_zap,
+	    VDEV_TOP_ZAP_POOL_CHECKPOINT_SM, sizeof (uint64_t), 1, &sm_obj);
+
+	ASSERT(err == 0 || err == ENOENT);
+
+	return (sm_obj);
+}
+
 int
 vdev_load(vdev_t *vd)
 {
@@ -2661,9 +3043,26 @@ vdev_load(vdev_t *vd)
 	vdev_set_deflate_ratio(vd);
 
 	/*
+	 * On spa_load path, grab the allocation bias from our zap
+	 */
+	if (vd == vd->vdev_top && vd->vdev_top_zap != 0) {
+		spa_t *spa = vd->vdev_spa;
+		char bias_str[64];
+
+		if (zap_lookup(spa->spa_meta_objset, vd->vdev_top_zap,
+		    VDEV_TOP_ZAP_ALLOCATION_BIAS, 1, sizeof (bias_str),
+		    bias_str) == 0) {
+			ASSERT(vd->vdev_alloc_bias == VDEV_BIAS_NONE);
+			vd->vdev_alloc_bias = vdev_derive_alloc_bias(bias_str);
+		}
+	}
+
+	/*
 	 * If this is a top-level vdev, initialize its metaslabs.
 	 */
 	if (vd == vd->vdev_top && vdev_is_concrete(vd)) {
+		vdev_metaslab_group_create(vd);
+
 		if (vd->vdev_ashift == 0 || vd->vdev_asize == 0) {
 			vdev_set_state(vd, B_FALSE, VDEV_STATE_CANT_OPEN,
 			    VDEV_AUX_CORRUPT_DATA);
@@ -2671,12 +3070,45 @@ vdev_load(vdev_t *vd)
 			    "asize=%llu", (u_longlong_t)vd->vdev_ashift,
 			    (u_longlong_t)vd->vdev_asize);
 			return (SET_ERROR(ENXIO));
-		} else if ((error = vdev_metaslab_init(vd, 0)) != 0) {
+		}
+
+		error = vdev_metaslab_init(vd, 0);
+		if (error != 0) {
 			vdev_dbgmsg(vd, "vdev_load: metaslab_init failed "
 			    "[error=%d]", error);
 			vdev_set_state(vd, B_FALSE, VDEV_STATE_CANT_OPEN,
 			    VDEV_AUX_CORRUPT_DATA);
 			return (error);
+		}
+
+		uint64_t checkpoint_sm_obj = vdev_checkpoint_sm_object(vd);
+		if (checkpoint_sm_obj != 0) {
+			objset_t *mos = spa_meta_objset(vd->vdev_spa);
+			ASSERT(vd->vdev_asize != 0);
+			ASSERT3P(vd->vdev_checkpoint_sm, ==, NULL);
+
+			error = space_map_open(&vd->vdev_checkpoint_sm,
+			    mos, checkpoint_sm_obj, 0, vd->vdev_asize,
+			    vd->vdev_ashift);
+			if (error != 0) {
+				vdev_dbgmsg(vd, "vdev_load: space_map_open "
+				    "failed for checkpoint spacemap (obj %llu) "
+				    "[error=%d]",
+				    (u_longlong_t)checkpoint_sm_obj, error);
+				return (error);
+			}
+			ASSERT3P(vd->vdev_checkpoint_sm, !=, NULL);
+
+			/*
+			 * Since the checkpoint_sm contains free entries
+			 * exclusively we can use space_map_allocated() to
+			 * indicate the cumulative checkpointed space that
+			 * has been freed.
+			 */
+			vd->vdev_stat.vs_checkpoint_space =
+			    -space_map_allocated(vd->vdev_checkpoint_sm);
+			vd->vdev_spa->spa_checkpoint_info.sci_dspace +=
+			    vd->vdev_stat.vs_checkpoint_space;
 		}
 	}
 
@@ -2695,7 +3127,7 @@ vdev_load(vdev_t *vd)
 	if (obsolete_sm_object != 0) {
 		objset_t *mos = vd->vdev_spa->spa_meta_objset;
 		ASSERT(vd->vdev_asize != 0);
-		ASSERT(vd->vdev_obsolete_sm == NULL);
+		ASSERT3P(vd->vdev_obsolete_sm, ==, NULL);
 
 		if ((error = space_map_open(&vd->vdev_obsolete_sm, mos,
 		    obsolete_sm_object, 0, vd->vdev_asize, 0))) {
@@ -2706,7 +3138,6 @@ vdev_load(vdev_t *vd)
 			    (u_longlong_t)obsolete_sm_object, error);
 			return (error);
 		}
-		space_map_update(vd->vdev_obsolete_sm);
 	}
 
 	return (0);
@@ -2785,55 +3216,22 @@ vdev_destroy_spacemaps(vdev_t *vd, dmu_tx_t *tx)
 }
 
 static void
-vdev_remove_empty(vdev_t *vd, uint64_t txg)
+vdev_remove_empty_log(vdev_t *vd, uint64_t txg)
 {
 	spa_t *spa = vd->vdev_spa;
-	dmu_tx_t *tx;
 
+	ASSERT(vd->vdev_islog);
 	ASSERT(vd == vd->vdev_top);
 	ASSERT3U(txg, ==, spa_syncing_txg(spa));
 
-	if (vd->vdev_ms != NULL) {
-		metaslab_group_t *mg = vd->vdev_mg;
+	dmu_tx_t *tx = dmu_tx_create_assigned(spa_get_dsl(spa), txg);
 
-		metaslab_group_histogram_verify(mg);
-		metaslab_class_histogram_verify(mg->mg_class);
-
-		for (int m = 0; m < vd->vdev_ms_count; m++) {
-			metaslab_t *msp = vd->vdev_ms[m];
-
-			if (msp == NULL || msp->ms_sm == NULL)
-				continue;
-
-			mutex_enter(&msp->ms_lock);
-			/*
-			 * If the metaslab was not loaded when the vdev
-			 * was removed then the histogram accounting may
-			 * not be accurate. Update the histogram information
-			 * here so that we ensure that the metaslab group
-			 * and metaslab class are up-to-date.
-			 */
-			metaslab_group_histogram_remove(mg, msp);
-
-			VERIFY0(space_map_allocated(msp->ms_sm));
-			space_map_close(msp->ms_sm);
-			msp->ms_sm = NULL;
-			mutex_exit(&msp->ms_lock);
-		}
-
-		metaslab_group_histogram_verify(mg);
-		metaslab_class_histogram_verify(mg->mg_class);
-		for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++)
-			ASSERT0(mg->mg_histogram[i]);
-	}
-
-	tx = dmu_tx_create_assigned(spa_get_dsl(spa), txg);
 	vdev_destroy_spacemaps(vd, tx);
-
-	if (vd->vdev_islog && vd->vdev_top_zap != 0) {
+	if (vd->vdev_top_zap != 0) {
 		vdev_destroy_unlink_zap(vd, vd->vdev_top_zap, tx);
 		vd->vdev_top_zap = 0;
 	}
+
 	dmu_tx_commit(tx);
 }
 
@@ -2845,7 +3243,8 @@ vdev_sync_done(vdev_t *vd, uint64_t txg)
 
 	ASSERT(vdev_is_concrete(vd));
 
-	while (msp = txg_list_remove(&vd->vdev_ms_list, TXG_CLEAN(txg)))
+	while ((msp = txg_list_remove(&vd->vdev_ms_list, TXG_CLEAN(txg)))
+	    != NULL)
 		metaslab_sync_done(msp, txg);
 
 	if (reassess)
@@ -2858,17 +3257,14 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 	spa_t *spa = vd->vdev_spa;
 	vdev_t *lvd;
 	metaslab_t *msp;
-	dmu_tx_t *tx;
 
+	ASSERT3U(txg, ==, spa->spa_syncing_txg);
+	dmu_tx_t *tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
 	if (range_tree_space(vd->vdev_obsolete_segments) > 0) {
-		dmu_tx_t *tx;
-
 		ASSERT(vd->vdev_removing ||
 		    vd->vdev_ops == &vdev_indirect_ops);
 
-		tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
 		vdev_indirect_sync_obsolete(vd, tx);
-		dmu_tx_commit(tx);
 
 		/*
 		 * If the vdev is indirect, it can't have dirty
@@ -2877,6 +3273,7 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 		if (vd->vdev_ops == &vdev_indirect_ops) {
 			ASSERT(txg_list_empty(&vd->vdev_ms_list, txg));
 			ASSERT(txg_list_empty(&vd->vdev_dtl_list, txg));
+			dmu_tx_commit(tx);
 			return;
 		}
 	}
@@ -2887,12 +3284,10 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 	    !vd->vdev_removing) {
 		ASSERT(vd == vd->vdev_top);
 		ASSERT0(vd->vdev_indirect_config.vic_mapping_object);
-		tx = dmu_tx_create_assigned(spa->spa_dsl_pool, txg);
 		vd->vdev_ms_array = dmu_object_alloc(spa->spa_meta_objset,
 		    DMU_OT_OBJECT_ARRAY, 0, DMU_OT_NONE, 0, tx);
 		ASSERT(vd->vdev_ms_array != 0);
 		vdev_config_dirty(vd);
-		dmu_tx_commit(tx);
 	}
 
 	while ((msp = txg_list_remove(&vd->vdev_ms_list, txg)) != NULL) {
@@ -2904,16 +3299,14 @@ vdev_sync(vdev_t *vd, uint64_t txg)
 		vdev_dtl_sync(lvd, txg);
 
 	/*
-	 * Remove the metadata associated with this vdev once it's empty.
-	 * Note that this is typically used for log/cache device removal;
-	 * we don't empty toplevel vdevs when removing them.  But if
-	 * a toplevel happens to be emptied, this is not harmful.
+	 * If this is an empty log device being removed, destroy the
+	 * metadata associated with it.
 	 */
-	if (vd->vdev_stat.vs_alloc == 0 && vd->vdev_removing) {
-		vdev_remove_empty(vd, txg);
-	}
+	if (vd->vdev_islog && vd->vdev_stat.vs_alloc == 0 && vd->vdev_removing)
+		vdev_remove_empty_log(vd, txg);
 
 	(void) txg_list_add(&spa->spa_vdev_txg_list, vd, TXG_CLEAN(txg));
+	dmu_tx_commit(tx);
 }
 
 uint64_t
@@ -3071,6 +3464,15 @@ vdev_online(spa_t *spa, uint64_t guid, uint64_t flags, vdev_state_t *newstate)
 		spa_async_request(spa, SPA_ASYNC_CONFIG_UPDATE);
 	}
 
+	/* Restart initializing if necessary */
+	mutex_enter(&vd->vdev_initialize_lock);
+	if (vdev_writeable(vd) &&
+	    vd->vdev_initialize_thread == NULL &&
+	    vd->vdev_initialize_state == VDEV_INITIALIZE_ACTIVE) {
+		(void) vdev_initialize(vd);
+	}
+	mutex_exit(&vd->vdev_initialize_lock);
+
 	if (wasoffline ||
 	    (oldstate < VDEV_STATE_DEGRADED &&
 	    vd->vdev_state >= VDEV_STATE_DEGRADED))
@@ -3127,6 +3529,15 @@ top:
 			(void) spa_vdev_state_exit(spa, vd, 0);
 
 			error = spa_reset_logs(spa);
+
+			/*
+			 * If the log device was successfully reset but has
+			 * checkpointed data, do not offline it.
+			 */
+			if (error == 0 &&
+			    tvd->vdev_checkpoint_sm != NULL) {
+				error = ZFS_ERR_CHECKPOINT_EXISTS;
+			}
 
 			spa_vdev_state_enter(spa, SCL_ALLOC);
 
@@ -3328,6 +3739,27 @@ vdev_accessible(vdev_t *vd, zio_t *zio)
 	return (B_TRUE);
 }
 
+boolean_t
+vdev_is_spacemap_addressable(vdev_t *vd)
+{
+	if (spa_feature_is_active(vd->vdev_spa, SPA_FEATURE_SPACEMAP_V2))
+		return (B_TRUE);
+
+	/*
+	 * If double-word space map entries are not enabled we assume
+	 * 47 bits of the space map entry are dedicated to the entry's
+	 * offset (see SM_OFFSET_BITS in space_map.h). We then use that
+	 * to calculate the maximum address that can be described by a
+	 * space map entry for the given device.
+	 */
+	uint64_t shift = vd->vdev_ashift + SM_OFFSET_BITS;
+
+	if (shift >= 63) /* detect potential overflow */
+		return (B_TRUE);
+
+	return (vd->vdev_asize < (1ULL << shift));
+}
+
 /*
  * Get statistics for the given vdev.
  */
@@ -3345,8 +3777,18 @@ vdev_get_stats(vdev_t *vd, vdev_stat_t *vs)
 	vs->vs_timestamp = gethrtime() - vs->vs_timestamp;
 	vs->vs_state = vd->vdev_state;
 	vs->vs_rsize = vdev_get_min_asize(vd);
-	if (vd->vdev_ops->vdev_op_leaf)
+	if (vd->vdev_ops->vdev_op_leaf) {
 		vs->vs_rsize += VDEV_LABEL_START_SIZE + VDEV_LABEL_END_SIZE;
+		/*
+		 * Report intializing progress. Since we don't have the
+		 * initializing locks held, this is only an estimate (although a
+		 * fairly accurate one).
+		 */
+		vs->vs_initialize_bytes_done = vd->vdev_initialize_bytes_done;
+		vs->vs_initialize_bytes_est = vd->vdev_initialize_bytes_est;
+		vs->vs_initialize_state = vd->vdev_initialize_state;
+		vs->vs_initialize_action_time = vd->vdev_initialize_action_time;
+	}
 	/*
 	 * Report expandable space on top-level, non-auxillary devices only.
 	 * The expandable space is reported in terms of metaslab sized units
@@ -3362,7 +3804,8 @@ vdev_get_stats(vdev_t *vd, vdev_stat_t *vs)
 	vs->vs_physical_ashift = vd->vdev_physical_ashift;
 	if (vd->vdev_aux == NULL && vd == vd->vdev_top &&
 	    vdev_is_concrete(vd)) {
-		vs->vs_fragmentation = vd->vdev_mg->mg_fragmentation;
+		vs->vs_fragmentation = (vd->vdev_mg != NULL) ?
+		    vd->vdev_mg->mg_fragmentation : 0;
 	}
 
 	/*
@@ -3548,19 +3991,25 @@ vdev_stat_update(zio_t *zio, uint64_t psize)
 	}
 }
 
+int64_t
+vdev_deflated_space(vdev_t *vd, int64_t space)
+{
+	ASSERT((space & (SPA_MINBLOCKSIZE-1)) == 0);
+	ASSERT(vd->vdev_deflate_ratio != 0 || vd->vdev_isl2cache);
+
+	return ((space >> SPA_MINBLOCKSHIFT) * vd->vdev_deflate_ratio);
+}
+
 /*
- * Update the in-core space usage stats for this vdev, its metaslab class,
- * and the root vdev.
+ * Update the in-core space usage stats for this vdev and the root vdev.
  */
 void
 vdev_space_update(vdev_t *vd, int64_t alloc_delta, int64_t defer_delta,
     int64_t space_delta)
 {
-	int64_t dspace_delta = space_delta;
+	int64_t dspace_delta;
 	spa_t *spa = vd->vdev_spa;
 	vdev_t *rvd = spa->spa_root_vdev;
-	metaslab_group_t *mg = vd->vdev_mg;
-	metaslab_class_t *mc = mg ? mg->mg_class : NULL;
 
 	ASSERT(vd == vd->vdev_top);
 
@@ -3570,10 +4019,7 @@ vdev_space_update(vdev_t *vd, int64_t alloc_delta, int64_t defer_delta,
 	 * because the root vdev's psize-to-asize is simply the max of its
 	 * childrens', thus not accurate enough for us.
 	 */
-	ASSERT((dspace_delta & (SPA_MINBLOCKSIZE-1)) == 0);
-	ASSERT(vd->vdev_deflate_ratio != 0 || vd->vdev_isl2cache);
-	dspace_delta = (dspace_delta >> SPA_MINBLOCKSHIFT) *
-	    vd->vdev_deflate_ratio;
+	dspace_delta = vdev_deflated_space(vd, space_delta);
 
 	mutex_enter(&vd->vdev_stat_lock);
 	vd->vdev_stat.vs_alloc += alloc_delta;
@@ -3581,21 +4027,15 @@ vdev_space_update(vdev_t *vd, int64_t alloc_delta, int64_t defer_delta,
 	vd->vdev_stat.vs_dspace += dspace_delta;
 	mutex_exit(&vd->vdev_stat_lock);
 
-	if (mc == spa_normal_class(spa)) {
+	/* every class but log contributes to root space stats */
+	if (vd->vdev_mg != NULL && !vd->vdev_islog) {
 		mutex_enter(&rvd->vdev_stat_lock);
 		rvd->vdev_stat.vs_alloc += alloc_delta;
 		rvd->vdev_stat.vs_space += space_delta;
 		rvd->vdev_stat.vs_dspace += dspace_delta;
 		mutex_exit(&rvd->vdev_stat_lock);
 	}
-
-	if (mc != NULL) {
-		ASSERT(rvd == vd->vdev_parent);
-		ASSERT(vd->vdev_ms_count != 0);
-
-		metaslab_class_space_update(mc,
-		    alloc_delta, defer_delta, space_delta, dspace_delta);
-	}
+	/* Note: metaslab_class_space_update moved to metaslab_space_update */
 }
 
 /*
@@ -4007,11 +4447,13 @@ vdev_expand(vdev_t *vd, uint64_t txg)
 {
 	ASSERT(vd->vdev_top == vd);
 	ASSERT(spa_config_held(vd->vdev_spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+	ASSERT(vdev_is_concrete(vd));
 
 	vdev_set_deflate_ratio(vd);
 
 	if ((vd->vdev_asize >> vd->vdev_ms_shift) > vd->vdev_ms_count &&
 	    vdev_is_concrete(vd)) {
+		vdev_metaslab_group_create(vd);
 		VERIFY(vdev_metaslab_init(vd, txg) == 0);
 		vdev_config_dirty(vd);
 	}

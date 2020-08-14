@@ -1,5 +1,5 @@
 #-
-# Copyright (c) 2016 Ruslan Bukin <br@bsdpad.com>
+# Copyright (c) 2016-2019 Ruslan Bukin <br@bsdpad.com>
 # All rights reserved.
 #
 # This software was developed by SRI International and the University of
@@ -43,19 +43,40 @@
 INTERFACE xdma;
 
 #
-# Prepare a channel for cyclic transfer.
+# Request a transfer.
 #
-METHOD int channel_prep_cyclic {
+METHOD int channel_request {
+	device_t		dev;
+	struct xdma_channel	*xchan;
+	struct xdma_request	*req;
+};
+
+#
+# Prepare xDMA channel for a scatter-gather transfer.
+#
+METHOD int channel_prep_sg {
 	device_t		dev;
 	struct xdma_channel	*xchan;
 };
 
 #
-# Prepare a channel for memcpy transfer.
+# Query DMA engine driver for the amount of free entries
+# (descriptors) are available.
 #
-METHOD int channel_prep_memcpy {
-	device_t		dev;
-	struct xdma_channel	*xchan;
+METHOD int channel_capacity {
+	device_t			dev;
+	struct xdma_channel		*xchan;
+	uint32_t			*capacity;
+};
+
+#
+# Submit sglist list to DMA engine driver.
+#
+METHOD int channel_submit_sg {
+	device_t			dev;
+	struct xdma_channel		*xchan;
+	struct xdma_sglist		*sg;
+	uint32_t			sg_n;
 };
 
 #
@@ -77,7 +98,7 @@ METHOD int channel_alloc {
 };
 
 #
-# Free the channel, including descriptors.
+# Free the real hardware channel.
 #
 METHOD int channel_free {
 	device_t dev;
@@ -91,4 +112,41 @@ METHOD int channel_control {
 	device_t dev;
 	struct xdma_channel *xchan;
 	int cmd;
+};
+
+# IOMMU interface
+
+#
+# pmap is initialized
+#
+METHOD int iommu_init {
+	device_t dev;
+	struct xdma_iommu *xio;
+};
+
+#
+# pmap is released
+#
+METHOD int iommu_release {
+	device_t dev;
+	struct xdma_iommu *xio;
+};
+
+#
+# Mapping entered
+#
+METHOD int iommu_enter {
+	device_t dev;
+	struct xdma_iommu *xio;
+	vm_offset_t va;
+	vm_offset_t pa;
+};
+
+#
+# Mapping removed
+#
+METHOD int iommu_remove {
+	device_t dev;
+	struct xdma_iommu *xio;
+	vm_offset_t va;
 };

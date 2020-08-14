@@ -128,7 +128,7 @@ typedef char s_char;
 #define MAX_TTL		8	/* max ttl mapping vector size */
 #define	BEACON		7200	/* manycast beacon interval */
 #define NTP_MAXEXTEN	2048	/* max extension field size */
-#define	NTP_ORPHWAIT	300	/* orphan wair (s) */
+#define	NTP_ORPHWAIT	300	/* orphan wait (s) */
 
 /*
  * Miscellaneous stuff
@@ -359,6 +359,7 @@ struct peer {
 	l_fp	aorg;		/* origin timestamp */
 	l_fp	borg;		/* alternate origin timestamp */
 	l_fp	bxmt;		/* most recent broadcast transmit timestamp */
+	l_fp	nonce;		/* Value of nonce we sent as the xmt stamp */
 	double	offset;		/* peer clock offset */
 	double	delay;		/* peer roundtrip delay */
 	double	jitter;		/* peer jitter (squares) */
@@ -466,6 +467,7 @@ struct peer {
 # define FLAG_ASSOC	0x8000	/* autokey request */
 #endif /* OPENSSL */
 #define FLAG_TSTAMP_PPS	0x10000	/* PPS source provides absolute timestamp */
+#define FLAG_LOOPNONCE	0x20000	/* Use a nonce for the loopback test */
 
 /*
  * Definitions for the clear() routine.  We use memset() to clear
@@ -609,6 +611,18 @@ struct pkt {
 
 #define	STRATUM_TO_PKT(s)	((u_char)(((s) == (STRATUM_UNSPEC)) ?\
 				(STRATUM_PKT_UNSPEC) : (s)))
+
+
+/*
+ * A test to determine if the refid should be interpreted as text string.
+ * This is usually the case for a refclock, which has stratum 0 internally,
+ * which results in sys_stratum 1 if the refclock becomes system peer, or
+ * in case of a kiss-of-death (KoD) packet that has STRATUM_PKT_UNSPEC (==0)
+ * in the packet which is converted to STRATUM_UNSPEC when the packet
+ * is evaluated.
+ */
+#define REFID_ISTEXT(s) (((s) <= 1) || ((s) >= STRATUM_UNSPEC))
+
 
 /*
  * Event codes. Used for reporting errors/events to the control module
@@ -829,6 +843,7 @@ struct restrict_u_tag {
 	u_short		rflags;		/* restrict (accesslist) flags */
 	u_short		mflags;		/* match flags */
 	short		ippeerlimit;	/* IP peer limit */
+	int		srvfuzrftpoll;	/* server response: fuzz reftime */
 	u_long		expire;		/* valid until time */
 	union {				/* variant starting here */
 		res_addr4 v4;
@@ -873,13 +888,16 @@ char *build_rflags(u_short rflags);
 #define	RES_MSSNTP		0x1000	/* enable MS-SNTP authentication */
 #define	RES_FLAKE		0x2000	/* flakeway - drop 10% */
 #define	RES_NOMRULIST		0x4000	/* mode 6 mrulist denied */
-#define RES_UNUSED		0x8000	/* Unused flag bits */
+
+#define	RES_SRVRSPFUZ		0x8000	/* Server response: fuzz */
+
+#define RES_UNUSED		0x0000	/* Unused flag bits (none left) */
 
 #define	RES_ALLFLAGS		(RES_FLAGS | RES_NOQUERY |	\
 				 RES_NOMODIFY | RES_NOTRAP |	\
 				 RES_LPTRAP | RES_KOD |		\
 				 RES_MSSNTP | RES_FLAKE |	\
-				 RES_NOMRULIST)
+				 RES_NOMRULIST | RES_SRVRSPFUZ )
 
 /*
  * Match flags (mflags)

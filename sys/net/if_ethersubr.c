@@ -42,17 +42,21 @@
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/eventhandler.h>
+#include <sys/jail.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mbuf.h>
+#include <sys/proc.h>
+#include <sys/priv.h>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
 #include <sys/uuid.h>
 
+#include <net/ieee_oui.h>
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_arp.h>
@@ -84,12 +88,14 @@
 #endif
 #include <security/mac/mac_framework.h>
 
+#include <crypto/sha1.h>
+
 #ifdef CTASSERT
 CTASSERT(sizeof (struct ether_header) == ETHER_ADDR_LEN * 2 + 2);
 CTASSERT(sizeof (struct ether_addr) == ETHER_ADDR_LEN);
 #endif
 
-VNET_DEFINE(struct pfil_head, link_pfil_hook);	/* Packet filter hooks */
+VNET_DEFINE(pfil_head_t, link_pfil_head);	/* Packet filter hooks */
 
 /* netgraph node hooks for ng_ether(4) */
 void	(*ng_ether_input_p)(struct ifnet *ifp, struct mbuf **mp);
@@ -101,9 +107,6 @@ void	(*ng_ether_detach_p)(struct ifnet *ifp);
 void	(*vlan_input_p)(struct ifnet *, struct mbuf *);
 
 /* if_bridge(4) support */
-struct mbuf *(*bridge_input_p)(struct ifnet *, struct mbuf *); 
-int	(*bridge_output_p)(struct ifnet *, struct mbuf *, 
-		struct sockaddr *, struct rtentry *);
 void	(*bridge_dn_p)(struct mbuf *, struct ifnet *);
 
 /* if_lagg(4) support */
@@ -437,6 +440,19 @@ bad:			if (m != NULL)
 	return ether_output_frame(ifp, m);
 }
 
+static bool
+ether_set_pcp(struct mbuf **mp, struct ifnet *ifp, uint8_t pcp)
+{
+	struct ether_header *eh;
+
+	eh = mtod(*mp, struct ether_header *);
+	if (ntohs(eh->ether_type) == ETHERTYPE_VLAN ||
+	    ether_8021q_frame(mp, ifp, ifp, 0, pcp))
+		return (true);
+	if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+	return (false);
+}
+
 /*
  * Ethernet link layer output routine to send a raw frame to the device.
  *
@@ -446,17 +462,42 @@ bad:			if (m != NULL)
 int
 ether_output_frame(struct ifnet *ifp, struct mbuf *m)
 {
-	int i;
+	uint8_t pcp;
 
-	if (PFIL_HOOKED(&V_link_pfil_hook)) {
-		i = pfil_run_hooks(&V_link_pfil_hook, &m, ifp, PFIL_OUT, NULL);
+	pcp = ifp->if_pcp;
+	if (pcp != IFNET_PCP_NONE && ifp->if_type != IFT_L2VLAN &&
+	    !ether_set_pcp(&m, ifp, pcp))
+		return (0);
 
-		if (i != 0)
+	if (PFIL_HOOKED_OUT(V_link_pfil_head))
+		switch (pfil_run_hooks(V_link_pfil_head, &m, ifp, PFIL_OUT,
+		    NULL)) {
+		case PFIL_DROPPED:
 			return (EACCES);
-
-		if (m == NULL)
+		case PFIL_CONSUMED:
 			return (0);
+		}
+
+#ifdef EXPERIMENTAL
+#if defined(INET6) && defined(INET)
+	/* draft-ietf-6man-ipv6only-flag */
+	/* Catch ETHERTYPE_IP, and ETHERTYPE_[REV]ARP if we are v6-only. */
+	if ((ND_IFINFO(ifp)->flags & ND6_IFF_IPV6_ONLY_MASK) != 0) {
+		struct ether_header *eh;
+
+		eh = mtod(m, struct ether_header *);
+		switch (ntohs(eh->ether_type)) {
+		case ETHERTYPE_IP:
+		case ETHERTYPE_ARP:
+		case ETHERTYPE_REVARP:
+			m_freem(m);
+			return (EAFNOSUPPORT);
+			/* NOTREACHED */
+			break;
+		};
 	}
+#endif
+#endif
 
 	/*
 	 * Queue message on interface, update output statistics if
@@ -497,7 +538,26 @@ ether_input_internal(struct ifnet *ifp, struct mbuf *m)
 	}
 	eh = mtod(m, struct ether_header *);
 	etype = ntohs(eh->ether_type);
-	random_harvest_queue(m, sizeof(*m), 2, RANDOM_NET_ETHER);
+	random_harvest_queue_ether(m, sizeof(*m));
+
+#ifdef EXPERIMENTAL
+#if defined(INET6) && defined(INET)
+	/* draft-ietf-6man-ipv6only-flag */
+	/* Catch ETHERTYPE_IP, and ETHERTYPE_[REV]ARP if we are v6-only. */
+	if ((ND_IFINFO(ifp)->flags & ND6_IFF_IPV6_ONLY_MASK) != 0) {
+
+		switch (etype) {
+		case ETHERTYPE_IP:
+		case ETHERTYPE_ARP:
+		case ETHERTYPE_REVARP:
+			m_freem(m);
+			return;
+			/* NOTREACHED */
+			break;
+		};
+	}
+#endif
+#endif
 
 	CURVNET_SET_QUIET(ifp->if_vnet);
 
@@ -700,14 +760,14 @@ SYSINIT(ether, SI_SUB_INIT_IF, SI_ORDER_ANY, ether_init, NULL);
 static void
 vnet_ether_init(__unused void *arg)
 {
-	int i;
+	struct pfil_head_args args;
 
-	/* Initialize packet filter hooks. */
-	V_link_pfil_hook.ph_type = PFIL_TYPE_AF;
-	V_link_pfil_hook.ph_af = AF_LINK;
-	if ((i = pfil_head_register(&V_link_pfil_hook)) != 0)
-		printf("%s: WARNING: unable to register pfil link hook, "
-			"error %d\n", __func__, i);
+	args.pa_version = PFIL_VERSION;
+	args.pa_flags = PFIL_IN | PFIL_OUT;
+	args.pa_type = PFIL_TYPE_ETHERNET;
+	args.pa_headname = PFIL_ETHER_NAME;
+	V_link_pfil_head = pfil_head_register(&args);
+
 #ifdef VIMAGE
 	netisr_register_vnet(&ether_nh);
 #endif
@@ -719,11 +779,8 @@ VNET_SYSINIT(vnet_ether_init, SI_SUB_PROTO_IF, SI_ORDER_ANY,
 static void
 vnet_ether_pfil_destroy(__unused void *arg)
 {
-	int i;
 
-	if ((i = pfil_head_unregister(&V_link_pfil_hook)) != 0)
-		printf("%s: WARNING: unable to unregister pfil link hook, "
-			"error %d\n", __func__, i);
+	pfil_head_unregister(V_link_pfil_head);
 }
 VNET_SYSUNINIT(vnet_ether_pfil_uninit, SI_SUB_PROTO_PFIL, SI_ORDER_ANY,
     vnet_ether_pfil_destroy, NULL);
@@ -743,29 +800,37 @@ VNET_SYSUNINIT(vnet_ether_uninit, SI_SUB_PROTO_IF, SI_ORDER_ANY,
 static void
 ether_input(struct ifnet *ifp, struct mbuf *m)
 {
-
+	struct epoch_tracker et;
 	struct mbuf *mn;
+	bool needs_epoch;
+
+	needs_epoch = !(ifp->if_flags & IFF_KNOWSEPOCH);
 
 	/*
 	 * The drivers are allowed to pass in a chain of packets linked with
 	 * m_nextpkt. We split them up into separate packets here and pass
 	 * them up. This allows the drivers to amortize the receive lock.
 	 */
+	CURVNET_SET_QUIET(ifp->if_vnet);
+	if (__predict_false(needs_epoch))
+		NET_EPOCH_ENTER(et);
 	while (m) {
 		mn = m->m_nextpkt;
 		m->m_nextpkt = NULL;
 
 		/*
-		 * We will rely on rcvif being set properly in the deferred context,
-		 * so assert it is correct here.
+		 * We will rely on rcvif being set properly in the deferred
+		 * context, so assert it is correct here.
 		 */
+		MPASS((m->m_pkthdr.csum_flags & CSUM_SND_TAG) == 0);
 		KASSERT(m->m_pkthdr.rcvif == ifp, ("%s: ifnet mismatch m %p "
 		    "rcvif %p ifp %p", __func__, m, m->m_pkthdr.rcvif, ifp));
-		CURVNET_SET_QUIET(ifp->if_vnet);
 		netisr_dispatch(NETISR_ETHER, m);
-		CURVNET_RESTORE();
 		m = mn;
 	}
+	if (__predict_false(needs_epoch))
+		NET_EPOCH_EXIT(et);
+	CURVNET_RESTORE();
 }
 
 /*
@@ -778,12 +843,12 @@ ether_demux(struct ifnet *ifp, struct mbuf *m)
 	int i, isr;
 	u_short ether_type;
 
+	NET_EPOCH_ASSERT();
 	KASSERT(ifp != NULL, ("%s: NULL interface pointer", __func__));
 
 	/* Do not grab PROMISC frames in case we are re-entered. */
-	if (PFIL_HOOKED(&V_link_pfil_hook) && !(m->m_flags & M_PROMISC)) {
-		i = pfil_run_hooks(&V_link_pfil_hook, &m, ifp, PFIL_IN, NULL);
-
+	if (PFIL_HOOKED_IN(V_link_pfil_head) && !(m->m_flags & M_PROMISC)) {
+		i = pfil_run_hooks(V_link_pfil_head, &m, ifp, PFIL_IN, NULL);
 		if (i != 0 || m == NULL)
 			return;
 	}
@@ -904,8 +969,8 @@ ether_ifattach(struct ifnet *ifp, const u_int8_t *lla)
 
 	ifp->if_addrlen = ETHER_ADDR_LEN;
 	ifp->if_hdrlen = ETHER_HDR_LEN;
-	if_attach(ifp);
 	ifp->if_mtu = ETHERMTU;
+	if_attach(ifp);
 	ifp->if_output = ether_output;
 	ifp->if_input = ether_input;
 	ifp->if_resolvemulti = ether_resolvemulti;
@@ -987,7 +1052,8 @@ ether_reassign(struct ifnet *ifp, struct vnet *new_vnet, char *unused __unused)
 #endif
 
 SYSCTL_DECL(_net_link);
-SYSCTL_NODE(_net_link, IFT_ETHER, ether, CTLFLAG_RW, 0, "Ethernet");
+SYSCTL_NODE(_net_link, IFT_ETHER, ether, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "Ethernet");
 
 #if 0
 /*
@@ -1088,13 +1154,8 @@ ether_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 		break;
 
 	case SIOCGIFADDR:
-		{
-			struct sockaddr *sa;
-
-			sa = (struct sockaddr *) & ifr->ifr_data;
-			bcopy(IF_LLADDR(ifp),
-			      (caddr_t) sa->sa_data, ETHER_ADDR_LEN);
-		}
+		bcopy(IF_LLADDR(ifp), &ifr->ifr_addr.sa_data[0],
+		    ETHER_ADDR_LEN);
 		break;
 
 	case SIOCSIFMTU:
@@ -1107,6 +1168,25 @@ ether_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 			ifp->if_mtu = ifr->ifr_mtu;
 		}
 		break;
+
+	case SIOCSLANPCP:
+		error = priv_check(curthread, PRIV_NET_SETLANPCP);
+		if (error != 0)
+			break;
+		if (ifr->ifr_lan_pcp > 7 &&
+		    ifr->ifr_lan_pcp != IFNET_PCP_NONE) {
+			error = EINVAL;
+		} else {
+			ifp->if_pcp = ifr->ifr_lan_pcp;
+			/* broadcast event about PCP change */
+			EVENTHANDLER_INVOKE(ifnet_event, ifp, IFNET_EVENT_PCP);
+		}
+		break;
+
+	case SIOCGLANPCP:
+		ifr->ifr_lan_pcp = ifp->if_pcp;
+		break;
+
 	default:
 		error = EINVAL;			/* XXX netbsd has ENOTTY??? */
 		break;
@@ -1253,6 +1333,133 @@ ether_vlanencap(struct mbuf *m, uint16_t tag)
 	evl->evl_encap_proto = htons(ETHERTYPE_VLAN);
 	evl->evl_tag = htons(tag);
 	return (m);
+}
+
+static SYSCTL_NODE(_net_link, IFT_L2VLAN, vlan, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "IEEE 802.1Q VLAN");
+static SYSCTL_NODE(_net_link_vlan, PF_LINK, link,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "for consistency");
+
+VNET_DEFINE_STATIC(int, soft_pad);
+#define	V_soft_pad	VNET(soft_pad)
+SYSCTL_INT(_net_link_vlan, OID_AUTO, soft_pad, CTLFLAG_RW | CTLFLAG_VNET,
+    &VNET_NAME(soft_pad), 0,
+    "pad short frames before tagging");
+
+/*
+ * For now, make preserving PCP via an mbuf tag optional, as it increases
+ * per-packet memory allocations and frees.  In the future, it would be
+ * preferable to reuse ether_vtag for this, or similar.
+ */
+int vlan_mtag_pcp = 0;
+SYSCTL_INT(_net_link_vlan, OID_AUTO, mtag_pcp, CTLFLAG_RW,
+    &vlan_mtag_pcp, 0,
+    "Retain VLAN PCP information as packets are passed up the stack");
+
+bool
+ether_8021q_frame(struct mbuf **mp, struct ifnet *ife, struct ifnet *p,
+    uint16_t vid, uint8_t pcp)
+{
+	struct m_tag *mtag;
+	int n;
+	uint16_t tag;
+	static const char pad[8];	/* just zeros */
+
+	/*
+	 * Pad the frame to the minimum size allowed if told to.
+	 * This option is in accord with IEEE Std 802.1Q, 2003 Ed.,
+	 * paragraph C.4.4.3.b.  It can help to work around buggy
+	 * bridges that violate paragraph C.4.4.3.a from the same
+	 * document, i.e., fail to pad short frames after untagging.
+	 * E.g., a tagged frame 66 bytes long (incl. FCS) is OK, but
+	 * untagging it will produce a 62-byte frame, which is a runt
+	 * and requires padding.  There are VLAN-enabled network
+	 * devices that just discard such runts instead or mishandle
+	 * them somehow.
+	 */
+	if (V_soft_pad && p->if_type == IFT_ETHER) {
+		for (n = ETHERMIN + ETHER_HDR_LEN - (*mp)->m_pkthdr.len;
+		     n > 0; n -= sizeof(pad)) {
+			if (!m_append(*mp, min(n, sizeof(pad)), pad))
+				break;
+		}
+		if (n > 0) {
+			m_freem(*mp);
+			*mp = NULL;
+			if_printf(ife, "cannot pad short frame");
+			return (false);
+		}
+	}
+
+	/*
+	 * If underlying interface can do VLAN tag insertion itself,
+	 * just pass the packet along. However, we need some way to
+	 * tell the interface where the packet came from so that it
+	 * knows how to find the VLAN tag to use, so we attach a
+	 * packet tag that holds it.
+	 */
+	if (vlan_mtag_pcp && (mtag = m_tag_locate(*mp, MTAG_8021Q,
+	    MTAG_8021Q_PCP_OUT, NULL)) != NULL)
+		tag = EVL_MAKETAG(vid, *(uint8_t *)(mtag + 1), 0);
+	else
+		tag = EVL_MAKETAG(vid, pcp, 0);
+	if (p->if_capenable & IFCAP_VLAN_HWTAGGING) {
+		(*mp)->m_pkthdr.ether_vtag = tag;
+		(*mp)->m_flags |= M_VLANTAG;
+	} else {
+		*mp = ether_vlanencap(*mp, tag);
+		if (*mp == NULL) {
+			if_printf(ife, "unable to prepend 802.1Q header");
+			return (false);
+		}
+	}
+	return (true);
+}
+
+/*
+ * Allocate an address from the FreeBSD Foundation OUI.  This uses a
+ * cryptographic hash function on the containing jail's name, UUID and the
+ * interface name to attempt to provide a unique but stable address.
+ * Pseudo-interfaces which require a MAC address should use this function to
+ * allocate non-locally-administered addresses.
+ */
+void
+ether_gen_addr(struct ifnet *ifp, struct ether_addr *hwaddr)
+{
+	SHA1_CTX ctx;
+	char *buf;
+	char uuid[HOSTUUIDLEN + 1];
+	uint64_t addr;
+	int i, sz;
+	char digest[SHA1_RESULTLEN];
+	char jailname[MAXHOSTNAMELEN];
+
+	getcredhostuuid(curthread->td_ucred, uuid, sizeof(uuid));
+	/* If each (vnet) jail would also have a unique hostuuid this would not
+	 * be necessary. */
+	getjailname(curthread->td_ucred, jailname, sizeof(jailname));
+	sz = asprintf(&buf, M_TEMP, "%s-%s-%s", uuid, if_name(ifp),
+	    jailname);
+	if (sz < 0) {
+		/* Fall back to a random mac address. */
+		arc4rand(hwaddr, sizeof(*hwaddr), 0);
+		hwaddr->octet[0] = 0x02;
+		return;
+	}
+
+	SHA1Init(&ctx);
+	SHA1Update(&ctx, buf, sz);
+	SHA1Final(digest, &ctx);
+	free(buf, M_TEMP);
+
+	addr = ((digest[0] << 16) | (digest[1] << 8) | digest[2]) &
+	    OUI_FREEBSD_GENERATED_MASK;
+	addr = OUI_FREEBSD(addr);
+	for (i = 0; i < ETHER_ADDR_LEN; ++i) {
+		hwaddr->octet[i] = addr >> ((ETHER_ADDR_LEN - i - 1) * 8) &
+		    0xFF;
+	}
 }
 
 DECLARE_MODULE(ether, ether_mod, SI_SUB_INIT_IF, SI_ORDER_ANY);

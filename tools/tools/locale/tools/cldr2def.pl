@@ -1,4 +1,31 @@
 #!/usr/local/bin/perl -wC
+
+# SPDX-License-Identifier: BSD-2-Clause-FreeBSD
+#
+# Copyright 2009 Edwin Groothuis <edwin@FreeBSD.org>
+# Copyright 2015 John Marino <draco@marino.st>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+#
 # $FreeBSD$
 
 use strict;
@@ -6,32 +33,27 @@ use File::Copy;
 use XML::Parser;
 use Tie::IxHash;
 use Text::Iconv;
-use Data::Dumper;
+#use Data::Dumper;
 use Getopt::Long;
 use Digest::SHA qw(sha1_hex);
 require "charmaps.pm";
 
 
 if ($#ARGV < 2) {
-	print "Usage: $0 --cldr=<cldrdir> --unidata=<unidatadir> --etc=<etcdir> --type=<type> [--lc=<la_CC>]\n";
+	print "Usage: $0 --unidir=<unidir> --etc=<etcdir> --type=<type>\n";
 	exit(1);
 }
 
 my $DEFENCODING = "UTF-8";
-my @filter = ();
 
-my $CLDRDIR = undef;
-my $UNIDATADIR = undef;
+my $UNIDIR = undef;
 my $ETCDIR = undef;
 my $TYPE = undef;
-my $doonly = undef;
 
 my $result = GetOptions (
-		"cldr=s"	=> \$CLDRDIR,
-		"unidata=s"	=> \$UNIDATADIR,
+		"unidir=s"	=> \$UNIDIR,
 		"etc=s"		=> \$ETCDIR,
 		"type=s"	=> \$TYPE,
-		"lc=s"		=> \$doonly
 	    );
 
 my %convertors = ();
@@ -47,8 +69,8 @@ get_languages();
 
 my %utf8map = ();
 my %utf8aliases = ();
-get_unidata($UNIDATADIR);
-get_utf8map("$CLDRDIR/posix/$DEFENCODING.cm");
+get_unidata($UNIDIR);
+get_utf8map("$UNIDIR/posix/$DEFENCODING.cm");
 get_encodings("$ETCDIR/charmaps");
 
 my %keys = ();
@@ -397,40 +419,24 @@ sub get_languages {
 	%translations = %{$data{T}}; 
 	%alternativemonths = %{$data{AM}}; 
 	%encodings = %{$data{E}}; 
-
-	return if (!defined $doonly);
-
-	my @a = split(/_/, $doonly);
-	if ($#a == 1) {
-		$filter[0] = $a[0];
-		$filter[1] = "x";
-		$filter[2] = $a[1];
-	} elsif ($#a == 2) {
-		$filter[0] = $a[0];
-		$filter[1] = $a[1];
-		$filter[2] = $a[2];
-	}
-
-	print Dumper(@filter);
-	return;
 }
 
 sub transform_ctypes {
+	# Add the C.UTF-8
+	$languages{"C"}{"x"}{data}{"x"}{$DEFENCODING} = undef;
+
 	foreach my $l (sort keys(%languages)) {
 	foreach my $f (sort keys(%{$languages{$l}})) {
 	foreach my $c (sort keys(%{$languages{$l}{$f}{data}})) {
-		next if ($#filter == 2 && ($filter[0] ne $l
-		    || $filter[1] ne $f || $filter[2] ne $c));
 		next if (defined $languages{$l}{$f}{definitions}
 		    && $languages{$l}{$f}{definitions} !~ /$TYPE/);
 		$languages{$l}{$f}{data}{$c}{$DEFENCODING} = 0;	# unread
-		my $file;
-		$file = $l . "_";
-		$file .= $f . "_" if ($f ne "x");
-		$file .= $c;
+		my $file = $l;
+		$file .= "_" . $f if ($f ne "x");
+		$file .= "_" . $c if ($c ne "x");
 		my $actfile = $file;
 
-		my $filename = "$CLDRDIR/posix/xx_Comm_US.UTF-8.src";
+		my $filename = "$UNIDIR/posix/xx_Comm_C.UTF-8.src";
 		if (! -f $filename) {
 			print STDERR "Cannot open $filename\n";
 			next;
@@ -453,7 +459,7 @@ sub transform_ctypes {
 		close(FOUT);
 		foreach my $enc (sort keys(%{$languages{$l}{$f}{data}{$c}})) {
 			next if ($enc eq $DEFENCODING);
-			$filename = "$CLDRDIR/posix/$file.$DEFENCODING.src";
+			$filename = "$UNIDIR/posix/$file.$DEFENCODING.src";
 			if (! -f $filename) {
 				print STDERR "Cannot open $filename\n";
 				next;
@@ -492,8 +498,6 @@ sub transform_collation {
 	foreach my $l (sort keys(%languages)) {
 	foreach my $f (sort keys(%{$languages{$l}})) {
 	foreach my $c (sort keys(%{$languages{$l}{$f}{data}})) {
-		next if ($#filter == 2 && ($filter[0] ne $l
-		    || $filter[1] ne $f || $filter[2] ne $c));
 		next if (defined $languages{$l}{$f}{definitions}
 		    && $languages{$l}{$f}{definitions} !~ /$TYPE/);
 		$languages{$l}{$f}{data}{$c}{$DEFENCODING} = 0;	# unread
@@ -503,15 +507,15 @@ sub transform_collation {
 		$file .= $c;
 		my $actfile = $file;
 
-		my $filename = "$CLDRDIR/posix/$file.$DEFENCODING.src";
+		my $filename = "$UNIDIR/posix/$file.$DEFENCODING.src";
 		$filename = "$ETCDIR/$file.$DEFENCODING.src"
 		    if (! -f $filename);
 		if (! -f $filename
 		 && defined $languages{$l}{$f}{fallback}) {
 			$file = $languages{$l}{$f}{fallback};
-			$filename = "$CLDRDIR/posix/$file.$DEFENCODING.src";
+			$filename = "$UNIDIR/posix/$file.$DEFENCODING.src";
 		}
-		$filename = "$CLDRDIR/posix/$file.$DEFENCODING.src"
+		$filename = "$UNIDIR/posix/$file.$DEFENCODING.src"
 		    if (! -f $filename);
 		if (! -f $filename) {
 			print STDERR
@@ -562,8 +566,6 @@ sub get_fields {
 	foreach my $l (sort keys(%languages)) {
 	foreach my $f (sort keys(%{$languages{$l}})) {
 	foreach my $c (sort keys(%{$languages{$l}{$f}{data}})) {
-		next if ($#filter == 2 && ($filter[0] ne $l
-		    || $filter[1] ne $f || $filter[2] ne $c));
 		next if (defined $languages{$l}{$f}{definitions}
 		    && $languages{$l}{$f}{definitions} !~ /$TYPE/);
 
@@ -573,15 +575,15 @@ sub get_fields {
 		$file .= $f . "_" if ($f ne "x");
 		$file .= $c;
 
-		my $filename = "$CLDRDIR/posix/$file.$DEFENCODING.src";
+		my $filename = "$UNIDIR/posix/$file.$DEFENCODING.src";
 		$filename = "$ETCDIR/$file.$DEFENCODING.src"
 		    if (! -f $filename);
 		if (! -f $filename
 		 && defined $languages{$l}{$f}{fallback}) {
 			$file = $languages{$l}{$f}{fallback};
-			$filename = "$CLDRDIR/posix/$file.$DEFENCODING.src";
+			$filename = "$UNIDIR/posix/$file.$DEFENCODING.src";
 		}
-		$filename = "$CLDRDIR/posix/$file.$DEFENCODING.src"
+		$filename = "$UNIDIR/posix/$file.$DEFENCODING.src"
 		    if (! -f $filename);
 		if (! -f $filename) {
 			print STDERR
@@ -701,8 +703,6 @@ sub print_fields {
 	foreach my $l (sort keys(%languages)) {
 	foreach my $f (sort keys(%{$languages{$l}})) {
 	foreach my $c (sort keys(%{$languages{$l}{$f}{data}})) {
-		next if ($#filter == 2 && ($filter[0] ne $l
-		    || $filter[1] ne $f || $filter[2] ne $c));
 		next if (defined $languages{$l}{$f}{definitions}
 		    && $languages{$l}{$f}{definitions} !~ /$TYPE/);
 		foreach my $enc (sort keys(%{$languages{$l}{$f}{data}{$c}})) {
@@ -849,7 +849,6 @@ EOF
 }
 
 sub make_makefile {
-	return if ($#filter > -1);
 	print "Creating Makefile for $TYPE\n";
 	my $SRCOUT;
 	my $SRCOUT2;
@@ -857,7 +856,8 @@ sub make_makefile {
 	my $SRCOUT4 = "";
 	my $MAPLOC;
 	if ($TYPE eq "colldef") {
-		$SRCOUT = "localedef -D -U -i \${.IMPSRC} \\\n" .
+		$SRCOUT = "localedef \${LOCALEDEF_ENDIAN} -D -U " .
+			"-i \${.IMPSRC} \\\n" .
 			"\t-f \${MAPLOC}/map.\${.TARGET:T:R:E:C/@.*//} " .
 			"\${.OBJDIR}/\${.IMPSRC:T:R}";
 		$MAPLOC = "MAPLOC=\t\t\${.CURDIR}/../../tools/tools/" .
@@ -868,14 +868,16 @@ sub make_makefile {
 			"FILES+=\t\$t.LC_COLLATE\n" .
 			"FILESDIR_\$t.LC_COLLATE=\t\${LOCALEDIR}/\$t\n" .
 			"\$t.LC_COLLATE: \${.CURDIR}/\$f.src\n" .
-			"\tlocaledef -D -U -i \${.ALLSRC} \\\n" .
+			"\tlocaledef \${LOCALEDEF_ENDIAN} -D -U " .
+			"-i \${.ALLSRC} \\\n" .
 			"\t\t-f \${MAPLOC}/map.\${.TARGET:T:R:E:C/@.*//} \\\n" .
 			"\t\t\${.OBJDIR}/\${.TARGET:T:R}\n" .
 			".endfor\n\n";
 		$SRCOUT4 = "## LOCALES_MAPPED\n";
 	}
 	elsif ($TYPE eq "ctypedef") {
-		$SRCOUT = "localedef -D -U -c -w \${MAPLOC}/widths.txt \\\n" .
+		$SRCOUT = "localedef \${LOCALEDEF_ENDIAN} -D -U -c " .
+			"-w \${MAPLOC}/widths.txt \\\n" .
 			"\t-f \${MAPLOC}/map.\${.IMPSRC:T:R:E} " .
 			"\\\n\t-i \${.IMPSRC} \${.OBJDIR}/\${.IMPSRC:T:R} " .
 			" || true";
@@ -886,7 +888,8 @@ sub make_makefile {
 			".for s t in \${SYMPAIRS}\n" .
 			"\${t:S/src\$/LC_CTYPE/}: " .
 			"\$s\n" .
-			"\tlocaledef -D -U -c -w \${MAPLOC}/widths.txt \\\n" .
+			"\tlocaledef \${LOCALEDEF_ENDIAN} -D -U -c " .
+			"-w \${MAPLOC}/widths.txt \\\n" .
 			"\t-f \${MAPLOC}/map.\${.TARGET:T:R:C/^.*\\.//} " .
 			"\\\n\t-i \${.ALLSRC} \${.OBJDIR}/\${.TARGET:T:R} " .
 			" || true\n" .
@@ -907,6 +910,16 @@ LOCALEDIR=	\${SHAREDIR}/locale
 FILESNAME=	$FILESNAMES{$TYPE}
 .SUFFIXES:	.src .${SRCOUT2}
 ${MAPLOC}
+EOF
+
+	if ($TYPE eq "colldef" || $TYPE eq "ctypedef") {
+		print FOUT <<EOF;
+.include <bsd.endian.mk>
+
+EOF
+	}
+
+	print FOUT <<EOF;
 .src.${SRCOUT2}:
 	$SRCOUT
 
@@ -933,8 +946,8 @@ EOF
 				} keys(%{$hashtable{$hash}});
 		} elsif ($TYPE eq "ctypedef") {
 			@files = sort {
-				if ($a eq 'en_x_US.UTF-8') { return -1; }
-				elsif ($b eq 'en_x_US.UTF-8') { return 1; }
+				if ($a eq 'C_x_x.UTF-8') { return -1; }
+				elsif ($b eq 'C_x_x.UTF-8') { return 1; }
 				if ($a =~ /^en_x_US/) { return -1; }
 				elsif ($b =~ /^en_x_US/) { return 1; }
 
@@ -956,6 +969,7 @@ EOF
 		}
 		if ($#files > 0) {
 			my $link = shift(@files);
+			$link =~ s/_x_x//;	# special case for C
 			$link =~ s/_x_/_/;	# strip family if none there
 			foreach my $file (@files) {
 				my @a = split(/_/, $file);
@@ -970,8 +984,6 @@ EOF
 	foreach my $l (sort keys(%languages)) {
 	foreach my $f (sort keys(%{$languages{$l}})) {
 	foreach my $c (sort keys(%{$languages{$l}{$f}{data}})) {
-		next if ($#filter == 2 && ($filter[0] ne $l
-		    || $filter[1] ne $f || $filter[2] ne $c));
 		next if (defined $languages{$l}{$f}{definitions}
 		    && $languages{$l}{$f}{definitions} !~ /$TYPE/);
 		if (defined $languages{$l}{$f}{data}{$c}{$DEFENCODING}
@@ -981,9 +993,9 @@ EOF
 			next;
 		}
 		foreach my $e (sort keys(%{$languages{$l}{$f}{data}{$c}})) {
-			my $file = $l . "_";
-			$file .= $f . "_" if ($f ne "x");
-			$file .= $c;
+			my $file = $l;
+			$file .= "_" . $f if ($f ne "x");
+			$file .= "_" . $c if ($c ne "x");
 			next if (!defined $languages{$l}{$f}{data}{$c}{$e});
 			print FOUT "LOCALES+=\t$file.$e\n";
 		}

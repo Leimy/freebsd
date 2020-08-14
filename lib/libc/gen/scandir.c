@@ -29,10 +29,8 @@
  * SUCH DAMAGE.
  */
 
-#if defined(LIBC_SCCS) && !defined(lint)
-static char sccsid[] = "@(#)scandir.c	8.3 (Berkeley) 1/2/94";
-#endif /* LIBC_SCCS and not lint */
 #include <sys/cdefs.h>
+__SCCSID("@(#)scandir.c	8.3 (Berkeley) 1/2/94");
 __FBSDID("$FreeBSD$");
 
 /*
@@ -52,8 +50,7 @@ __FBSDID("$FreeBSD$");
 #include "block_abi.h"
 #define	SELECT(x)	CALL_BLOCK(select, x)
 #ifndef __BLOCKS__
-void
-qsort_b(void *, size_t, size_t, void*);
+void qsort_b(void *, size_t, size_t, void *);
 #endif
 #else
 #define	SELECT(x)	select(x)
@@ -136,6 +133,7 @@ fail:
 	return (-1);
 }
 
+#ifndef I_AM_SCANDIR_B
 /*
  * Alphabetic order comparison routine for those who want it.
  * POSIX 2008 requires that alphasort() uses strcoll().
@@ -155,3 +153,4 @@ alphasort_thunk(void *thunk, const void *p1, const void *p2)
 	dc = *(int (**)(const struct dirent **, const struct dirent **))thunk;
 	return (dc((const struct dirent **)p1, (const struct dirent **)p2));
 }
+#endif

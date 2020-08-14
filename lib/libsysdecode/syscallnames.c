@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2015 John H. Baldwin <jhb@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,9 +48,11 @@ static
 #include <compat/freebsd32/freebsd32_syscalls.c>
 #endif
 
-#if defined(__amd64__) || defined(__i386__)
+#if defined(__aarch64__) || defined(__amd64__) || defined(__i386__)
 static
-#ifdef __amd64__
+#ifdef __aarch64__
+#include <arm64/linux/linux_syscalls.c>
+#elif __amd64__
 #include <amd64/linux/linux_syscalls.c>
 #else
 #include <i386/linux/linux_syscalls.c>
@@ -83,7 +84,7 @@ sysdecode_syscallname(enum sysdecode_abi abi, unsigned int code)
 			return (freebsd32_syscallnames[code]);
 		break;
 #endif
-#if defined(__amd64__) || defined(__i386__)
+#if defined(__aarch64__) || defined(__amd64__) || defined(__i386__)
 	case SYSDECODE_ABI_LINUX:
 		if (code < nitems(linux_syscallnames))
 			return (linux_syscallnames[code]);

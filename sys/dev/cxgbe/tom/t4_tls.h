@@ -249,19 +249,15 @@ enum {
 	CH_MK_SIZE_NOP,
 };
 
-#define SCMD_ENCDECCTRL_ENCRYPT 0
-#define SCMD_ENCDECCTRL_DECRYPT 1
-
-#define SCMD_CIPH_MODE_NOP			0
-#define SCMD_CIPH_MODE_AES_CBC			1
-#define SCMD_CIPH_MODE_AES_GCM			2
-#define SCMD_CIPH_MODE_AES_CTR			3
-#define SCMD_CIPH_MODE_AES_GEN			4
-#define SCMD_CIPH_MODE_AES_CCM			7
-
 struct tls_scmd {
 	__be32 seqno_numivs;
 	__be32 ivgen_hdrlen;
+};
+
+enum tls_mode {
+	TLS_MODE_OFF,
+	TLS_MODE_TLSOM,
+	TLS_MODE_KTLS,
 };
 
 struct tls_ofld_info {
@@ -276,8 +272,10 @@ struct tls_ofld_info {
 	unsigned short expn_per_ulp;
 	unsigned short pdus_per_ulp;
 	struct tls_scmd scmd0;
-	u_int sb_off;
+	u_int iv_len;
+	enum tls_mode mode;
 	struct callout handshake_timer;
+	u_int sb_off;
 	u_int rcv_over;
 };
 

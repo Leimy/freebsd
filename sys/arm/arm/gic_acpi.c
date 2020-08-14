@@ -34,6 +34,7 @@
  * SUCH DAMAGE.
  */
 
+#include "opt_acpi.h"
 #include "opt_platform.h"
 
 #include <sys/cdefs.h>
@@ -43,6 +44,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/malloc.h>
 #include <sys/module.h>
 
 #include <machine/intr.h>
@@ -216,7 +218,7 @@ gic_acpi_attach(device_t dev)
 	if (err != 0)
 		return (err);
 
-	xref = 0;
+	xref = ACPI_INTR_XREF;
 
 	/*
 	 * Now, when everything is initialized, it's right time to
@@ -329,9 +331,21 @@ arm_gicv2m_acpi_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static int
+arm_gicv2m_acpi_attach(device_t dev)
+{
+	struct arm_gicv2m_softc *sc;
+
+	sc = device_get_softc(dev);
+	sc->sc_xref = ACPI_MSI_XREF;
+
+	return (arm_gicv2m_attach(dev));
+}
+
 static device_method_t arm_gicv2m_acpi_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe,		arm_gicv2m_acpi_probe),
+	DEVMETHOD(device_attach,	arm_gicv2m_acpi_attach),
 
 	/* End */
 	DEVMETHOD_END

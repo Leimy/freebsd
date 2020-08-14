@@ -83,7 +83,8 @@ static void xbd_startio(struct xbd_softc *sc);
 static MALLOC_DEFINE(M_XENBLOCKFRONT, "xbd", "Xen Block Front driver data");
 
 static int xbd_enable_indirect = 1;
-SYSCTL_NODE(_hw, OID_AUTO, xbd, CTLFLAG_RD, 0, "xbd driver parameters");
+SYSCTL_NODE(_hw, OID_AUTO, xbd, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "xbd driver parameters");
 SYSCTL_INT(_hw_xbd, OID_AUTO, xbd_enable_indirect, CTLFLAG_RDTUN,
     &xbd_enable_indirect, 0, "Enable xbd indirect segments");
 
@@ -399,7 +400,9 @@ xbd_bio_command(struct xbd_softc *sc)
 			panic("flush request, but no flush support available");
 		break;
 	default:
-		panic("unknown bio command %d", bp->bio_cmd);
+		biofinish(bp, NULL, EOPNOTSUPP);
+		xbd_enqueue_cm(cm, XBD_Q_FREE);
+		return (NULL);
 	}
 
 	return (cm);
@@ -602,8 +605,8 @@ xbd_dump(void *arg, void *virtual, vm_offset_t physical, off_t offset,
 	int sbp;
 	int rc = 0;
 
-	if (length <= 0)
-		return (rc);
+	if (length == 0)
+		return (0);
 
 	xbd_quiesce(sc);	/* All quiet on the western front. */
 
@@ -924,8 +927,8 @@ xbd_setup_sysctl(struct xbd_softc *xbd)
 	    "communication channel pages (negotiated)");
 
 	SYSCTL_ADD_PROC(sysctl_ctx, children, OID_AUTO,
-	    "features", CTLTYPE_STRING|CTLFLAG_RD, xbd, 0,
-	    xbd_sysctl_features, "A", "protocol features (negotiated)");
+	    "features", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT, xbd,
+	    0, xbd_sysctl_features, "A", "protocol features (negotiated)");
 }
 
 /*
@@ -1222,19 +1225,49 @@ static void
 xbd_connect(struct xbd_softc *sc)
 {
 	device_t dev = sc->xbd_dev;
-	unsigned long sectors, sector_size, phys_sector_size;
+	blkif_sector_t sectors;
+	unsigned long sector_size, phys_sector_size;
 	unsigned int binfo;
 	int err, feature_barrier, feature_flush;
 	int i, j;
 
-	if (sc->xbd_state == XBD_STATE_CONNECTED || 
-	    sc->xbd_state == XBD_STATE_SUSPENDED)
-		return;
-
 	DPRINTK("blkfront.c:connect:%s.\n", xenbus_get_otherend_path(dev));
 
+	if (sc->xbd_state == XBD_STATE_SUSPENDED) {
+		return;
+	}
+
+	if (sc->xbd_state == XBD_STATE_CONNECTED) {
+		struct disk *disk;
+
+		disk = sc->xbd_disk;
+		if (disk == NULL) {
+			return;
+		}
+		err = xs_gather(XST_NIL, xenbus_get_otherend_path(dev),
+		    "sectors", "%"PRIu64, &sectors, NULL);
+		if (err != 0) {
+			xenbus_dev_error(dev, err,
+			    "reading sectors at %s",
+			    xenbus_get_otherend_path(dev));
+			return;
+		}
+		disk->d_mediasize = disk->d_sectorsize * sectors;
+		err = disk_resize(disk, M_NOWAIT);
+		if (err) {
+			xenbus_dev_error(dev, err,
+			    "unable to resize disk %s%u",
+			    disk->d_name, disk->d_unit);
+			return;
+		}
+		device_printf(sc->xbd_dev,
+		    "changed capacity to %jd\n",
+		    (intmax_t)disk->d_mediasize);
+		return;
+	}
+
 	err = xs_gather(XST_NIL, xenbus_get_otherend_path(dev),
-	    "sectors", "%lu", &sectors,
+	    "sectors", "%"PRIu64, &sectors,
 	    "info", "%u", &binfo,
 	    "sector-size", "%lu", &sector_size,
 	    NULL);
@@ -1247,7 +1280,7 @@ xbd_connect(struct xbd_softc *sc)
 	if ((sectors == 0) || (sector_size == 0)) {
 		xenbus_dev_fatal(dev, 0,
 		    "invalid parameters from %s:"
-		    " sectors = %lu, sector_size = %lu",
+		    " sectors = %"PRIu64", sector_size = %lu",
 		    xenbus_get_otherend_path(dev),
 		    sectors, sector_size);
 		return;
@@ -1333,7 +1366,10 @@ xbd_connect(struct xbd_softc *sc)
 		if (sc->xbd_max_request_indirectpages > 0) {
 			indirectpages = contigmalloc(
 			    PAGE_SIZE * sc->xbd_max_request_indirectpages,
-			    M_XENBLOCKFRONT, M_ZERO, 0, ~0, PAGE_SIZE, 0);
+			    M_XENBLOCKFRONT, M_ZERO | M_NOWAIT, 0, ~0,
+			    PAGE_SIZE, 0);
+			if (indirectpages == NULL)
+				sc->xbd_max_request_indirectpages = 0;
 		} else {
 			indirectpages = NULL;
 		}
@@ -1345,8 +1381,12 @@ xbd_connect(struct xbd_softc *sc)
 			    &cm->cm_indirectionrefs[j]))
 				break;
 		}
-		if (j < sc->xbd_max_request_indirectpages)
+		if (j < sc->xbd_max_request_indirectpages) {
+			contigfree(indirectpages,
+			    PAGE_SIZE * sc->xbd_max_request_indirectpages,
+			    M_XENBLOCKFRONT);
 			break;
+		}
 		cm->cm_indirectionpages = indirectpages;
 		xbd_free_command(cm);
 	}

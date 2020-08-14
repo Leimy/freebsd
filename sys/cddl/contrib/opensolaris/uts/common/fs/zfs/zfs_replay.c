@@ -281,6 +281,8 @@ zfs_replay_create_acl(void *arg1, void *arg2, boolean_t byteswap)
 	void *fuidstart;
 	size_t xvatlen = 0;
 	uint64_t txtype;
+	uint64_t objid;
+	uint64_t dnodesize;
 	int error;
 
 	txtype = (lr->lr_common.lrc_txtype & ~TX_CI);
@@ -306,19 +308,24 @@ zfs_replay_create_acl(void *arg1, void *arg2, boolean_t byteswap)
 	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
 		return (error);
 
+	objid = LR_FOID_GET_OBJ(lr->lr_foid);
+	dnodesize = LR_FOID_GET_SLOTS(lr->lr_foid) << DNODE_SHIFT;
+
 	xva_init(&xva);
 	zfs_init_vattr(&xva.xva_vattr, AT_TYPE | AT_MODE | AT_UID | AT_GID,
-	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, lr->lr_foid);
+	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, objid);
 
 	/*
 	 * All forms of zfs create (create, mkdir, mkxattrdir, symlink)
 	 * eventually end up in zfs_mknode(), which assigns the object's
-	 * creation time and generation number.  The generic VOP_CREATE()
-	 * doesn't have either concept, so we smuggle the values inside
-	 * the vattr's otherwise unused va_ctime and va_nblocks fields.
+	 * creation time, generation number, and dnode size. The generic
+	 * zfs_create() has no concept of these attributes, so we smuggle
+	 * the values inside the vattr's otherwise unused va_ctime,
+	 * va_nblocks, and va_fsid fields.
 	 */
 	ZFS_TIME_DECODE(&xva.xva_vattr.va_ctime, lr->lr_crtime);
 	xva.xva_vattr.va_nblocks = lr->lr_gen;
+	xva.xva_vattr.va_fsid = dnodesize;
 
 	error = dmu_object_info(zfsvfs->z_os, lr->lr_foid, NULL);
 	if (error != ENOENT)
@@ -444,21 +451,26 @@ zfs_replay_create(void *arg1, void *arg2, boolean_t byteswap)
 	if ((error = zfs_zget(zfsvfs, lr->lr_doid, &dzp)) != 0)
 		return (error);
 
+	uint64_t objid = LR_FOID_GET_OBJ(lr->lr_foid);
+	int dnodesize = LR_FOID_GET_SLOTS(lr->lr_foid) << DNODE_SHIFT;
+
 	xva_init(&xva);
 	zfs_init_vattr(&xva.xva_vattr, AT_TYPE | AT_MODE | AT_UID | AT_GID,
-	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, lr->lr_foid);
+	    lr->lr_mode, lr->lr_uid, lr->lr_gid, lr->lr_rdev, objid);
 
 	/*
 	 * All forms of zfs create (create, mkdir, mkxattrdir, symlink)
 	 * eventually end up in zfs_mknode(), which assigns the object's
-	 * creation time and generation number.  The generic VOP_CREATE()
-	 * doesn't have either concept, so we smuggle the values inside
-	 * the vattr's otherwise unused va_ctime and va_nblocks fields.
+	 * creation time, generation number, and dnode slot count. The
+	 * generic zfs_create() has no concept of these attributes, so
+	 * we smuggle the values inside the vattr's otherwise unused
+	 * va_ctime, va_nblocks and va_fsid fields.
 	 */
 	ZFS_TIME_DECODE(&xva.xva_vattr.va_ctime, lr->lr_crtime);
 	xva.xva_vattr.va_nblocks = lr->lr_gen;
+	xva.xva_vattr.va_fsid = dnodesize;
 
-	error = dmu_object_info(zfsvfs->z_os, lr->lr_foid, NULL);
+	error = dmu_object_info(zfsvfs->z_os, objid, NULL);
 	if (error != ENOENT)
 		goto out;
 
@@ -534,7 +546,7 @@ zfs_replay_create(void *arg1, void *arg2, boolean_t byteswap)
 	default:
 		error = SET_ERROR(ENOTSUP);
 	}
-	VOP_UNLOCK(ZTOV(dzp), 0);
+	VOP_UNLOCK(ZTOV(dzp));
 
 out:
 	if (error == 0 && vp != NULL)
@@ -578,7 +590,7 @@ zfs_replay_remove(void *arg1, void *arg2, boolean_t byteswap)
 	vn_lock(ZTOV(dzp), LK_EXCLUSIVE | LK_RETRY);
 	error = VOP_LOOKUP(ZTOV(dzp), &vp, &cn);
 	if (error != 0) {
-		VOP_UNLOCK(ZTOV(dzp), 0);
+		VOP_UNLOCK(ZTOV(dzp));
 		goto fail;
 	}
 
@@ -593,7 +605,7 @@ zfs_replay_remove(void *arg1, void *arg2, boolean_t byteswap)
 		error = SET_ERROR(ENOTSUP);
 	}
 	vput(vp);
-	VOP_UNLOCK(ZTOV(dzp), 0);
+	VOP_UNLOCK(ZTOV(dzp));
 
 fail:
 	VN_RELE(ZTOV(dzp));
@@ -634,8 +646,8 @@ zfs_replay_link(void *arg1, void *arg2, boolean_t byteswap)
 	vn_lock(ZTOV(dzp), LK_EXCLUSIVE | LK_RETRY);
 	vn_lock(ZTOV(zp), LK_EXCLUSIVE | LK_RETRY);
 	error = VOP_LINK(ZTOV(dzp), ZTOV(zp), &cn /*,vflg*/);
-	VOP_UNLOCK(ZTOV(zp), 0);
-	VOP_UNLOCK(ZTOV(dzp), 0);
+	VOP_UNLOCK(ZTOV(zp));
+	VOP_UNLOCK(ZTOV(dzp));
 
 	VN_RELE(ZTOV(zp));
 	VN_RELE(ZTOV(dzp));
@@ -681,10 +693,10 @@ zfs_replay_rename(void *arg1, void *arg2, boolean_t byteswap)
 	scn.cn_thread = td;
 	vn_lock(ZTOV(sdzp), LK_EXCLUSIVE | LK_RETRY);
 	error = VOP_LOOKUP(ZTOV(sdzp), &svp, &scn);
-	VOP_UNLOCK(ZTOV(sdzp), 0);
+	VOP_UNLOCK(ZTOV(sdzp));
 	if (error != 0)
 		goto fail;
-	VOP_UNLOCK(svp, 0);
+	VOP_UNLOCK(svp);
 
 	tcn.cn_nameptr = tname;
 	tcn.cn_namelen = strlen(tname);
@@ -698,7 +710,7 @@ zfs_replay_rename(void *arg1, void *arg2, boolean_t byteswap)
 	if (error == EJUSTRETURN)
 		tvp = NULL;
 	else if (error != 0) {
-		VOP_UNLOCK(ZTOV(tdzp), 0);
+		VOP_UNLOCK(ZTOV(tdzp));
 		goto fail;
 	}
 
@@ -913,7 +925,7 @@ zfs_replay_setattr(void *arg1, void *arg2, boolean_t byteswap)
 	vp = ZTOV(zp);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	error = VOP_SETATTR(vp, vap, kcred);
-	VOP_UNLOCK(vp, 0);
+	VOP_UNLOCK(vp);
 
 	zfs_fuid_info_free(zfsvfs->z_fuid_replay);
 	zfsvfs->z_fuid_replay = NULL;
@@ -954,7 +966,7 @@ zfs_replay_acl_v0(void *arg1, void *arg2, boolean_t byteswap)
 	vp = ZTOV(zp);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	error = zfs_setsecattr(vp, &vsa, 0, kcred, NULL);
-	VOP_UNLOCK(vp, 0);
+	VOP_UNLOCK(vp);
 
 	VN_RELE(vp);
 
@@ -1018,7 +1030,7 @@ zfs_replay_acl(void *arg1, void *arg2, boolean_t byteswap)
 	vp = ZTOV(zp);
 	vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 	error = zfs_setsecattr(vp, &vsa, 0, kcred, NULL);
-	VOP_UNLOCK(vp, 0);
+	VOP_UNLOCK(vp);
 
 	if (zfsvfs->z_fuid_replay)
 		zfs_fuid_info_free(zfsvfs->z_fuid_replay);

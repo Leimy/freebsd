@@ -276,14 +276,14 @@ null_update_chw(struct ieee80211com *ic)
 
 int
 ic_printf(struct ieee80211com *ic, const char * fmt, ...)
-{ 
+{
 	va_list ap;
 	int retval;
 
 	retval = printf("%s: ", ic->ic_name);
 	va_start(ap, fmt);
 	retval += vprintf(fmt, ap);
-	va_end(ap);  
+	va_end(ap);
 	return (retval);
 }
 
@@ -386,6 +386,15 @@ ieee80211_ifdetach(struct ieee80211com *ic)
 {
 	struct ieee80211vap *vap;
 
+	/*
+	 * We use this as an indicator that ifattach never had a chance to be
+	 * called, e.g. early driver attach failed and ifdetach was called
+	 * during subsequent detach.  Never fear, for we have nothing to do
+	 * here.
+	 */
+	if (ic->ic_tq == NULL)
+		return;
+
 	mtx_lock(&ic_list_mtx);
 	LIST_REMOVE(ic, ic_next);
 	mtx_unlock(&ic_list_mtx);
@@ -396,8 +405,10 @@ ieee80211_ifdetach(struct ieee80211com *ic)
 	 * The VAP is responsible for setting and clearing
 	 * the VIMAGE context.
 	 */
-	while ((vap = TAILQ_FIRST(&ic->ic_vaps)) != NULL)
+	while ((vap = TAILQ_FIRST(&ic->ic_vaps)) != NULL) {
+		ieee80211_com_vdetach(vap);
 		ieee80211_vap_destroy(vap);
+	}
 	ieee80211_waitfor_parent(ic);
 
 	ieee80211_sysctl_detach(ic);
@@ -605,6 +616,12 @@ ieee80211_vap_setup(struct ieee80211com *ic, struct ieee80211vap *vap,
 	if (vap->iv_opmode == IEEE80211_M_HOSTAP &&
 	    (vap->iv_caps & IEEE80211_C_DFS))
 		vap->iv_flags_ext |= IEEE80211_FEXT_DFS;
+	/* NB: only flip on U-APSD for hostap/sta for now */
+	if ((vap->iv_opmode == IEEE80211_M_STA)
+	    || (vap->iv_opmode == IEEE80211_M_HOSTAP)) {
+		if (vap->iv_caps & IEEE80211_C_UAPSD)
+			vap->iv_flags_ext |= IEEE80211_FEXT_UAPSD;
+	}
 
 	vap->iv_des_chan = IEEE80211_CHAN_ANYC;		/* any channel is ok */
 	vap->iv_bmissthreshold = IEEE80211_HWBMISS_DEFAULT;
@@ -634,6 +651,7 @@ ieee80211_vap_setup(struct ieee80211com *ic, struct ieee80211vap *vap,
 	ieee80211_scan_vattach(vap);
 	ieee80211_regdomain_vattach(vap);
 	ieee80211_radiotap_vattach(vap);
+	ieee80211_vap_reset_erp(vap);
 	ieee80211_ratectl_set(vap, IEEE80211_RATECTL_NONE);
 
 	return 0;
@@ -702,7 +720,7 @@ ieee80211_vap_attach(struct ieee80211vap *vap, ifm_change_cb_t media_change,
 	return 1;
 }
 
-/* 
+/*
  * Tear down vap state and reclaim the ifnet.
  * The driver is assumed to have prepared for
  * this; e.g. by turning off interrupts for the
@@ -1375,6 +1393,8 @@ getflags(const uint8_t bands[], uint32_t flags[], int ht40, int vht80)
 
 /*
  * Add one 20 MHz channel into specified channel list.
+ * You MUST NOT mix bands when calling this.  It will not add 5ghz
+ * channels if you have any B/G/N band bit set.
  */
 /* XXX VHT */
 int
@@ -1621,6 +1641,17 @@ ieee80211_add_channel_list_2ghz(struct ieee80211_channel chans[], int maxchans,
 }
 
 int
+ieee80211_add_channels_default_2ghz(struct ieee80211_channel chans[],
+    int maxchans, int *nchans, const uint8_t bands[], int ht40)
+{
+	const uint8_t default_chan_list[] =
+	    { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+
+	return (ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
+	    default_chan_list, nitems(default_chan_list), bands, ht40));
+}
+
+int
 ieee80211_add_channel_list_5ghz(struct ieee80211_channel chans[], int maxchans,
     int *nchans, const uint8_t ieee[], int nieee, const uint8_t bands[],
     int ht40)
@@ -1760,7 +1791,7 @@ addmedia(struct ifmedia *media, int caps, int addsta, int mode, int mword)
 #define	ADD(_ic, _s, _o) \
 	ifmedia_add(media, \
 		IFM_MAKEWORD(IFM_IEEE80211, (_s), (_o), 0), 0, NULL)
-	static const u_int mopts[IEEE80211_MODE_MAX] = { 
+	static const u_int mopts[IEEE80211_MODE_MAX] = {
 	    [IEEE80211_MODE_AUTO]	= IFM_AUTO,
 	    [IEEE80211_MODE_11A]	= IFM_IEEE80211_11A,
 	    [IEEE80211_MODE_11B]	= IFM_IEEE80211_11B,
@@ -2176,7 +2207,7 @@ ieee80211_setmode(struct ieee80211com *ic, enum ieee80211_phymode mode)
 		ieee80211_setbasicrates(&ic->ic_sup_rates[mode], mode);
 
 	ic->ic_curmode = mode;
-	ieee80211_reset_erp(ic);	/* reset ERP state */
+	ieee80211_reset_erp(ic);	/* reset global ERP state */
 
 	return 0;
 }
@@ -2386,13 +2417,13 @@ ieee80211_rate2media(struct ieee80211com *ic, int rate, enum ieee80211_phymode m
 	case IEEE80211_MODE_11NA:
 	case IEEE80211_MODE_TURBO_A:
 	case IEEE80211_MODE_STURBO_A:
-		return findmedia(rates, nitems(rates), 
+		return findmedia(rates, nitems(rates),
 		    rate | IFM_IEEE80211_11A);
 	case IEEE80211_MODE_11B:
-		return findmedia(rates, nitems(rates), 
+		return findmedia(rates, nitems(rates),
 		    rate | IFM_IEEE80211_11B);
 	case IEEE80211_MODE_FH:
-		return findmedia(rates, nitems(rates), 
+		return findmedia(rates, nitems(rates),
 		    rate | IFM_IEEE80211_FH);
 	case IEEE80211_MODE_AUTO:
 		/* NB: ic may be NULL for some drivers */

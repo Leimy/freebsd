@@ -30,14 +30,67 @@
 --
 
 local config = require("config")
+local hook = require("hook")
 
 local core = {}
+
+local default_safe_mode = false
+local default_single_user = false
+local default_verbose = false
 
 local function composeLoaderCmd(cmd_name, argstr)
 	if argstr ~= nil then
 		cmd_name = cmd_name .. " " .. argstr
 	end
 	return cmd_name
+end
+
+local function recordDefaults()
+	-- On i386, hint.acpi.0.rsdp will be set before we're loaded. On !i386,
+	-- it will generally be set upon execution of the kernel. Because of
+	-- this, we can't (or don't really want to) detect/disable ACPI on !i386
+	-- reliably. Just set it enabled if we detect it and leave well enough
+	-- alone if we don't.
+	local boot_acpi = core.isSystem386() and core.getACPIPresent(false)
+	local boot_single = loader.getenv("boot_single") or "no"
+	local boot_verbose = loader.getenv("boot_verbose") or "no"
+	default_single_user = boot_single:lower() ~= "no"
+	default_verbose = boot_verbose:lower() ~= "no"
+
+	if boot_acpi then
+		core.setACPI(true)
+	end
+	core.setSingleUser(default_single_user)
+	core.setVerbose(default_verbose)
+end
+
+
+-- Globals
+-- try_include will return the loaded module on success, or false and the error
+-- message on failure.
+function try_include(module)
+	if module:sub(1, 1) ~= "/" then
+		local lua_path = loader.lua_path
+		-- XXX Temporary compat shim; this should be removed once the
+		-- loader.lua_path export has sufficiently spread.
+		if lua_path == nil then
+			lua_path = "/boot/lua"
+		end
+		module = lua_path .. "/" .. module
+		-- We only attempt to append an extension if an absolute path
+		-- wasn't specified.  This assumes that the caller either wants
+		-- to treat this like it would require() and specify just the
+		-- base filename, or they know what they're doing as they've
+		-- specified an absolute path and we shouldn't impede.
+		if module:match(".lua$") == nil then
+			module = module .. ".lua"
+		end
+	end
+	if lfs.attributes(module, "mode") ~= "file" then
+		return
+	end
+
+	return dofile(module)
 end
 
 -- Module exports
@@ -50,6 +103,7 @@ core.KEY_DELETE		= 127
 -- other contexts (outside of Lua) may mean 'octal'
 core.KEYSTR_ESCAPE	= "\027"
 core.KEYSTR_CSI		= core.KEYSTR_ESCAPE .. "["
+core.KEYSTR_RESET	= core.KEYSTR_ESCAPE .. "c"
 
 core.MENU_RETURN	= "return"
 core.MENU_ENTRY		= "entry"
@@ -138,7 +192,7 @@ function core.setSafeMode(safe_mode)
 	core.sm = safe_mode
 end
 
-function core.configReloaded()
+function core.clearCachedKernels()
 	-- Clear the kernel cache on config changes, autodetect might have
 	-- changed or if we've switched boot environments then we could have
 	-- a new kernel set.
@@ -164,7 +218,7 @@ function core.kernelList()
 	end
 
 	if v ~= nil then
-		for n in v:gmatch("([^; ]+)[; ]?") do
+		for n in v:gmatch("([^;, ]+)[;, ]?") do
 			if unique[n] == nil then
 				i = i + 1
 				kernels[i] = n
@@ -247,9 +301,9 @@ end
 
 function core.setDefaults()
 	core.setACPI(core.getACPIPresent(true))
-	core.setSafeMode(false)
-	core.setSingleUser(false)
-	core.setVerbose(false)
+	core.setSafeMode(default_safe_mode)
+	core.setSingleUser(default_single_user)
+	core.setVerbose(default_verbose)
 end
 
 function core.autoboot(argstr)
@@ -273,6 +327,12 @@ function core.isSingleUserBoot()
 	return single_user ~= nil and single_user:lower() == "yes"
 end
 
+function core.isUEFIBoot()
+	local efiver = loader.getenv("efi-version")
+
+	return efiver ~= nil
+end
+
 function core.isZFSBoot()
 	local c = loader.getenv("currdev")
 
@@ -282,15 +342,17 @@ function core.isZFSBoot()
 	return false
 end
 
-function core.isSerialBoot()
+function core.isSerialConsole()
 	local c = loader.getenv("console")
-
 	if c ~= nil then
 		if c:find("comconsole") ~= nil then
 			return true
 		end
 	end
+	return false
+end
 
+function core.isSerialBoot()
 	local s = loader.getenv("boot_serial")
 	if s ~= nil then
 		return true
@@ -309,16 +371,7 @@ end
 
 -- Is the menu skipped in the environment in which we've booted?
 function core.isMenuSkipped()
-	if core.isSerialBoot() then
-		return true
-	end
-	local c = string.lower(loader.getenv("console") or "")
-	if c:match("^efi[ ;]") ~= nil or c:match("[ ;]efi[ ;]") ~= nil then
-		return true
-	end
-
-	c = string.lower(loader.getenv("beastie_disable") or "")
-	return c == "yes"
+	return string.lower(loader.getenv("beastie_disable") or "") == "yes"
 end
 
 -- This may be a better candidate for a 'utility' module.
@@ -357,11 +410,6 @@ function core.popFrontTable(tbl)
 	return first_value, new_tbl
 end
 
--- On i386, hint.acpi.0.rsdp will be set before we're loaded. On !i386, it will
--- generally be set upon execution of the kernel. Because of this, we can't (or
--- don't really want to) detect/disable ACPI on !i386 reliably. Just set it
--- enabled if we detect it and leave well enough alone if we don't.
-if core.isSystem386() and core.getACPIPresent(false) then
-	core.setACPI(true)
-end
+recordDefaults()
+hook.register("config.reloaded", core.clearCachedKernels)
 return core

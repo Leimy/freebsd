@@ -42,6 +42,8 @@
 #define CMD_WRITE_STATUS	0x01
 #define CMD_READ		0x03
 #define CMD_FAST_READ		0x0B
+#define CMD_READ_DUAL_IO	0xBB
+#define CMD_READ_QUAD_OUTPUT	0x6B
 #define CMD_PAGE_PROGRAM	0x02
 #define CMD_SECTOR_ERASE	0xD8
 #define CMD_BULK_ERASE		0xC7
@@ -49,6 +51,11 @@
 #define	CMD_BLOCK_32K_ERASE	0x52
 #define	CMD_ENTER_4B_MODE	0xB7
 #define	CMD_EXIT_4B_MODE	0xE9
+
+/* Quad 4B-addressing operations. */
+#define	CMD_QUAD_SECTOR_ERASE	0xDC
+#define	CMD_QUAD_PAGE_PROGRAM	0x34
+#define	CMD_READ_4B_QUAD_OUTPUT	0x6C
 
 /*
  * Status register flags

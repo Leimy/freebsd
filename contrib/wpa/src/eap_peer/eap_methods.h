@@ -16,7 +16,6 @@ const struct eap_method * eap_peer_get_methods(size_t *count);
 
 struct eap_method * eap_peer_method_alloc(int version, int vendor,
 					  EapType method, const char *name);
-void eap_peer_method_free(struct eap_method *method);
 int eap_peer_method_register(struct eap_method *method);
 
 
@@ -98,6 +97,7 @@ int eap_peer_psk_register(void);
 int eap_peer_aka_register(void);
 int eap_peer_aka_prime_register(void);
 int eap_peer_fast_register(void);
+int eap_peer_teap_register(void);
 int eap_peer_pax_register(void);
 int eap_peer_sake_register(void);
 int eap_peer_gpsk_register(void);

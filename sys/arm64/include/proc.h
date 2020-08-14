@@ -40,7 +40,7 @@ struct mdthread {
 };
 
 struct mdproc {
-	vm_offset_t	md_l0addr;
+	long	md_dummy;
 };
 
 #define	KINFO_PROC_SIZE	1088
@@ -53,5 +53,19 @@ struct syscall_args {
 	register_t args[MAXARGS];
 	int narg;
 };
+
+#ifdef _KERNEL
+
+#include <machine/pcb.h>
+
+#define	GET_STACK_USAGE(total, used) do {				\
+	struct thread *td = curthread;					\
+	(total) = td->td_kstack_pages * PAGE_SIZE - sizeof(struct pcb);	\
+	(used) = (char *)td->td_kstack +				\
+	    td->td_kstack_pages * PAGE_SIZE -				\
+	    (char *)&td;						\
+} while (0)
+
+#endif
 
 #endif /* !_MACHINE_PROC_H_ */

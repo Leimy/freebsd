@@ -76,6 +76,7 @@ __FBSDID("$FreeBSD$");
 
 static int	devinfo_init_devices(int generation);
 static int	devinfo_init_resources(int generation);
+static void	devinfo_free_dev(struct devinfo_i_dev *dd);
 
 TAILQ_HEAD(,devinfo_i_dev)	devinfo_dev;
 TAILQ_HEAD(,devinfo_i_rman)	devinfo_rman;
@@ -125,7 +126,8 @@ devinfo_init(void)
 		}
 		if ((ub_size != sizeof(ubus)) ||
 		    (ubus.ub_version != BUS_USER_VERSION)) {
-			warn("kernel bus interface version mismatch");
+			warnx("kernel bus interface version mismatch: kernel %d expected %d",
+			    ubus.ub_version, BUS_USER_VERSION);
 			return(EINVAL);
 		}
 		debug("generation count is %d", ubus.ub_generation);
@@ -174,7 +176,7 @@ devinfo_init_devices(int generation)
 	int			name2oid[2];
 	int			oid[CTL_MAXNAME + 12];
 	size_t			oidlen, rlen;
-	char			*name;
+	char			*name, *walker, *ep;
 	int			error;
 
 	/* 
@@ -219,26 +221,44 @@ devinfo_init_devices(int generation)
 				warn("sysctl hw.bus.devices.%d", dev_idx);
 			return(errno);
 		}
-		if ((dd = malloc(sizeof(*dd))) == NULL)
+		if (rlen != sizeof(udev)) {
+			warnx("sysctl returned wrong data %zd bytes instead of %zd",
+			    rlen, sizeof(udev));
+			return (EINVAL);
+		}
+		if ((dd = calloc(1, sizeof(*dd))) == NULL)
 			return(ENOMEM);
 		dd->dd_dev.dd_handle = udev.dv_handle;
 		dd->dd_dev.dd_parent = udev.dv_parent;
-		snprintf(dd->dd_name, sizeof(dd->dd_name), "%s", udev.dv_name);
-		dd->dd_dev.dd_name = &dd->dd_name[0];
-		snprintf(dd->dd_desc, sizeof(dd->dd_desc), "%s", udev.dv_desc);
-		dd->dd_dev.dd_desc = &dd->dd_desc[0];
-		snprintf(dd->dd_drivername, sizeof(dd->dd_drivername), "%s",
-		    udev.dv_drivername);
-		dd->dd_dev.dd_drivername = &dd->dd_drivername[0];
-		snprintf(dd->dd_pnpinfo, sizeof(dd->dd_pnpinfo), "%s",
-		    udev.dv_pnpinfo);
-		dd->dd_dev.dd_pnpinfo = &dd->dd_pnpinfo[0];
-		snprintf(dd->dd_location, sizeof(dd->dd_location), "%s",
-		    udev.dv_location);
-		dd->dd_dev.dd_location = &dd->dd_location[0];
 		dd->dd_dev.dd_devflags = udev.dv_devflags;
 		dd->dd_dev.dd_flags = udev.dv_flags;
 		dd->dd_dev.dd_state = udev.dv_state;
+
+		walker = udev.dv_fields;
+		ep = walker + sizeof(udev.dv_fields);
+		dd->dd_name = NULL;
+		dd->dd_desc = NULL;
+		dd->dd_drivername = NULL;
+		dd->dd_pnpinfo = NULL;
+		dd->dd_location = NULL;
+#define UNPACK(x)							\
+		dd->dd_dev.x = dd->x = strdup(walker);			\
+		if (dd->x == NULL) {					\
+			devinfo_free_dev(dd);				\
+			return(ENOMEM);					\
+		}							\
+		if (walker + strnlen(walker, ep - walker) >= ep) {	\
+			devinfo_free_dev(dd);				\
+			return(EINVAL);					\
+		}							\
+		walker += strlen(walker) + 1;
+
+		UNPACK(dd_name);
+		UNPACK(dd_desc);
+		UNPACK(dd_drivername);
+		UNPACK(dd_pnpinfo);
+		UNPACK(dd_location);
+#undef UNPACK
 		TAILQ_INSERT_TAIL(&devinfo_dev, dd, dd_link);
 	}
 	debug("fetched %d devices", dev_idx);
@@ -350,6 +370,20 @@ devinfo_init_resources(int generation)
 }
 
 /*
+ * Free an individual dev.
+ */
+static void
+devinfo_free_dev(struct devinfo_i_dev *dd)
+{
+	free(dd->dd_name);
+	free(dd->dd_desc);
+	free(dd->dd_drivername);
+	free(dd->dd_pnpinfo);
+	free(dd->dd_location);
+	free(dd);
+}	
+
+/*
  * Free the list contents.
  */
 void
@@ -361,7 +395,7 @@ devinfo_free(void)
 
 	while ((dd = TAILQ_FIRST(&devinfo_dev)) != NULL) {
 		TAILQ_REMOVE(&devinfo_dev, dd, dd_link);
-		free(dd);
+		devinfo_free_dev(dd);
 	}
 	while ((dm = TAILQ_FIRST(&devinfo_rman)) != NULL) {
 		TAILQ_REMOVE(&devinfo_rman, dm, dm_link);

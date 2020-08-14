@@ -68,6 +68,7 @@ __FBSDID("$FreeBSD$");
 
 #include <net/if.h>
 #include <net/route.h>
+#include <net/route/route_ctl.h>
 #include <netinet/in.h>
 
 #include <fs/nfs/nfsport.h>
@@ -86,6 +87,7 @@ extern enum nfsiod_state ncl_iodwant[NFS_MAXASYNCDAEMON];
 extern struct nfsmount *ncl_iodmount[NFS_MAXASYNCDAEMON];
 extern struct mtx ncl_iod_mutex;
 NFSCLSTATEMUTEX;
+extern struct mtx nfsrv_dslock_mtx;
 
 MALLOC_DEFINE(M_NEWNFSREQ, "newnfsclient_req", "NFS request header");
 MALLOC_DEFINE(M_NEWNFSMNT, "newnfsmnt", "NFS mount struct");
@@ -135,7 +137,8 @@ static struct vfsops nfs_vfsops = {
 	.vfs_init =		ncl_init,
 	.vfs_mount =		nfs_mount,
 	.vfs_cmount =		nfs_cmount,
-	.vfs_root =		nfs_root,
+	.vfs_root =		vfs_cache_root,
+	.vfs_cachedroot =	nfs_root,
 	.vfs_statfs =		nfs_statfs,
 	.vfs_sync =		nfs_sync,
 	.vfs_uninit =		ncl_uninit,
@@ -150,7 +153,6 @@ MODULE_VERSION(nfs, 1);
 MODULE_DEPEND(nfs, nfscommon, 1, 1, 1);
 MODULE_DEPEND(nfs, krpc, 1, 1, 1);
 MODULE_DEPEND(nfs, nfssvc, 1, 1, 1);
-MODULE_DEPEND(nfs, nfslock, 1, 1, 1);
 
 /*
  * This structure is now defined in sys/nfs/nfs_diskless.c so that it
@@ -464,18 +466,27 @@ nfs_mountroot(struct mount *mp)
 	if (nd->mygateway.sin_len != 0 &&
 	    nd->mygateway.sin_addr.s_addr != 0) {
 		struct sockaddr_in mask, sin;
+		struct epoch_tracker et;
+		struct rt_addrinfo info;
+		struct rib_cmd_info rc;
 
 		bzero((caddr_t)&mask, sizeof(mask));
 		sin = mask;
 		sin.sin_family = AF_INET;
 		sin.sin_len = sizeof(sin);
                 /* XXX MRT use table 0 for this sort of thing */
+		NET_EPOCH_ENTER(et);
 		CURVNET_SET(TD_TO_VNET(td));
-		error = rtrequest_fib(RTM_ADD, (struct sockaddr *)&sin,
-		    (struct sockaddr *)&nd->mygateway,
-		    (struct sockaddr *)&mask,
-		    RTF_UP | RTF_GATEWAY, NULL, RT_DEFAULT_FIB);
+
+		bzero((caddr_t)&info, sizeof(info));
+		info.rti_flags = RTF_UP | RTF_GATEWAY;
+		info.rti_info[RTAX_DST] = (struct sockaddr *)&sin;
+		info.rti_info[RTAX_GATEWAY] = (struct sockaddr *)&nd->mygateway;
+		info.rti_info[RTAX_NETMASK] = (struct sockaddr *)&mask;
+
+		error = rib_action(RT_DEFAULT_FIB, RTM_ADD, &info, &rc);
 		CURVNET_RESTORE();
+		NET_EPOCH_EXIT(et);
 		if (error)
 			panic("nfs_mountroot: RTM_ADD: %d", error);
 	}
@@ -707,7 +718,7 @@ nfs_decode_args(struct mount *mp, struct nfsmount *nmp, struct nfs_args *argp,
 		    nmp->nm_soproto = argp->proto;
 		    if (nmp->nm_sotype == SOCK_DGRAM)
 			while (newnfs_connect(nmp, &nmp->nm_sockreq,
-			    cred, td, 0)) {
+			    cred, td, 0, false)) {
 				printf("newnfs_args: retrying connect\n");
 				(void) nfs_catnap(PSOCK, 0, "nfscon");
 			}
@@ -1149,7 +1160,7 @@ nfs_mount(struct mount *mp)
 	if (vfs_getopt(mp->mnt_optnew, "minorversion", (void **)&opt, NULL) ==
 	    0) {
 		ret = sscanf(opt, "%d", &minvers);
-		if (ret != 1 || minvers < 0 || minvers > 1 ||
+		if (ret != 1 || minvers < 0 || minvers > 2 ||
 		    (args.flags & NFSMNT_NFSV4) == 0) {
 			vfs_mount_error(mp, "illegal minorversion: %s", opt);
 			error = EINVAL;
@@ -1237,8 +1248,7 @@ nfs_mount(struct mount *mp)
 		bzero(&hst[hstlen], MNAMELEN - hstlen);
 		args.hostname = hst;
 		/* getsockaddr() call must be after above copyin() calls */
-		error = getsockaddr(&nam, (caddr_t)args.addr,
-		    args.addrlen);
+		error = getsockaddr(&nam, args.addr, args.addrlen);
 		if (error != 0)
 			goto out;
 	} else if (nfs_mount_parse_from(mp->mnt_optnew,
@@ -1517,7 +1527,7 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 		nmp->nm_sockreq.nr_vers = NFS_VER2;
 
 
-	if ((error = newnfs_connect(nmp, &nmp->nm_sockreq, cred, td, 0)))
+	if ((error = newnfs_connect(nmp, &nmp->nm_sockreq, cred, td, 0, false)))
 		goto bad;
 	/* For NFSv4.1, get the clientid now. */
 	if (nmp->nm_minorvers > 0) {
@@ -1543,10 +1553,8 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 			if (error)
 				(void) nfs_catnap(PZERO, error, "nfsgetdirp");
 		} while (error && --trycnt > 0);
-		if (error) {
-			error = nfscl_maperr(td, error, (uid_t)0, (gid_t)0);
+		if (error)
 			goto bad;
-		}
 	}
 
 	/*
@@ -1625,7 +1633,8 @@ mountnfs(struct nfs_args *argp, struct mount *mp, struct sockaddr *nam,
 		/*
 		 * Lose the lock but keep the ref.
 		 */
-		NFSVOPUNLOCK(*vpp, 0);
+		NFSVOPUNLOCK(*vpp);
+		vfs_cache_root_set(mp, *vpp);
 		return (0);
 	}
 	error = EIO;
@@ -1672,6 +1681,7 @@ nfs_unmount(struct mount *mp, int mntflags)
 	if (mntflags & MNT_FORCE)
 		flags |= FORCECLOSE;
 	nmp = VFSTONFS(mp);
+	error = 0;
 	/*
 	 * Goes something like this..
 	 * - Call vflush() to clear out vnodes for this filesystem
@@ -1680,6 +1690,12 @@ nfs_unmount(struct mount *mp, int mntflags)
 	 */
 	/* In the forced case, cancel any outstanding requests. */
 	if (mntflags & MNT_FORCE) {
+		NFSDDSLOCK();
+		if (nfsv4_findmirror(nmp) != NULL)
+			error = ENXIO;
+		NFSDDSUNLOCK();
+		if (error)
+			goto out;
 		error = newnfs_nmcancelreqs(nmp);
 		if (error)
 			goto out;
@@ -1706,13 +1722,13 @@ nfs_unmount(struct mount *mp, int mntflags)
 		mtx_unlock(&nmp->nm_mtx);
 	}
 	/* Make sure no nfsiods are assigned to this mount. */
-	mtx_lock(&ncl_iod_mutex);
+	NFSLOCKIOD();
 	for (i = 0; i < NFS_MAXASYNCDAEMON; i++)
 		if (ncl_iodmount[i] == nmp) {
 			ncl_iodwant[i] = NFSIOD_AVAILABLE;
 			ncl_iodmount[i] = NULL;
 		}
-	mtx_unlock(&ncl_iod_mutex);
+	NFSUNLOCKIOD();
 
 	/*
 	 * We can now set mnt_data to NULL and wait for
@@ -1819,7 +1835,7 @@ loop:
 		error = VOP_FSYNC(vp, waitfor, td);
 		if (error)
 			allerror = error;
-		NFSVOPUNLOCK(vp, 0);
+		NFSVOPUNLOCK(vp);
 		vrele(vp);
 	}
 	return (allerror);

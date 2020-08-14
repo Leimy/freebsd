@@ -88,9 +88,6 @@ static driver_t mpr_pci_driver = {
 	sizeof(struct mpr_softc)
 };
 
-static devclass_t	mpr_devclass;
-DRIVER_MODULE(mpr, pci, mpr_pci_driver, mpr_devclass, 0, 0);
-MODULE_DEPEND(mpr, cam, 1, 1, 1);
 
 struct mpr_ident {
 	uint16_t	vendor;
@@ -151,8 +148,40 @@ struct mpr_ident {
 	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_SAS3716,
 	    0xffff, 0xffff, MPR_FLAGS_GEN35_IOC,
 	    "Avago Technologies (LSI) SAS3716" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_INVALID0_SAS3816,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) INVALID0 SAS3816" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_CFG_SEC_SAS3816,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) CFG SEC SAS3816" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_HARD_SEC_SAS3816,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) HARD SEC SAS3816" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_INVALID1_SAS3816,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) INVALID1 SAS3816" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_INVALID0_SAS3916,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) INVALID0 SAS3916" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_CFG_SEC_SAS3916,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) CFG SEC SAS3916" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_HARD_SEC_SAS3916,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) HARD SEC SAS3916" },
+	{ MPI2_MFGPAGE_VENDORID_LSI, MPI26_MFGPAGE_DEVID_INVALID1_SAS3916,
+	    0xffff, 0xffff, (MPR_FLAGS_GEN35_IOC | MPR_FLAGS_SEA_IOC),
+	    "Broadcom Inc. (LSI) INVALID1 SAS3916" },
 	{ 0, 0, 0, 0, 0, NULL }
 };
+
+
+static devclass_t	mpr_devclass;
+DRIVER_MODULE(mpr, pci, mpr_pci_driver, mpr_devclass, 0, 0);
+MODULE_PNP_INFO("U16:vendor;U16:device;U16:subvendor;U16:subdevice;D:#", pci,
+    mpr, mpr_identifiers, nitems(mpr_identifiers) - 1);
+
+MODULE_DEPEND(mpr, cam, 1, 1, 1);
 
 static struct mpr_ident *
 mpr_find_ident(device_t dev)
@@ -191,6 +220,7 @@ mpr_pci_probe(device_t dev)
 static int
 mpr_pci_attach(device_t dev)
 {
+	bus_dma_tag_template_t t;
 	struct mpr_softc *sc;
 	struct mpr_ident *m;
 	int error, i;
@@ -200,6 +230,21 @@ mpr_pci_attach(device_t dev)
 	sc->mpr_dev = dev;
 	m = mpr_find_ident(dev);
 	sc->mpr_flags = m->flags;
+
+	switch (m->device) {
+	case MPI26_MFGPAGE_DEVID_INVALID0_SAS3816:
+	case MPI26_MFGPAGE_DEVID_INVALID1_SAS3816:
+	case MPI26_MFGPAGE_DEVID_INVALID0_SAS3916:
+	case MPI26_MFGPAGE_DEVID_INVALID1_SAS3916:
+		mpr_printf(sc, "HBA is in Non Secure mode\n");
+		return (ENXIO);
+	case MPI26_MFGPAGE_DEVID_CFG_SEC_SAS3816:
+	case MPI26_MFGPAGE_DEVID_CFG_SEC_SAS3916:
+		mpr_printf(sc, "HBA is in Configurable Secure mode\n");
+		break;
+	default:
+		break;
+	}
 
 	mpr_get_tunables(sc);
 
@@ -223,17 +268,8 @@ mpr_pci_attach(device_t dev)
 	sc->mpr_bhandle = rman_get_bushandle(sc->mpr_regs_resource);
 
 	/* Allocate the parent DMA tag */
-	if (bus_dma_tag_create( bus_get_dma_tag(dev),	/* parent */
-				1, 0,			/* algnmnt, boundary */
-				BUS_SPACE_MAXADDR,	/* lowaddr */
-				BUS_SPACE_MAXADDR,	/* highaddr */
-				NULL, NULL,		/* filter, filterarg */
-				BUS_SPACE_MAXSIZE_32BIT,/* maxsize */
-				BUS_SPACE_UNRESTRICTED,	/* nsegments */
-				BUS_SPACE_MAXSIZE_32BIT,/* maxsegsize */
-				0,			/* flags */
-				NULL, NULL,		/* lockfunc, lockarg */
-				&sc->mpr_parent_dmat)) {
+	bus_dma_template_init(&t, bus_get_dma_tag(dev));
+	if (bus_dma_template_tag(&t, &sc->mpr_parent_dmat)) {
 		mpr_printf(sc, "Cannot allocate parent DMA tag\n");
 		mpr_pci_free(sc);
 		return (ENOMEM);

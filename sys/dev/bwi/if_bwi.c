@@ -307,9 +307,6 @@ static const struct {
 	[108]	= { 7, 3 }
 };
 
-static const uint8_t bwi_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-
 #ifdef BWI_DEBUG
 #ifdef BWI_DEBUG_VERBOSE
 static uint32_t bwi_debug = BWI_DBG_ATTACH | BWI_DBG_INIT | BWI_DBG_TXPOWER;
@@ -490,10 +487,12 @@ bwi_attach(struct bwi_softc *sc)
 				   BWI_SPROM_CARD_INFO_LOCALE);
 	DPRINTF(sc, BWI_DBG_ATTACH, "locale: %d\n", sc->sc_locale);
 	/* XXX use locale */
+
+	ic->ic_softc = sc;
+
 	bwi_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans,
 	    ic->ic_channels);
 
-	ic->ic_softc = sc;
 	ic->ic_name = device_get_nameunit(dev);
 	ic->ic_caps = IEEE80211_C_STA |
 		      IEEE80211_C_SHSLOT |
@@ -1507,6 +1506,7 @@ bwi_stop_locked(struct bwi_softc *sc, int statechg)
 void
 bwi_intr(void *xsc)
 {
+	struct epoch_tracker et;
 	struct bwi_softc *sc = xsc;
 	struct bwi_mac *mac;
 	uint32_t intr_status;
@@ -1626,7 +1626,9 @@ bwi_intr(void *xsc)
 		device_printf(sc->sc_dev, "intr noise\n");
 
 	if (txrx_intr_status[0] & BWI_TXRX_INTR_RX) {
+		NET_EPOCH_ENTER(et);
 		rx_data = sc->sc_rxeof(sc);
+		NET_EPOCH_EXIT(et);
 		if (sc->sc_flags & BWI_F_STOP) {
 			BWI_UNLOCK(sc);
 			return;
@@ -1713,8 +1715,7 @@ bwi_getradiocaps(struct ieee80211com *ic,
 		panic("unknown phymode %d\n", phy->phy_mode);
 	}
 
-	ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
-	    bwi_chan_2ghz, nitems(bwi_chan_2ghz), bands, 0);
+	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
 }
 
 static void
@@ -1731,15 +1732,6 @@ bwi_set_channel(struct ieee80211com *ic)
 	bwi_rf_set_chan(mac, ieee80211_chan2ieee(ic, c), 0);
 
 	sc->sc_rates = ieee80211_get_ratetable(c);
-
-	/*
-	 * Setup radio tap channel freq and flags
-	 */
-	sc->sc_tx_th.wt_chan_freq = sc->sc_rx_th.wr_chan_freq =
-		htole16(c->ic_freq);
-	sc->sc_tx_th.wt_chan_flags = sc->sc_rx_th.wr_chan_flags =
-		htole16(c->ic_flags & 0xffff);
-
 	BWI_UNLOCK(sc);
 }
 

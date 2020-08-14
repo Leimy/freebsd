@@ -54,6 +54,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/disklabel.h>
 #include <sys/filio.h>
 #include <sys/mtio.h>
+#include <sys/time.h>
 
 #include <assert.h>
 #include <capsicum_helpers.h>
@@ -82,26 +83,33 @@ STAT	st;			/* statistics */
 void	(*cfunc)(void);		/* conversion function */
 uintmax_t cpy_cnt;		/* # of blocks to copy */
 static off_t	pending = 0;	/* pending seek if sparse */
-u_int	ddflags = 0;		/* conversion options */
+uint64_t	ddflags = 0;	/* conversion options */
 size_t	cbsz;			/* conversion block size */
 uintmax_t files_cnt = 1;	/* # of files to copy */
 const	u_char *ctab;		/* conversion table */
 char	fill_char;		/* Character to fill with if defined */
 size_t	speed = 0;		/* maximum speed, in bytes per second */
 volatile sig_atomic_t need_summary;
+volatile sig_atomic_t need_progress;
 
 int
 main(int argc __unused, char *argv[])
 {
+	struct itimerval itv = { { 1, 0 }, { 1, 0 } }; /* SIGALARM every second, if needed */
+
 	(void)setlocale(LC_CTYPE, "");
 	jcl(argv);
 	setup();
 
 	caph_cache_catpages();
-	if (cap_enter() == -1 && errno != ENOSYS)
+	if (caph_enter() < 0)
 		err(1, "unable to enter capability mode");
 
 	(void)signal(SIGINFO, siginfo_handler);
+	if (ddflags & C_PROGRESS) {
+		(void)signal(SIGALRM, sigalarm_handler);
+		setitimer(ITIMER_REAL, &itv, NULL);
+	}
 	(void)signal(SIGINT, terminate);
 
 	atexit(summary);
@@ -116,7 +124,8 @@ main(int argc __unused, char *argv[])
 	 * descriptor explicitly so that the summary handler (called
 	 * from an atexit() hook) includes this work.
 	 */
-	close(out.fd);
+	if (close(out.fd) == -1 && errno != EINTR)
+		err(1, "close");
 	exit(0);
 }
 
@@ -134,6 +143,7 @@ static void
 setup(void)
 {
 	u_int cnt;
+	int iflags, oflags;
 	cap_rights_t rights;
 	unsigned long cmds[] = { FIODTYPE, MTIOCTOP };
 
@@ -141,7 +151,10 @@ setup(void)
 		in.name = "stdin";
 		in.fd = STDIN_FILENO;
 	} else {
-		in.fd = open(in.name, O_RDONLY, 0);
+		iflags = 0;
+		if (ddflags & C_IDIRECT)
+			iflags |= O_DIRECT;
+		in.fd = open(in.name, O_RDONLY | iflags, 0);
 		if (in.fd == -1)
 			err(1, "%s", in.name);
 	}
@@ -149,28 +162,43 @@ setup(void)
 	getfdtype(&in);
 
 	cap_rights_init(&rights, CAP_READ, CAP_SEEK);
-	if (cap_rights_limit(in.fd, &rights) == -1 && errno != ENOSYS)
+	if (caph_rights_limit(in.fd, &rights) == -1)
 		err(1, "unable to limit capability rights");
 
 	if (files_cnt > 1 && !(in.flags & ISTAPE))
 		errx(1, "files is not supported for non-tape devices");
 
 	cap_rights_set(&rights, CAP_FTRUNCATE, CAP_IOCTL, CAP_WRITE);
+	if (ddflags & (C_FDATASYNC | C_FSYNC))
+		cap_rights_set(&rights, CAP_FSYNC);
 	if (out.name == NULL) {
 		/* No way to check for read access here. */
 		out.fd = STDOUT_FILENO;
 		out.name = "stdout";
+		if (ddflags & C_OFSYNC) {
+			oflags = fcntl(out.fd, F_GETFL);
+			if (oflags == -1)
+				err(1, "unable to get fd flags for stdout");
+			oflags |= O_FSYNC;
+			if (fcntl(out.fd, F_SETFL, oflags) == -1)
+				err(1, "unable to set fd flags for stdout");
+		}
 	} else {
-#define	OFLAGS \
-    (O_CREAT | (ddflags & (C_SEEK | C_NOTRUNC) ? 0 : O_TRUNC))
-		out.fd = open(out.name, O_RDWR | OFLAGS, DEFFILEMODE);
+		oflags = O_CREAT;
+		if (!(ddflags & (C_SEEK | C_NOTRUNC)))
+			oflags |= O_TRUNC;
+		if (ddflags & C_OFSYNC)
+			oflags |= O_FSYNC;
+		if (ddflags & C_ODIRECT)
+			oflags |= O_DIRECT;
+		out.fd = open(out.name, O_RDWR | oflags, DEFFILEMODE);
 		/*
 		 * May not have read access, so try again with write only.
 		 * Without read we may have a problem if output also does
 		 * not support seeks.
 		 */
 		if (out.fd == -1) {
-			out.fd = open(out.name, O_WRONLY | OFLAGS, DEFFILEMODE);
+			out.fd = open(out.name, O_WRONLY | oflags, DEFFILEMODE);
 			out.flags |= NOREAD;
 			cap_rights_clear(&rights, CAP_READ);
 		}
@@ -180,10 +208,9 @@ setup(void)
 
 	getfdtype(&out);
 
-	if (cap_rights_limit(out.fd, &rights) == -1 && errno != ENOSYS)
+	if (caph_rights_limit(out.fd, &rights) == -1)
 		err(1, "unable to limit capability rights");
-	if (cap_ioctls_limit(out.fd, cmds, nitems(cmds)) == -1 &&
-	    errno != ENOSYS)
+	if (caph_ioctls_limit(out.fd, cmds, nitems(cmds)) == -1)
 		err(1, "unable to limit capability rights");
 
 	if (in.fd != STDIN_FILENO && out.fd != STDIN_FILENO) {
@@ -386,13 +413,15 @@ dd_in(void)
 				memset(in.dbp, 0, in.dbsz);
 		}
 
-		n = read(in.fd, in.dbp, in.dbsz);
-		if (n == 0) {
-			in.dbrcnt = 0;
-			return;
-		}
+		in.dbrcnt = 0;
+fill:
+		n = read(in.fd, in.dbp + in.dbrcnt, in.dbsz - in.dbrcnt);
 
-		/* Read error. */
+		/* EOF */
+		if (n == 0 && in.dbrcnt == 0)
+			return;
+
+		/* Read error */
 		if (n == -1) {
 			/*
 			 * If noerror not specified, die.  POSIX requires that
@@ -416,25 +445,25 @@ dd_in(void)
 			/* If sync not specified, omit block and continue. */
 			if (!(ddflags & C_SYNC))
 				continue;
-
-			/* Read errors count as full blocks. */
-			in.dbcnt += in.dbrcnt = in.dbsz;
-			++st.in_full;
-
-		/* Handle full input blocks. */
-		} else if ((size_t)n == (size_t)in.dbsz) {
-			in.dbcnt += in.dbrcnt = n;
-			++st.in_full;
-
-		/* Handle partial input blocks. */
-		} else {
-			/* If sync, use the entire block. */
-			if (ddflags & C_SYNC)
-				in.dbcnt += in.dbrcnt = in.dbsz;
-			else
-				in.dbcnt += in.dbrcnt = n;
-			++st.in_part;
 		}
+
+		/* If conv=sync, use the entire block. */
+		if (ddflags & C_SYNC)
+			n = in.dbsz;
+
+		/* Count the bytes read for this block. */
+		in.dbrcnt += n;
+
+		/* Count the number of full and partial blocks. */
+		if (in.dbrcnt == in.dbsz)
+			++st.in_full;
+		else if (ddflags & C_IFULLBLOCK && n != 0)
+			goto fill; /* these don't count */
+		else
+			++st.in_part;
+
+		/* Count the total bytes read for this file. */
+		in.dbcnt += in.dbrcnt;
 
 		/*
 		 * POSIX states that if bs is set and no other conversions
@@ -456,11 +485,13 @@ dd_in(void)
 			swapbytes(in.dbp, (size_t)n);
 		}
 
+		/* Advance to the next block. */
 		in.dbp += in.dbrcnt;
 		(*cfunc)();
-		if (need_summary) {
+		if (need_summary)
 			summary();
-		}
+		if (need_progress)
+			progress();
 	}
 }
 
@@ -497,13 +528,21 @@ dd_close(void)
 		if (ftruncate(out.fd, out.seek_offset) == -1)
 			err(1, "truncating %s", out.name);
 	}
+
+	if (ddflags & C_FSYNC) {
+		if (fsync(out.fd) == -1)
+			err(1, "fsyncing %s", out.name);
+	} else if (ddflags & C_FDATASYNC) {
+		if (fdatasync(out.fd) == -1)
+			err(1, "fdatasyncing %s", out.name);
+	}
 }
 
 void
 dd_out(int force)
 {
 	u_char *outp;
-	size_t cnt, i, n;
+	size_t cnt, n;
 	ssize_t nw;
 	static int warned;
 	int sparse;
@@ -536,12 +575,8 @@ dd_out(int force)
 		do {
 			sparse = 0;
 			if (ddflags & C_SPARSE) {
-				sparse = 1;	/* Is buffer sparse? */
-				for (i = 0; i < cnt; i++)
-					if (outp[i] != 0) {
-						sparse = 0;
-						break;
-					}
+				/* Is buffer sparse? */
+				sparse = BISZERO(outp, cnt);
 			}
 			if (sparse && !force) {
 				pending += cnt;

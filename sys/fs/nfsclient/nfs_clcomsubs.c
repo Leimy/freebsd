@@ -41,238 +41,28 @@ __FBSDID("$FreeBSD$");
  * the nfs op functions. They do things like create the rpc header and
  * copy data between mbuf chains and uio lists.
  */
-#ifndef APPLEKEXT
 #include <fs/nfs/nfsport.h>
 
 extern struct nfsstatsv1 nfsstatsv1;
-extern struct nfsv4_opflag nfsv4_opflag[NFSV41_NOPS];
 extern int ncl_mbuf_mlen;
 extern enum vtype newnv2tov_type[8];
 extern enum vtype nv34tov_type[8];
-extern int	nfs_bigreply[NFSV41_NPROCS];
 NFSCLSTATEMUTEX;
-#endif	/* !APPLEKEXT */
 
 static nfsuint64 nfs_nullcookie = {{ 0, 0 }};
-static struct {
-	int	op;
-	int	opcnt;
-	const u_char *tag;
-	int	taglen;
-} nfsv4_opmap[NFSV41_NPROCS] = {
-	{ 0, 1, "Null", 4 },
-	{ NFSV4OP_GETATTR, 1, "Getattr", 7, },
-	{ NFSV4OP_SETATTR, 2, "Setattr", 7, },
-	{ NFSV4OP_LOOKUP, 3, "Lookup", 6, },
-	{ NFSV4OP_ACCESS, 2, "Access", 6, },
-	{ NFSV4OP_READLINK, 2, "Readlink", 8, },
-	{ NFSV4OP_READ, 1, "Read", 4, },
-	{ NFSV4OP_WRITE, 2, "Write", 5, },
-	{ NFSV4OP_OPEN, 5, "Open", 4, },
-	{ NFSV4OP_CREATE, 5, "Create", 6, },
-	{ NFSV4OP_CREATE, 1, "Create", 6, },
-	{ NFSV4OP_CREATE, 3, "Create", 6, },
-	{ NFSV4OP_REMOVE, 1, "Remove", 6, },
-	{ NFSV4OP_REMOVE, 1, "Remove", 6, },
-	{ NFSV4OP_SAVEFH, 5, "Rename", 6, },
-	{ NFSV4OP_SAVEFH, 4, "Link", 4, },
-	{ NFSV4OP_READDIR, 2, "Readdir", 7, },
-	{ NFSV4OP_READDIR, 2, "Readdir", 7, },
-	{ NFSV4OP_GETATTR, 1, "Getattr", 7, },
-	{ NFSV4OP_GETATTR, 1, "Getattr", 7, },
-	{ NFSV4OP_GETATTR, 1, "Getattr", 7, },
-	{ NFSV4OP_COMMIT, 2, "Commit", 6, },
-	{ NFSV4OP_LOOKUPP, 3, "Lookupp", 7, },
-	{ NFSV4OP_SETCLIENTID, 1, "SetClientID", 11, },
-	{ NFSV4OP_SETCLIENTIDCFRM, 1, "SetClientIDConfirm", 18, },
-	{ NFSV4OP_LOCK, 1, "Lock", 4, },
-	{ NFSV4OP_LOCKU, 1, "LockU", 5, },
-	{ NFSV4OP_OPEN, 2, "Open", 4, },
-	{ NFSV4OP_CLOSE, 1, "Close", 5, },
-	{ NFSV4OP_OPENCONFIRM, 1, "Openconfirm", 11, },
-	{ NFSV4OP_LOCKT, 1, "LockT", 5, },
-	{ NFSV4OP_OPENDOWNGRADE, 1, "Opendowngrade", 13, },
-	{ NFSV4OP_RENEW, 1, "Renew", 5, },
-	{ NFSV4OP_PUTROOTFH, 1, "Dirpath", 7, },
-	{ NFSV4OP_RELEASELCKOWN, 1, "Rellckown", 9, },
-	{ NFSV4OP_DELEGRETURN, 1, "Delegret", 8, },
-	{ NFSV4OP_DELEGRETURN, 3, "DelegRemove", 11, },
-	{ NFSV4OP_DELEGRETURN, 7, "DelegRename1", 12, },
-	{ NFSV4OP_DELEGRETURN, 9, "DelegRename2", 12, },
-	{ NFSV4OP_GETATTR, 1, "Getacl", 6, },
-	{ NFSV4OP_SETATTR, 1, "Setacl", 6, },
-	{ NFSV4OP_EXCHANGEID, 1, "ExchangeID", 10, },
-	{ NFSV4OP_CREATESESSION, 1, "CreateSession", 13, },
-	{ NFSV4OP_DESTROYSESSION, 1, "DestroySession", 14, },
-	{ NFSV4OP_DESTROYCLIENTID, 1, "DestroyClient", 13, },
-	{ NFSV4OP_FREESTATEID, 1, "FreeStateID", 11, },
-	{ NFSV4OP_LAYOUTGET, 1, "LayoutGet", 9, },
-	{ NFSV4OP_GETDEVINFO, 1, "GetDeviceInfo", 13, },
-	{ NFSV4OP_LAYOUTCOMMIT, 1, "LayoutCommit", 12, },
-	{ NFSV4OP_LAYOUTRETURN, 1, "LayoutReturn", 12, },
-	{ NFSV4OP_RECLAIMCOMPL, 1, "ReclaimComplete", 15, },
-	{ NFSV4OP_WRITE, 1, "WriteDS", 7, },
-	{ NFSV4OP_READ, 1, "ReadDS", 6, },
-	{ NFSV4OP_COMMIT, 1, "CommitDS", 8, },
-	{ NFSV4OP_OPEN, 3, "OpenLayoutGet", 13, },
-	{ NFSV4OP_OPEN, 8, "CreateLayGet", 12, },
-};
-
-/*
- * NFS RPCS that have large request message size.
- */
-static int nfs_bigrequest[NFSV41_NPROCS] = {
-	0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0
-};
-
-/*
- * Start building a request. Mostly just put the first file handle in
- * place.
- */
-APPLESTATIC void
-nfscl_reqstart(struct nfsrv_descript *nd, int procnum, struct nfsmount *nmp,
-    u_int8_t *nfhp, int fhlen, u_int32_t **opcntpp, struct nfsclsession *sep,
-    int vers, int minorvers)
-{
-	struct mbuf *mb;
-	u_int32_t *tl;
-	int opcnt;
-	nfsattrbit_t attrbits;
-
-	/*
-	 * First, fill in some of the fields of nd.
-	 */
-	nd->nd_slotseq = NULL;
-	if (vers == NFS_VER4) {
-		nd->nd_flag = ND_NFSV4 | ND_NFSCL;
-		if (minorvers == NFSV41_MINORVERSION)
-			nd->nd_flag |= ND_NFSV41;
-	} else if (vers == NFS_VER3)
-		nd->nd_flag = ND_NFSV3 | ND_NFSCL;
-	else {
-		if (NFSHASNFSV4(nmp)) {
-			nd->nd_flag = ND_NFSV4 | ND_NFSCL;
-			if (NFSHASNFSV4N(nmp))
-				nd->nd_flag |= ND_NFSV41;
-		} else if (NFSHASNFSV3(nmp))
-			nd->nd_flag = ND_NFSV3 | ND_NFSCL;
-		else
-			nd->nd_flag = ND_NFSV2 | ND_NFSCL;
-	}
-	nd->nd_procnum = procnum;
-	nd->nd_repstat = 0;
-
-	/*
-	 * Get the first mbuf for the request.
-	 */
-	if (nfs_bigrequest[procnum])
-		NFSMCLGET(mb, M_WAITOK);
-	else
-		NFSMGET(mb);
-	mbuf_setlen(mb, 0);
-	nd->nd_mreq = nd->nd_mb = mb;
-	nd->nd_bpos = NFSMTOD(mb, caddr_t);
-	
-	/*
-	 * And fill the first file handle into the request.
-	 */
-	if (nd->nd_flag & ND_NFSV4) {
-		opcnt = nfsv4_opmap[procnum].opcnt +
-		    nfsv4_opflag[nfsv4_opmap[procnum].op].needscfh;
-		if ((nd->nd_flag & ND_NFSV41) != 0) {
-			opcnt += nfsv4_opflag[nfsv4_opmap[procnum].op].needsseq;
-			if (procnum == NFSPROC_RENEW)
-				/*
-				 * For the special case of Renew, just do a
-				 * Sequence Op.
-				 */
-				opcnt = 1;
-			else if (procnum == NFSPROC_WRITEDS ||
-			    procnum == NFSPROC_COMMITDS)
-				/*
-				 * For the special case of a Writeor Commit to
-				 * a DS, the opcnt == 3, for Sequence, PutFH,
-				 * Write/Commit.
-				 */
-				opcnt = 3;
-		}
-		/*
-		 * What should the tag really be?
-		 */
-		(void) nfsm_strtom(nd, nfsv4_opmap[procnum].tag,
-			nfsv4_opmap[procnum].taglen);
-		NFSM_BUILD(tl, u_int32_t *, 2 * NFSX_UNSIGNED);
-		if ((nd->nd_flag & ND_NFSV41) != 0)
-			*tl++ = txdr_unsigned(NFSV41_MINORVERSION);
-		else
-			*tl++ = txdr_unsigned(NFSV4_MINORVERSION);
-		if (opcntpp != NULL)
-			*opcntpp = tl;
-		*tl = txdr_unsigned(opcnt);
-		if ((nd->nd_flag & ND_NFSV41) != 0 &&
-		    nfsv4_opflag[nfsv4_opmap[procnum].op].needsseq > 0) {
-			if (nfsv4_opflag[nfsv4_opmap[procnum].op].loopbadsess >
-			    0)
-				nd->nd_flag |= ND_LOOPBADSESS;
-			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
-			*tl = txdr_unsigned(NFSV4OP_SEQUENCE);
-			if (sep == NULL) {
-				sep = nfsmnt_mdssession(nmp);
-				nfsv4_setsequence(nmp, nd, sep,
-				    nfs_bigreply[procnum]);
-			} else
-				nfsv4_setsequence(nmp, nd, sep,
-				    nfs_bigreply[procnum]);
-		}
-		if (nfsv4_opflag[nfsv4_opmap[procnum].op].needscfh > 0) {
-			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
-			*tl = txdr_unsigned(NFSV4OP_PUTFH);
-			(void) nfsm_fhtom(nd, nfhp, fhlen, 0);
-			if (nfsv4_opflag[nfsv4_opmap[procnum].op].needscfh
-			    == 2 && procnum != NFSPROC_WRITEDS &&
-			    procnum != NFSPROC_COMMITDS) {
-				NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
-				*tl = txdr_unsigned(NFSV4OP_GETATTR);
-				/*
-				 * For Lookup Ops, we want all the directory
-				 * attributes, so we can load the name cache.
-				 */
-				if (procnum == NFSPROC_LOOKUP ||
-				    procnum == NFSPROC_LOOKUPP)
-					NFSGETATTR_ATTRBIT(&attrbits);
-				else {
-					NFSWCCATTR_ATTRBIT(&attrbits);
-					nd->nd_flag |= ND_V4WCCATTR;
-				}
-				(void) nfsrv_putattrbit(nd, &attrbits);
-			}
-		}
-		if (procnum != NFSPROC_RENEW ||
-		    (nd->nd_flag & ND_NFSV41) == 0) {
-			NFSM_BUILD(tl, u_int32_t *, NFSX_UNSIGNED);
-			*tl = txdr_unsigned(nfsv4_opmap[procnum].op);
-		}
-	} else {
-		(void) nfsm_fhtom(nd, nfhp, fhlen, 0);
-	}
-	if (procnum < NFSV41_NPROCS)
-		NFSINCRGLOBAL(nfsstatsv1.rpccnt[procnum]);
-}
 
 /*
  * copies a uio scatter/gather list to an mbuf chain.
  * NOTE: can ony handle iovcnt == 1
  */
-APPLESTATIC void
+void
 nfsm_uiombuf(struct nfsrv_descript *nd, struct uio *uiop, int siz)
 {
 	char *uiocp;
 	struct mbuf *mp, *mp2;
 	int xfer, left, mlen;
 	int uiosiz, clflg, rem;
-	char *cp, *tcp;
+	char *mcp, *tcp;
 
 	KASSERT(uiop->uio_iovcnt == 1, ("nfsm_uiotombuf: iovcnt != 1"));
 
@@ -282,6 +72,123 @@ nfsm_uiombuf(struct nfsrv_descript *nd, struct uio *uiop, int siz)
 		clflg = 0;
 	rem = NFSM_RNDUP(siz) - siz;
 	mp = mp2 = nd->nd_mb;
+	mcp = nd->nd_bpos;
+	while (siz > 0) {
+		KASSERT((nd->nd_flag & ND_EXTPG) != 0 || mcp ==
+		    mtod(mp, char *) + mp->m_len, ("nfsm_uiombuf: mcp wrong"));
+		left = uiop->uio_iov->iov_len;
+		uiocp = uiop->uio_iov->iov_base;
+		if (left > siz)
+			left = siz;
+		uiosiz = left;
+		while (left > 0) {
+			if ((nd->nd_flag & ND_EXTPG) != 0)
+				mlen = nd->nd_bextpgsiz;
+			else
+				mlen = M_TRAILINGSPACE(mp);
+			if (mlen == 0) {
+				if ((nd->nd_flag & ND_EXTPG) != 0) {
+					mp = nfsm_add_ext_pgs(mp,
+					    nd->nd_maxextsiz, &nd->nd_bextpg);
+					mcp = (char *)(void *)PHYS_TO_DMAP(
+					  mp->m_epg_pa[nd->nd_bextpg]);
+					nd->nd_bextpgsiz = mlen = PAGE_SIZE;
+				} else {
+					if (clflg)
+						NFSMCLGET(mp, M_WAITOK);
+					else
+						NFSMGET(mp);
+					mp->m_len = 0;
+					mlen = M_TRAILINGSPACE(mp);
+					mcp = mtod(mp, char *);
+					mp2->m_next = mp;
+					mp2 = mp;
+				}
+			}
+			xfer = (left > mlen) ? mlen : left;
+			if (uiop->uio_segflg == UIO_SYSSPACE)
+				NFSBCOPY(uiocp, mcp, xfer);
+			else
+				copyin(uiocp, mcp, xfer);
+			mp->m_len += xfer;
+			left -= xfer;
+			uiocp += xfer;
+			mcp += xfer;
+			if ((nd->nd_flag & ND_EXTPG) != 0) {
+				nd->nd_bextpgsiz -= xfer;
+				mp->m_epg_last_len += xfer;
+			}
+			uiop->uio_offset += xfer;
+			uiop->uio_resid -= xfer;
+		}
+		tcp = (char *)uiop->uio_iov->iov_base;
+		tcp += uiosiz;
+		uiop->uio_iov->iov_base = (void *)tcp;
+		uiop->uio_iov->iov_len -= uiosiz;
+		siz -= uiosiz;
+	}
+	if (rem > 0) {
+		if ((nd->nd_flag & ND_EXTPG) == 0 && rem >
+		    M_TRAILINGSPACE(mp)) {
+			NFSMGET(mp);
+			mp->m_len = 0;
+			mp2->m_next = mp;
+			mcp = mtod(mp, char *);
+		} else if ((nd->nd_flag & ND_EXTPG) != 0 && rem >
+		    nd->nd_bextpgsiz) {
+			mp = nfsm_add_ext_pgs(mp, nd->nd_maxextsiz,
+			    &nd->nd_bextpg);
+			mcp = (char *)(void *)
+			    PHYS_TO_DMAP(mp->m_epg_pa[nd->nd_bextpg]);
+			nd->nd_bextpgsiz = PAGE_SIZE;
+		}
+		for (left = 0; left < rem; left++)
+			*mcp++ = '\0';
+		mp->m_len += rem;
+		if ((nd->nd_flag & ND_EXTPG) != 0) {
+			nd->nd_bextpgsiz -= rem;
+			mp->m_epg_last_len += rem;
+		}
+	}
+	nd->nd_bpos = mcp;
+	nd->nd_mb = mp;
+}
+
+/*
+ * copies a uio scatter/gather list to an mbuf chain.
+ * This version returns the mbuf list and does not use "nd".
+ * NOTE: can ony handle iovcnt == 1
+ */
+struct mbuf *
+nfsm_uiombuflist(struct uio *uiop, int siz, u_int maxext)
+{
+	char *uiocp;
+	struct mbuf *mp, *mp2, *firstmp;
+	int extpg, extpgsiz = 0, i, left, mlen, rem, xfer;
+	int uiosiz, clflg;
+	char *mcp, *tcp;
+
+	KASSERT(uiop->uio_iovcnt == 1, ("nfsm_uiotombuf: iovcnt != 1"));
+
+	if (maxext > 0) {
+		mp = mb_alloc_ext_plus_pages(PAGE_SIZE, M_WAITOK);
+		mcp = (char *)(void *)PHYS_TO_DMAP(mp->m_epg_pa[0]);
+		extpg = 0;
+		extpgsiz = PAGE_SIZE;
+	} else {
+		if (siz > ncl_mbuf_mlen) /* or should it >= MCLBYTES ?? */
+			clflg = 1;
+		else
+			clflg = 0;
+		if (clflg != 0)
+			NFSMCLGET(mp, M_WAITOK);
+		else
+			NFSMGET(mp);
+		mcp = mtod(mp, char *);
+	}
+	mp->m_len = 0;
+	firstmp = mp2 = mp;
+	rem = NFSM_RNDUP(siz) - siz;
 	while (siz > 0) {
 		left = uiop->uio_iov->iov_len;
 		uiocp = uiop->uio_iov->iov_base;
@@ -289,33 +196,40 @@ nfsm_uiombuf(struct nfsrv_descript *nd, struct uio *uiop, int siz)
 			left = siz;
 		uiosiz = left;
 		while (left > 0) {
-			mlen = M_TRAILINGSPACE(mp);
-			if (mlen == 0) {
-				if (clflg)
-					NFSMCLGET(mp, M_WAITOK);
-				else
-					NFSMGET(mp);
-				mbuf_setlen(mp, 0);
-				mbuf_setnext(mp2, mp);
-				mp2 = mp;
+			if (maxext > 0)
+				mlen = extpgsiz;
+			else
 				mlen = M_TRAILINGSPACE(mp);
+			if (mlen == 0) {
+				if (maxext > 0) {
+					mp = nfsm_add_ext_pgs(mp, maxext,
+					    &extpg);
+					mlen = extpgsiz = PAGE_SIZE;
+					mcp = (char *)(void *)PHYS_TO_DMAP(
+					    mp->m_epg_pa[extpg]);
+				} else {
+					if (clflg)
+						NFSMCLGET(mp, M_WAITOK);
+					else
+						NFSMGET(mp);
+					mcp = mtod(mp, char *);
+					mlen = M_TRAILINGSPACE(mp);
+					mp->m_len = 0;
+					mp2->m_next = mp;
+					mp2 = mp;
+				}
 			}
 			xfer = (left > mlen) ? mlen : left;
-#ifdef notdef
-			/* Not Yet.. */
-			if (uiop->uio_iov->iov_op != NULL)
-				(*(uiop->uio_iov->iov_op))
-				(uiocp, NFSMTOD(mp, caddr_t) + mbuf_len(mp),
-				    xfer);
-			else
-#endif
 			if (uiop->uio_segflg == UIO_SYSSPACE)
-			    NFSBCOPY(uiocp, NFSMTOD(mp, caddr_t) + mbuf_len(mp),
-				xfer);
+				NFSBCOPY(uiocp, mcp, xfer);
 			else
-			    copyin(CAST_USER_ADDR_T(uiocp), NFSMTOD(mp, caddr_t)
-				+ mbuf_len(mp), xfer);
-			mbuf_setlen(mp, mbuf_len(mp) + xfer);
+				copyin(uiocp, mcp, xfer);
+			mp->m_len += xfer;
+			mcp += xfer;
+			if (maxext > 0) {
+				extpgsiz -= xfer;
+				mp->m_epg_last_len += xfer;
+			}
 			left -= xfer;
 			uiocp += xfer;
 			uiop->uio_offset += xfer;
@@ -328,89 +242,15 @@ nfsm_uiombuf(struct nfsrv_descript *nd, struct uio *uiop, int siz)
 		siz -= uiosiz;
 	}
 	if (rem > 0) {
-		if (rem > M_TRAILINGSPACE(mp)) {
-			NFSMGET(mp);
-			mbuf_setlen(mp, 0);
-			mbuf_setnext(mp2, mp);
-		}
-		cp = NFSMTOD(mp, caddr_t) + mbuf_len(mp);
-		for (left = 0; left < rem; left++)
-			*cp++ = '\0';
-		mbuf_setlen(mp, mbuf_len(mp) + rem);
-		nd->nd_bpos = cp;
-	} else
-		nd->nd_bpos = NFSMTOD(mp, caddr_t) + mbuf_len(mp);
-	nd->nd_mb = mp;
-}
-
-/*
- * copies a uio scatter/gather list to an mbuf chain.
- * This version returns the mbuf list and does not use "nd".
- * NOTE: can ony handle iovcnt == 1
- */
-struct mbuf *
-nfsm_uiombuflist(struct uio *uiop, int siz, struct mbuf **mbp, char **cpp)
-{
-	char *uiocp;
-	struct mbuf *mp, *mp2, *firstmp;
-	int xfer, left, mlen;
-	int uiosiz, clflg, rem;
-	char *tcp;
-
-	KASSERT(uiop->uio_iovcnt == 1, ("nfsm_uiotombuf: iovcnt != 1"));
-
-	if (siz > ncl_mbuf_mlen)	/* or should it >= MCLBYTES ?? */
-		clflg = 1;
-	else
-		clflg = 0;
-	rem = NFSM_RNDUP(siz) - siz;
-	if (clflg != 0)
-		NFSMCLGET(mp, M_WAITOK);
-	else
-		NFSMGET(mp);
-	mbuf_setlen(mp, 0);
-	firstmp = mp2 = mp;
-	while (siz > 0) {
-		left = uiop->uio_iov->iov_len;
-		uiocp = uiop->uio_iov->iov_base;
-		if (left > siz)
-			left = siz;
-		uiosiz = left;
-		while (left > 0) {
-			mlen = M_TRAILINGSPACE(mp);
-			if (mlen == 0) {
-				if (clflg)
-					NFSMCLGET(mp, M_WAITOK);
-				else
-					NFSMGET(mp);
-				mbuf_setlen(mp, 0);
-				mbuf_setnext(mp2, mp);
-				mp2 = mp;
-				mlen = M_TRAILINGSPACE(mp);
-			}
-			xfer = (left > mlen) ? mlen : left;
-			if (uiop->uio_segflg == UIO_SYSSPACE)
-				NFSBCOPY(uiocp, NFSMTOD(mp, caddr_t) +
-				    mbuf_len(mp), xfer);
-			else
-				copyin(uiocp, NFSMTOD(mp, caddr_t) +
-				    mbuf_len(mp), xfer);
-			mbuf_setlen(mp, mbuf_len(mp) + xfer);
-			left -= xfer;
-			uiocp += xfer;
-			uiop->uio_offset += xfer;
-			uiop->uio_resid -= xfer;
-		}
-		tcp = (char *)uiop->uio_iov->iov_base;
-		tcp += uiosiz;
-		uiop->uio_iov->iov_base = (void *)tcp;
-		uiop->uio_iov->iov_len -= uiosiz;
-		siz -= uiosiz;
+		KASSERT((mp->m_flags & M_EXTPG) != 0 ||
+		    rem <= M_TRAILINGSPACE(mp),
+		    ("nfsm_uiombuflist: no space for padding"));
+		for (i = 0; i < rem; i++)
+			*mcp++ = '\0';
+		mp->m_len += rem;
+		if (maxext > 0)
+			mp->m_epg_last_len += rem;
 	}
-	if (cpp != NULL)
-		*cpp = NFSMTOD(mp, caddr_t) + mbuf_len(mp);
-	if (mbp != NULL)
-		*mbp = mp;
 	return (firstmp);
 }
 
@@ -418,7 +258,7 @@ nfsm_uiombuflist(struct uio *uiop, int siz, struct mbuf **mbp, char **cpp)
  * Load vnode attributes from the xdr file attributes.
  * Returns EBADRPC if they can't be parsed, 0 otherwise.
  */
-APPLESTATIC int
+int
 nfsm_loadattr(struct nfsrv_descript *nd, struct nfsvattr *nap)
 {
 	struct nfs_fattr *fp;
@@ -431,8 +271,9 @@ nfsm_loadattr(struct nfsrv_descript *nd, struct nfsvattr *nap)
 		NFSM_DISSECT(fp, struct nfs_fattr *, NFSX_V3FATTR);
 		nap->na_type = nfsv34tov_type(fp->fa_type);
 		nap->na_mode = fxdr_unsigned(u_short, fp->fa_mode);
-		nap->na_rdev = makedev(fxdr_unsigned(u_char, fp->fa3_rdev.specdata1),
-			fxdr_unsigned(u_char, fp->fa3_rdev.specdata2));
+		nap->na_rdev = NFSMAKEDEV(
+		    fxdr_unsigned(int, fp->fa3_rdev.specdata1),
+		    fxdr_unsigned(int, fp->fa3_rdev.specdata2));
 		nap->na_nlink = fxdr_unsigned(uint32_t, fp->fa_nlink);
 		nap->na_uid = fxdr_unsigned(uid_t, fp->fa_uid);
 		nap->na_gid = fxdr_unsigned(gid_t, fp->fa_gid);
@@ -484,7 +325,7 @@ nfsmout:
  * This function finds the directory cookie that corresponds to the
  * logical byte offset given.
  */
-APPLESTATIC nfsuint64 *
+nfsuint64 *
 nfscl_getcookie(struct nfsnode *np, off_t off, int add)
 {
 	struct nfsdmap *dp, *dp2;
@@ -536,7 +377,7 @@ nfscl_getcookie(struct nfsnode *np, off_t off, int add)
  * the file handle and the file's attributes.
  * For V4, it assumes that Getfh and Getattr Op's results are here.
  */
-APPLESTATIC int
+int
 nfscl_mtofh(struct nfsrv_descript *nd, struct nfsfh **nfhpp,
     struct nfsvattr *nap, int *attrflagp)
 {
@@ -595,41 +436,9 @@ nfsmout:
 }
 
 /*
- * Put a state Id in the mbuf list.
- */
-APPLESTATIC void
-nfsm_stateidtom(struct nfsrv_descript *nd, nfsv4stateid_t *stateidp, int flag)
-{
-	nfsv4stateid_t *st;
-
-	NFSM_BUILD(st, nfsv4stateid_t *, NFSX_STATEID);
-	if (flag == NFSSTATEID_PUTALLZERO) {
-		st->seqid = 0;
-		st->other[0] = 0;
-		st->other[1] = 0;
-		st->other[2] = 0;
-	} else if (flag == NFSSTATEID_PUTALLONE) {
-		st->seqid = 0xffffffff;
-		st->other[0] = 0xffffffff;
-		st->other[1] = 0xffffffff;
-		st->other[2] = 0xffffffff;
-	} else if (flag == NFSSTATEID_PUTSEQIDZERO) {
-		st->seqid = 0;
-		st->other[0] = stateidp->other[0];
-		st->other[1] = stateidp->other[1];
-		st->other[2] = stateidp->other[2];
-	} else {
-		st->seqid = stateidp->seqid;
-		st->other[0] = stateidp->other[0];
-		st->other[1] = stateidp->other[1];
-		st->other[2] = stateidp->other[2];
-	}
-}
-
-/*
  * Initialize the owner/delegation sleep lock.
  */
-APPLESTATIC void
+void
 nfscl_lockinit(struct nfsv4lock *lckp)
 {
 
@@ -641,7 +450,7 @@ nfscl_lockinit(struct nfsv4lock *lckp)
  * Get an exclusive lock. (Not needed for OpenBSD4, since there is only one
  * thread for each posix process in the kernel.)
  */
-APPLESTATIC void
+void
 nfscl_lockexcl(struct nfsv4lock *lckp, void *mutex)
 {
 	int igotlock;
@@ -654,7 +463,7 @@ nfscl_lockexcl(struct nfsv4lock *lckp, void *mutex)
 /*
  * Release an exclusive lock.
  */
-APPLESTATIC void
+void
 nfscl_lockunlock(struct nfsv4lock *lckp)
 {
 
@@ -664,7 +473,7 @@ nfscl_lockunlock(struct nfsv4lock *lckp)
 /*
  * Called to derefernce a lock on a stateid (delegation or open owner).
  */
-APPLESTATIC void
+void
 nfscl_lockderef(struct nfsv4lock *lckp)
 {
 

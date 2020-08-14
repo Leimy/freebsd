@@ -1,6 +1,5 @@
 /*-
- * Copyright (c) 2018 Warner Losh <imp@freebd.org>
- * All rights reserved.
+ * Copyright (c) 2018 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -38,10 +37,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/reboot.h>
 
 #include "bootstrap.h"
-
-#ifdef LOADER_ZFS_SUPPORT
-#include "../zfs/libzfs.h"
-#endif
+#include "libzfs.h"
 
 COMMAND_SET(lszfs, "lszfs", "list child datasets of a zfs dataset",
 	    command_lszfs);

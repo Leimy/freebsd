@@ -80,11 +80,11 @@ printf(const char *fmt, ...)
 	return retval;
 }
 
-void
+int
 vprintf(const char *fmt, va_list ap)
 {
 
-	kvprintf(fmt, putchar_wrapper, NULL, 10, ap);
+	return (kvprintf(fmt, putchar_wrapper, NULL, 10, ap));
 }
 
 int
@@ -122,6 +122,34 @@ snprint_func(int ch, void *arg)
 }
 
 int
+asprintf(char **buf, const char *cfmt, ...)
+{
+	int retval;
+	struct print_buf arg;
+	va_list ap;
+
+	*buf = NULL;
+	va_start(ap, cfmt);
+	retval = kvprintf(cfmt, NULL, NULL, 10, ap);
+	va_end(ap);
+	if (retval <= 0)
+		return (-1);
+
+	arg.size = retval + 1;
+	arg.buf = *buf = malloc(arg.size);
+	if (*buf == NULL)
+		return (-1);
+
+	va_start(ap, cfmt);
+	retval = kvprintf(cfmt, &snprint_func, &arg, 10, ap);
+	va_end(ap);
+
+	if (arg.size >= 1)
+		*(arg.buf)++ = 0;
+	return (retval);
+}
+
+int
 snprintf(char *buf, size_t size, const char *cfmt, ...)
 {
 	int retval;
@@ -140,13 +168,32 @@ snprintf(char *buf, size_t size, const char *cfmt, ...)
 	return retval;
 }
 
-void
+int
+vsnprintf(char *buf, size_t size, const char *cfmt, va_list ap)
+{
+	struct print_buf arg;
+	int retval;
+
+	arg.buf = buf;
+	arg.size = size;
+
+	retval = kvprintf(cfmt, &snprint_func, &arg, 10, ap);
+
+	if (arg.size >= 1)
+		*(arg.buf)++ = 0;
+
+	return (retval);
+}
+
+int
 vsprintf(char *buf, const char *cfmt, va_list ap)
 {
 	int	retval;
 	
 	retval = kvprintf(cfmt, NULL, (void *)buf, 10, ap);
 	buf[retval] = '\0';
+
+	return (retval);
 }
 
 /*
@@ -200,7 +247,17 @@ ksprintn(char *nbuf, uintmax_t num, int base, int *lenp, int upper)
 static int
 kvprintf(char const *fmt, kvprintf_fn_t *func, void *arg, int radix, va_list ap)
 {
-#define PCHAR(c) {int cc=(c); if (func) (*func)(cc, arg); else *d++ = cc; retval++; }
+#define PCHAR(c) { \
+	int cc = (c);				\
+						\
+	if (func) {				\
+		(*func)(cc, arg);		\
+	} else if (d != NULL) {			\
+		*d++ = cc;			\
+	}					\
+	retval++;				\
+	}
+
 	char nbuf[MAXNBUF];
 	char *d;
 	const char *p, *percent, *q;

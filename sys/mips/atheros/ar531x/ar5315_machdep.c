@@ -39,9 +39,12 @@ __FBSDID("$FreeBSD$");
 #include <sys/cons.h>
 #include <sys/kdb.h>
 #include <sys/reboot.h>
+#include <sys/boot.h>
 
 #include <vm/vm.h>
+#include <vm/vm_param.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 
 #include <net/ethernet.h>
 
@@ -51,7 +54,6 @@ __FBSDID("$FreeBSD$");
 #include <machine/hwfunc.h>
 #include <machine/md_var.h>
 #include <machine/trap.h>
-#include <machine/vmparam.h>
 
 #include <mips/atheros/ar531x/ar5315reg.h>
 
@@ -64,39 +66,6 @@ uint32_t ar711_base_mac[ETHER_ADDR_LEN];
 /* 4KB static data aread to keep a copy of the bootload env until
    the dynamic kenv is setup */
 char boot1_env[4096];
-
-/*
- * We get a string in from Redboot with the all the arguments together,
- * "foo=bar bar=baz". Split them up and save in kenv.
- */
-static void
-parse_argv(char *str)
-{
-	char *n, *v;
-
-	while ((v = strsep(&str, " ")) != NULL) {
-		if (*v == '\0')
-			continue;
-		if (*v == '-') {
-			while (*v != '\0') {
-				v++;
-				switch (*v) {
-				case 'a': boothowto |= RB_ASKNAME; break;
-				case 'd': boothowto |= RB_KDB; break;
-				case 'g': boothowto |= RB_GDB; break;
-				case 's': boothowto |= RB_SINGLE; break;
-				case 'v': boothowto |= RB_VERBOSE; break;
-				}
-			}
-		} else {
-			n = strsep(&v, "=");
-			if (v == NULL)
-				kern_setenv(n, "1");
-			else
-				kern_setenv(n, v);
-		}
-	}
-}
 
 void
 platform_cpu_init()
@@ -140,7 +109,7 @@ ar5315_redboot_get_macaddr(void)
 }
 
 #if defined(SOC_VENDOR) || defined(SOC_MODEL) || defined(SOC_REV)
-static SYSCTL_NODE(_hw, OID_AUTO, soc, CTLFLAG_RD, 0,
+static SYSCTL_NODE(_hw, OID_AUTO, soc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "System on Chip information");
 #endif
 #if defined(SOC_VENDOR)
@@ -160,7 +129,8 @@ SYSCTL_STRING(_hw_soc, OID_AUTO, revision, CTLFLAG_RD, hw_soc_revision, 0,
 #endif
 
 #if defined(DEVICE_VENDOR) || defined(DEVICE_MODEL) || defined(DEVICE_REV)
-static SYSCTL_NODE(_hw, OID_AUTO, device, CTLFLAG_RD, 0, "Board information");
+static SYSCTL_NODE(_hw, OID_AUTO, device, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Board information");
 #endif
 #if defined(DEVICE_VENDOR)
 static char hw_device_vendor[] = DEVICE_VENDOR;
@@ -292,6 +262,8 @@ platform_start(__register_t a0 __unused, __register_t a1 __unused,
 	printf("  a2 = %08x\n", a2);
 	printf("  a3 = %08x\n", a3);
 
+	strcpy(cpu_model, ar5315_get_system_type());
+
 	/*
 	 * XXX this code is very redboot specific.
 	 */
@@ -299,7 +271,7 @@ platform_start(__register_t a0 __unused, __register_t a1 __unused,
 	if (MIPS_IS_VALID_PTR(argv)) {
 		for (i = 0; i < argc; i++) {
 			printf(" %s", argv[i]);
-			parse_argv(argv[i]);
+			boothowto |= boot_parse_arg(argv[i]);
 		}
 	}
 	else

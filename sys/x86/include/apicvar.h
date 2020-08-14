@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2003 John Baldwin <jhb@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -113,7 +112,8 @@
 #define	APIC_IPI_INTS	(APIC_LOCAL_INTS + 3)
 
 #define	IPI_RENDEZVOUS	(APIC_IPI_INTS)		/* Inter-CPU rendezvous. */
-#define	IPI_INVLTLB	(APIC_IPI_INTS + 1)	/* TLB Shootdown IPIs */
+#define	IPI_INVLOP	(APIC_IPI_INTS + 1)	/* TLB Shootdown IPIs, amd64 */
+#define	IPI_INVLTLB	(APIC_IPI_INTS + 1)	/* TLB Shootdown IPIs, i386 */
 #define	IPI_INVLPG	(APIC_IPI_INTS + 2)
 #define	IPI_INVLRNG	(APIC_IPI_INTS + 3)
 #define	IPI_INVLCACHE	(APIC_IPI_INTS + 4)
@@ -124,25 +124,21 @@
 #define	IPI_AST		0 	/* Generate software trap. */
 #define IPI_PREEMPT     1
 #define IPI_HARDCLOCK   2
-#define IPI_BITMAP_LAST IPI_HARDCLOCK
+#define	IPI_TRACE	3	/* Collect stack trace. */
+#define	IPI_BITMAP_LAST IPI_TRACE
 #define IPI_IS_BITMAPED(x) ((x) <= IPI_BITMAP_LAST)
 
 #define	IPI_STOP	(APIC_IPI_INTS + 6)	/* Stop CPU until restarted. */
 #define	IPI_SUSPEND	(APIC_IPI_INTS + 7)	/* Suspend CPU until restarted. */
-#ifdef __i386__
-#define	IPI_LAZYPMAP	(APIC_IPI_INTS + 8)	/* Lazy pmap release. */
+#define	IPI_SWI		(APIC_IPI_INTS + 8)	/* Run clk_intr_event. */
 #define	IPI_DYN_FIRST	(APIC_IPI_INTS + 9)
-#else
-#define	IPI_DYN_FIRST	(APIC_IPI_INTS + 8)
-#endif
-#define	IPI_DYN_LAST	(253)			/* IPIs allocated at runtime */
+#define	IPI_DYN_LAST	(254)			/* IPIs allocated at runtime */
 
 /*
  * IPI_STOP_HARD does not need to occupy a slot in the IPI vector space since
  * it is delivered using an NMI anyways.
  */
-#define	IPI_NMI_FIRST	254
-#define	IPI_TRACE	254			/* Interrupt for tracing. */
+#define	IPI_NMI_FIRST	255
 #define	IPI_STOP_HARD	255			/* Stop CPU with a NMI. */
 
 /*
@@ -163,10 +159,10 @@
 #define	APIC_BUS_PCI		2
 #define	APIC_BUS_MAX		APIC_BUS_PCI
 
-#define	IRQ_EXTINT		(NUM_IO_INTS + 1)
-#define	IRQ_NMI			(NUM_IO_INTS + 2)
-#define	IRQ_SMI			(NUM_IO_INTS + 3)
-#define	IRQ_DISABLED		(NUM_IO_INTS + 4)
+#define	IRQ_EXTINT		-1
+#define	IRQ_NMI			-2
+#define	IRQ_SMI			-3
+#define	IRQ_DISABLED		-4
 
 /*
  * An APIC enumerator is a pseudo bus driver that enumerates APIC's including

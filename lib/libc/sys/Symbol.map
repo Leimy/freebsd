@@ -179,8 +179,6 @@ FBSD_1.0 {
 	munlockall;
 	munmap;
 	nanosleep;
-	netbsd_lchown;
-	netbsd_msync;
 	nfssvc;
 	nmount;
 	ntp_adjtime;
@@ -392,6 +390,7 @@ FBSD_1.5 {
 	getdents;
 	getdirentries;
 	getfsstat;
+	getrandom;
 	kevent;
 	lstat;
 	mknod;
@@ -400,6 +399,19 @@ FBSD_1.5 {
 	statfs;
 	cpuset_getdomain;
 	cpuset_setdomain;
+};
+
+FBSD_1.6 {
+	__sysctlbyname;
+	close_range;
+	copy_file_range;
+	fhlink;
+	fhlinkat;
+	fhreadlink;
+	getfhat;
+	funlinkat;
+	memfd_create;
+	shm_rename;
 };
 
 FBSDprivate_1.0 {
@@ -508,8 +520,6 @@ FBSDprivate_1.0 {
 	__sys_clock_settime;
 	_close;
 	__sys_close;
-	_closefrom;
-	__sys_closefrom;
 	_connect;
 	__sys_connect;
 	_cpuset;
@@ -556,6 +566,7 @@ FBSDprivate_1.0 {
 	__sys_extattr_set_link;
 	_extattrctl;
 	__sys_extattrctl;
+	__sys_sigfastblock;
 	_fchdir;
 	__sys_fchdir;
 	_fchflags;
@@ -776,10 +787,6 @@ FBSDprivate_1.0 {
 	__sys_munmap;
 	_nanosleep;
 	__sys_nanosleep;
-	_netbsd_lchown;
-	__sys_netbsd_lchown;
-	_netbsd_msync;
-	__sys_netbsd_msync;
 	_nfssvc;
 	__sys_nfssvc;
 	_nmount;
@@ -1009,8 +1016,6 @@ FBSDprivate_1.0 {
 	__sys_utrace;
 	_uuidgen;
 	__sys_uuidgen;
-	_vadvise;
-	__sys_vadvise;
 	_wait4;
 	__sys_wait4;
 	_wait6;
@@ -1028,4 +1033,5 @@ FBSDprivate_1.0 {
 	__sys_cpuset_getdomain;
 	_cpuset_setdomain;
 	__sys_cpuset_setdomain;
+	rpctls_syscall;
 };

@@ -32,6 +32,7 @@
 
 #include "opt_inet.h"
 #include "opt_inet6.h"
+#include "opt_ipsec.h"
 
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -86,9 +87,9 @@ struct enchdr {
 struct enc_softc {
 	struct	ifnet *sc_ifp;
 };
-static VNET_DEFINE(struct enc_softc *, enc_sc);
+VNET_DEFINE_STATIC(struct enc_softc *, enc_sc);
 #define	V_enc_sc	VNET(enc_sc)
-static VNET_DEFINE(struct if_clone *, enc_cloner);
+VNET_DEFINE_STATIC(struct if_clone *, enc_cloner);
 #define	V_enc_cloner	VNET(enc_cloner)
 
 static int	enc_ioctl(struct ifnet *, u_long, caddr_t);
@@ -111,18 +112,21 @@ static const char encname[] = "enc";
  * some changes to the packet, e.g. address translation. If PFIL hook
  * consumes mbuf, nothing will be captured.
  */
-static VNET_DEFINE(int, filter_mask_in) = IPSEC_ENC_BEFORE;
-static VNET_DEFINE(int, bpf_mask_in) = IPSEC_ENC_BEFORE;
-static VNET_DEFINE(int, filter_mask_out) = IPSEC_ENC_BEFORE;
-static VNET_DEFINE(int, bpf_mask_out) = IPSEC_ENC_BEFORE | IPSEC_ENC_AFTER;
+VNET_DEFINE_STATIC(int, filter_mask_in) = IPSEC_ENC_BEFORE;
+VNET_DEFINE_STATIC(int, bpf_mask_in) = IPSEC_ENC_BEFORE;
+VNET_DEFINE_STATIC(int, filter_mask_out) = IPSEC_ENC_BEFORE;
+VNET_DEFINE_STATIC(int, bpf_mask_out) = IPSEC_ENC_BEFORE | IPSEC_ENC_AFTER;
 #define	V_filter_mask_in	VNET(filter_mask_in)
 #define	V_bpf_mask_in		VNET(bpf_mask_in)
 #define	V_filter_mask_out	VNET(filter_mask_out)
 #define	V_bpf_mask_out		VNET(bpf_mask_out)
 
-static SYSCTL_NODE(_net, OID_AUTO, enc, CTLFLAG_RW, 0, "enc sysctl");
-static SYSCTL_NODE(_net_enc, OID_AUTO, in, CTLFLAG_RW, 0, "enc input sysctl");
-static SYSCTL_NODE(_net_enc, OID_AUTO, out, CTLFLAG_RW, 0, "enc output sysctl");
+static SYSCTL_NODE(_net, OID_AUTO, enc, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "enc sysctl");
+static SYSCTL_NODE(_net_enc, OID_AUTO, in, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "enc input sysctl");
+static SYSCTL_NODE(_net_enc, OID_AUTO, out, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "enc output sysctl");
 SYSCTL_INT(_net_enc_in, OID_AUTO, ipsec_filter_mask,
     CTLFLAG_RW | CTLFLAG_VNET, &VNET_NAME(filter_mask_in), 0,
     "IPsec input firewall filter mask");
@@ -285,24 +289,24 @@ enc_hhook(int32_t hhook_type, int32_t hhook_id, void *udata, void *ctx_data,
 	switch (hhook_id) {
 #ifdef INET
 	case AF_INET:
-		ph = &V_inet_pfil_hook;
+		ph = V_inet_pfil_head;
 		break;
 #endif
 #ifdef INET6
 	case AF_INET6:
-		ph = &V_inet6_pfil_hook;
+		ph = V_inet6_pfil_head;
 		break;
 #endif
 	default:
 		ph = NULL;
 	}
-	if (ph == NULL || !PFIL_HOOKED(ph))
+	if (ph == NULL || (pdir == PFIL_OUT && !PFIL_HOOKED_OUT(ph)) ||
+	    (pdir == PFIL_IN && !PFIL_HOOKED_IN(ph)))
 		return (0);
 	/* Make a packet looks like it was received on enc(4) */
 	rcvif = (*ctx->mp)->m_pkthdr.rcvif;
 	(*ctx->mp)->m_pkthdr.rcvif = ifp;
-	if (pfil_run_hooks(ph, ctx->mp, ifp, pdir, ctx->inp) != 0 ||
-	    *ctx->mp == NULL) {
+	if (pfil_run_hooks(ph, ctx->mp, ifp, pdir, ctx->inp) != PFIL_PASS) {
 		*ctx->mp = NULL; /* consumed by filter */
 		return (EACCES);
 	}

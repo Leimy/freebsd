@@ -26,12 +26,15 @@
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  * Copyright 2013 Saso Kiselkov. All rights reserved.
  * Copyright (c) 2017 Datto Inc.
+ * Copyright (c) 2017, Intel Corporation.
+ * Copyright (c) 2016 Actifio, Inc. All rights reserved.
  */
 
 #ifndef _SYS_SPA_IMPL_H
 #define	_SYS_SPA_IMPL_H
 
 #include <sys/spa.h>
+#include <sys/spa_checkpoint.h>
 #include <sys/vdev.h>
 #include <sys/vdev_removal.h>
 #include <sys/metaslab.h>
@@ -136,7 +139,7 @@ typedef struct spa_config_lock {
 	kthread_t	*scl_writer;
 	int		scl_write_wanted;
 	kcondvar_t	scl_cv;
-	refcount_t	scl_count;
+	zfs_refcount_t	scl_count;
 } spa_config_lock_t;
 
 typedef struct spa_config_dirent {
@@ -218,6 +221,8 @@ struct spa {
 	boolean_t	spa_is_initializing;	/* true while opening pool */
 	metaslab_class_t *spa_normal_class;	/* normal data class */
 	metaslab_class_t *spa_log_class;	/* intent log data class */
+	metaslab_class_t *spa_special_class;	/* special allocation class */
+	metaslab_class_t *spa_dedup_class;	/* dedup allocation class */
 	uint64_t	spa_first_txg;		/* first txg after spa_open() */
 	uint64_t	spa_final_txg;		/* txg of export/destroy */
 	uint64_t	spa_freeze_txg;		/* freeze pool at this txg */
@@ -237,8 +242,16 @@ struct spa {
 	uint64_t	spa_last_synced_guid;	/* last synced guid */
 	list_t		spa_config_dirty_list;	/* vdevs with dirty config */
 	list_t		spa_state_dirty_list;	/* vdevs with dirty state */
-	kmutex_t	spa_alloc_lock;
-	avl_tree_t	spa_alloc_tree;
+	/*
+	 * spa_alloc_locks and spa_alloc_trees are arrays, whose lengths are
+	 * stored in spa_alloc_count. There is one tree and one lock for each
+	 * allocator, to help improve allocation performance in write-heavy
+	 * workloads.
+	 */
+	kmutex_t	*spa_alloc_locks;
+	avl_tree_t	*spa_alloc_trees;
+	int		spa_alloc_count;
+
 	spa_aux_vdev_t	spa_spares;		/* hot spares */
 	spa_aux_vdev_t	spa_l2cache;		/* L2ARC cache devices */
 	nvlist_t	*spa_label_features;	/* Features for reading MOS */
@@ -256,7 +269,8 @@ struct spa {
 	boolean_t	spa_extreme_rewind;	/* rewind past deferred frees */
 	uint64_t	spa_last_io;		/* lbolt of last non-scan I/O */
 	kmutex_t	spa_scrub_lock;		/* resilver/scrub lock */
-	uint64_t	spa_scrub_inflight;	/* in-flight scrub I/Os */
+	uint64_t	spa_scrub_inflight;	/* in-flight scrub bytes */
+	uint64_t	spa_load_verify_ios;	/* in-flight verifications IOs */
 	kcondvar_t	spa_scrub_io_cv;	/* scrub I/O completion */
 	uint8_t		spa_scrub_active;	/* active or suspended? */
 	uint8_t		spa_scrub_type;		/* type of scrub we're doing */
@@ -267,6 +281,7 @@ struct spa {
 	uint64_t	spa_scan_pass_scrub_pause; /* scrub pause time */
 	uint64_t	spa_scan_pass_scrub_spent_paused; /* total paused */
 	uint64_t	spa_scan_pass_exam;	/* examined bytes per pass */
+	uint64_t	spa_scan_pass_issued;	/* issued bytes per pass */
 	kmutex_t	spa_async_lock;		/* protect async state */
 	kthread_t	*spa_async_thread;	/* thread doing async task */
 	kthread_t	*spa_async_thread_vd;	/* thread doing vd async task */
@@ -282,6 +297,10 @@ struct spa {
 	spa_condensing_indirect_phys_t	spa_condensing_indirect_phys;
 	spa_condensing_indirect_t	*spa_condensing_indirect;
 	zthr_t		*spa_condense_zthr;	/* zthr doing condense. */
+
+	uint64_t	spa_checkpoint_txg;	/* the txg of the checkpoint */
+	spa_checkpoint_info_t spa_checkpoint_info; /* checkpoint accounting */
+	zthr_t		*spa_checkpoint_discard_zthr;
 
 	char		*spa_root;		/* alternate root directory */
 	uint64_t	spa_ena;		/* spa-wide ereport ENA */
@@ -315,9 +334,8 @@ struct spa {
 	zio_t		*spa_txg_zio[TXG_SIZE]; /* spa_sync() waits for this */
 	kmutex_t	spa_suspend_lock;	/* protects suspend_zio_root */
 	kcondvar_t	spa_suspend_cv;		/* notification of resume */
-	uint8_t		spa_suspended;		/* pool is suspended */
+	zio_suspend_reason_t	spa_suspended;	/* pool is suspended */
 	uint8_t		spa_claiming;		/* pool is doing zil_claim() */
-	boolean_t	spa_debug;		/* debug enabled? */
 	boolean_t	spa_is_root;		/* pool is root */
 	int		spa_minref;		/* num refs when first opened */
 	int		spa_mode;		/* FREAD | FWRITE */
@@ -346,6 +364,8 @@ struct spa {
 	uint64_t	spa_feat_for_read_obj;	/* required to read from pool */
 	uint64_t	spa_feat_desc_obj;	/* Feature descriptions */
 	uint64_t	spa_feat_enabled_txg_obj; /* Feature enabled txg */
+	kmutex_t	spa_feat_stats_lock;	/* protects spa_feat_stats */
+	nvlist_t	*spa_feat_stats;	/* Cache of enabled features */
 	/* cache feature refcounts */
 	uint64_t	spa_feat_refcount_cache[SPA_FEATURES];
 #ifdef illumos
@@ -374,16 +394,28 @@ struct spa {
 		int spa_queued;
 	} spa_queue_stats[ZIO_PRIORITY_NUM_QUEUEABLE];
 #endif
+	/* arc_memory_throttle() parameters during low memory condition */
+	uint64_t	spa_lowmem_page_load;	/* memory load during txg */
+	uint64_t	spa_lowmem_last_txg;	/* txg window start */
+
 	hrtime_t	spa_ccw_fail_time;	/* Conf cache write fail time */
+
+	taskq_t		*spa_zvol_taskq;	/* Taskq for minor management */
+
+	uint64_t	spa_multihost;		/* multihost aware (mmp) */
+	mmp_thread_t	spa_mmp;		/* multihost mmp thread */
+	list_t		spa_leaf_list;		/* list of leaf vdevs */
+	uint64_t	spa_leaf_list_gen;	/* track leaf_list changes */
 
 	/*
 	 * spa_refcount & spa_config_lock must be the last elements
 	 * because refcount_t changes size based on compilation options.
+	 * because zfs_refcount_t changes size based on compilation options.
 	 * In order for the MDB module to function correctly, the other
 	 * fields must remain in the same location.
 	 */
 	spa_config_lock_t spa_config_lock[SCL_LOCKS]; /* config changes */
-	refcount_t	spa_refcount;		/* number of opens */
+	zfs_refcount_t	spa_refcount;		/* number of opens */
 #ifndef illumos
 	boolean_t	spa_splitting_newspa;	/* creating new spa in split */
 #endif

@@ -63,24 +63,60 @@ static void	sicode_to_lsicode(int si_code, int *lsi_code);
 static void
 linux_to_bsd_sigaction(l_sigaction_t *lsa, struct sigaction *bsa)
 {
+	unsigned long flags;
 
 	linux_to_bsd_sigset(&lsa->lsa_mask, &bsa->sa_mask);
 	bsa->sa_handler = PTRIN(lsa->lsa_handler);
 	bsa->sa_flags = 0;
-	if (lsa->lsa_flags & LINUX_SA_NOCLDSTOP)
+
+	flags = lsa->lsa_flags;
+	if (lsa->lsa_flags & LINUX_SA_NOCLDSTOP) {
+		flags &= ~LINUX_SA_NOCLDSTOP;
 		bsa->sa_flags |= SA_NOCLDSTOP;
-	if (lsa->lsa_flags & LINUX_SA_NOCLDWAIT)
+	}
+	if (lsa->lsa_flags & LINUX_SA_NOCLDWAIT) {
+		flags &= ~LINUX_SA_NOCLDWAIT;
 		bsa->sa_flags |= SA_NOCLDWAIT;
-	if (lsa->lsa_flags & LINUX_SA_SIGINFO)
+	}
+	if (lsa->lsa_flags & LINUX_SA_SIGINFO) {
+		flags &= ~LINUX_SA_SIGINFO;
 		bsa->sa_flags |= SA_SIGINFO;
-	if (lsa->lsa_flags & LINUX_SA_ONSTACK)
+#ifdef notyet
+		/*
+		 * XXX: We seem to be missing code to convert
+		 *      some of the fields in ucontext_t.
+		 */
+		linux_msg(curthread,
+		    "partially unsupported sigaction flag SA_SIGINFO");
+#endif
+	}
+	if (lsa->lsa_flags & LINUX_SA_RESTORER) {
+		flags &= ~LINUX_SA_RESTORER;
+		/* XXX: We might want to handle it; see Linux sigreturn(2). */
+	}
+	if (lsa->lsa_flags & LINUX_SA_ONSTACK) {
+		flags &= ~LINUX_SA_ONSTACK;
 		bsa->sa_flags |= SA_ONSTACK;
-	if (lsa->lsa_flags & LINUX_SA_RESTART)
+	}
+	if (lsa->lsa_flags & LINUX_SA_RESTART) {
+		flags &= ~LINUX_SA_RESTART;
 		bsa->sa_flags |= SA_RESTART;
-	if (lsa->lsa_flags & LINUX_SA_ONESHOT)
+	}
+	if (lsa->lsa_flags & LINUX_SA_INTERRUPT) {
+		flags &= ~LINUX_SA_INTERRUPT;
+		/* Documented to be a "historical no-op". */
+	}
+	if (lsa->lsa_flags & LINUX_SA_ONESHOT) {
+		flags &= ~LINUX_SA_ONESHOT;
 		bsa->sa_flags |= SA_RESETHAND;
-	if (lsa->lsa_flags & LINUX_SA_NOMASK)
+	}
+	if (lsa->lsa_flags & LINUX_SA_NOMASK) {
+		flags &= ~LINUX_SA_NOMASK;
 		bsa->sa_flags |= SA_NODEFER;
+	}
+
+	if (flags != 0)
+		linux_msg(curthread, "unsupported sigaction flag %#lx", flags);
 }
 
 static void
@@ -146,12 +182,6 @@ linux_signal(struct thread *td, struct linux_signal_args *args)
 	l_sigaction_t nsa, osa;
 	int error;
 
-#ifdef DEBUG
-	if (ldebug(signal))
-		printf(ARGS(signal, "%d, %p"),
-		    args->sig, (void *)(uintptr_t)args->handler);
-#endif
-
 	nsa.lsa_handler = args->handler;
 	nsa.lsa_flags = LINUX_SA_ONESHOT | LINUX_SA_NOMASK;
 	LINUX_SIGEMPTYSET(nsa.lsa_mask);
@@ -168,13 +198,6 @@ linux_rt_sigaction(struct thread *td, struct linux_rt_sigaction_args *args)
 {
 	l_sigaction_t nsa, osa;
 	int error;
-
-#ifdef DEBUG
-	if (ldebug(rt_sigaction))
-		printf(ARGS(rt_sigaction, "%ld, %p, %p, %ld"),
-		    (long)args->sig, (void *)args->act,
-		    (void *)args->oact, (long)args->sigsetsize);
-#endif
 
 	if (args->sigsetsize != sizeof(l_sigset_t))
 		return (EINVAL);
@@ -239,11 +262,6 @@ linux_sigprocmask(struct thread *td, struct linux_sigprocmask_args *args)
 	l_sigset_t set, oset;
 	int error;
 
-#ifdef DEBUG
-	if (ldebug(sigprocmask))
-		printf(ARGS(sigprocmask, "%d, *, *"), args->how);
-#endif
-
 	if (args->mask != NULL) {
 		error = copyin(args->mask, &mask, sizeof(l_osigset_t));
 		if (error)
@@ -270,13 +288,6 @@ linux_rt_sigprocmask(struct thread *td, struct linux_rt_sigprocmask_args *args)
 {
 	l_sigset_t set, oset;
 	int error;
-
-#ifdef DEBUG
-	if (ldebug(rt_sigprocmask))
-		printf(ARGS(rt_sigprocmask, "%d, %p, %p, %ld"),
-		    args->how, (void *)args->mask,
-		    (void *)args->omask, (long)args->sigsetsize);
-#endif
 
 	if (args->sigsetsize != sizeof(l_sigset_t))
 		return (EINVAL);
@@ -305,11 +316,6 @@ linux_sgetmask(struct thread *td, struct linux_sgetmask_args *args)
 	struct proc *p = td->td_proc;
 	l_sigset_t mask;
 
-#ifdef DEBUG
-	if (ldebug(sgetmask))
-		printf(ARGS(sgetmask, ""));
-#endif
-
 	PROC_LOCK(p);
 	bsd_to_linux_sigset(&td->td_sigmask, &mask);
 	PROC_UNLOCK(p);
@@ -323,11 +329,6 @@ linux_ssetmask(struct thread *td, struct linux_ssetmask_args *args)
 	struct proc *p = td->td_proc;
 	l_sigset_t lset;
 	sigset_t bset;
-
-#ifdef DEBUG
-	if (ldebug(ssetmask))
-		printf(ARGS(ssetmask, "%08lx"), (unsigned long)args->mask);
-#endif
 
 	PROC_LOCK(p);
 	bsd_to_linux_sigset(&td->td_sigmask, &lset);
@@ -349,11 +350,6 @@ linux_sigpending(struct thread *td, struct linux_sigpending_args *args)
 	sigset_t bset;
 	l_sigset_t lset;
 	l_osigset_t mask;
-
-#ifdef DEBUG
-	if (ldebug(sigpending))
-		printf(ARGS(sigpending, "*"));
-#endif
 
 	PROC_LOCK(p);
 	bset = p->p_siglist;
@@ -380,11 +376,6 @@ linux_rt_sigpending(struct thread *td, struct linux_rt_sigpending_args *args)
 		return (EINVAL);
 		/* NOT REACHED */
 
-#ifdef DEBUG
-	if (ldebug(rt_sigpending))
-		printf(ARGS(rt_sigpending, "*"));
-#endif
-
 	PROC_LOCK(p);
 	bset = p->p_siglist;
 	SIGSETOR(bset, td->td_siglist);
@@ -410,10 +401,6 @@ linux_rt_sigtimedwait(struct thread *td,
 	l_siginfo_t linfo;
 	ksiginfo_t info;
 
-#ifdef DEBUG
-	if (ldebug(rt_sigtimedwait))
-		printf(ARGS(rt_sigtimedwait, "*"));
-#endif
 	if (args->sigsetsize != sizeof(l_sigset_t))
 		return (EINVAL);
 
@@ -425,12 +412,6 @@ linux_rt_sigtimedwait(struct thread *td,
 	if (args->timeout) {
 		if ((error = copyin(args->timeout, &ltv, sizeof(ltv))))
 			return (error);
-#ifdef DEBUG
-		if (ldebug(rt_sigtimedwait))
-			printf(LMSG("linux_rt_sigtimedwait: "
-			    "incoming timeout (%jd/%jd)\n"),
-			    (intmax_t)ltv.tv_sec, (intmax_t)ltv.tv_usec);
-#endif
 		tv.tv_sec = (long)ltv.tv_sec;
 		tv.tv_usec = (suseconds_t)ltv.tv_usec;
 		if (itimerfix(&tv)) {
@@ -446,22 +427,11 @@ linux_rt_sigtimedwait(struct thread *td,
 			}
 			if (tv.tv_sec < 0)
 				timevalclear(&tv);
-#ifdef DEBUG
-			if (ldebug(rt_sigtimedwait))
-				printf(LMSG("linux_rt_sigtimedwait: "
-				    "converted timeout (%jd/%ld)\n"),
-				    (intmax_t)tv.tv_sec, tv.tv_usec);
-#endif
 		}
 		TIMEVAL_TO_TIMESPEC(&tv, &ts);
 		tsa = &ts;
 	}
 	error = kern_sigtimedwait(td, bset, &info, tsa);
-#ifdef DEBUG
-	if (ldebug(rt_sigtimedwait))
-		printf(LMSG("linux_rt_sigtimedwait: "
-		    "sigtimedwait returning (%d)\n"), error);
-#endif
 	if (error)
 		return (error);
 
@@ -481,15 +451,7 @@ linux_rt_sigtimedwait(struct thread *td,
 int
 linux_kill(struct thread *td, struct linux_kill_args *args)
 {
-	struct kill_args /* {
-	    int pid;
-	    int signum;
-	} */ tmp;
-
-#ifdef DEBUG
-	if (ldebug(kill))
-		printf(ARGS(kill, "%d, %d"), args->pid, args->signum);
-#endif
+	int l_signum;
 
 	/*
 	 * Allow signal 0 as a means to check for privileges
@@ -498,12 +460,11 @@ linux_kill(struct thread *td, struct linux_kill_args *args)
 		return (EINVAL);
 
 	if (args->signum > 0)
-		tmp.signum = linux_to_bsd_signal(args->signum);
+		l_signum = linux_to_bsd_signal(args->signum);
 	else
-		tmp.signum = 0;
+		l_signum = 0;
 
-	tmp.pid = args->pid;
-	return (sys_kill(td, &tmp));
+	return (kern_kill(td, args->pid, l_signum));
 }
 
 static int
@@ -534,12 +495,6 @@ linux_tgkill(struct thread *td, struct linux_tgkill_args *args)
 	struct thread *tdt;
 	ksiginfo_t ksi;
 	int sig;
-
-#ifdef DEBUG
-	if (ldebug(tgkill))
-		printf(ARGS(tgkill, "%d, %d, %d"),
-		    args->tgid, args->pid, args->sig);
-#endif
 
 	if (args->pid <= 0 || args->tgid <=0)
 		return (EINVAL);
@@ -578,10 +533,6 @@ linux_tkill(struct thread *td, struct linux_tkill_args *args)
 	ksiginfo_t ksi;
 	int sig;
 
-#ifdef DEBUG
-	if (ldebug(tkill))
-		printf(ARGS(tkill, "%i, %i"), args->tid, args->sig);
-#endif
 	if (args->tid <= 0)
 		return (EINVAL);
 

@@ -51,6 +51,8 @@ physio(struct cdev *dev, struct uio *uio, int ioflag)
 	vm_prot_t prot;
 
 	csw = dev->si_devsw;
+	npages = 0;
+	sa = NULL;
 	/* check if character device is being destroyed */
 	if (csw == NULL)
 		return (ENXIO);
@@ -102,7 +104,7 @@ physio(struct cdev *dev, struct uio *uio, int ioflag)
 		maxpages = btoc(MIN(uio->uio_resid, MAXPHYS)) + 1;
 		pages = malloc(sizeof(*pages) * maxpages, M_DEVBUF, M_WAITOK);
 	} else {
-		pbuf = getpbuf(NULL);
+		pbuf = uma_zalloc(pbuf_zone, M_WAITOK);
 		sa = pbuf->b_data;
 		maxpages = btoc(MAXPHYS);
 		pages = pbuf->b_pages;
@@ -177,7 +179,7 @@ physio(struct cdev *dev, struct uio *uio, int ioflag)
 					error = EFAULT;
 					goto doerror;
 				}
-				if (pbuf) {
+				if (pbuf && sa) {
 					pmap_qenter((vm_offset_t)sa,
 					    pages, npages);
 					bp->bio_data = sa + poff;
@@ -218,7 +220,7 @@ physio(struct cdev *dev, struct uio *uio, int ioflag)
 	}
 doerror:
 	if (pbuf)
-		relpbuf(pbuf, NULL);
+		uma_zfree(pbuf_zone, pbuf);
 	else if (pages)
 		free(pages, M_DEVBUF);
 	g_destroy_bio(bp);

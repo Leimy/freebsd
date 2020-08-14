@@ -56,12 +56,16 @@ __FBSDID("$FreeBSD$");
 
 #include <machine/bus.h>
 #include <machine/cpu.h>
+#include <machine/cpufunc.h>
 #include <machine/intr.h>
 #include <machine/asm.h>
 #include <machine/trap.h>
 #include <machine/sbi.h>
 
-#define	DEFAULT_FREQ	10000000
+#include <dev/fdt/fdt_common.h>
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+#include <dev/ofw/openfirm.h>
 
 #define	TIMER_COUNTS		0x00
 #define	TIMER_MTIMECMP(cpu)	(cpu * 8)
@@ -70,8 +74,6 @@ struct riscv_timer_softc {
 	void			*ih;
 	uint32_t		clkfreq;
 	struct eventtimer	et;
-	int			intr_rid;
-	struct resource		*intr_res;
 };
 
 static struct riscv_timer_softc *riscv_timer_sc = NULL;
@@ -90,11 +92,8 @@ static struct timecounter riscv_timer_timecount = {
 static inline uint64_t
 get_cycles(void)
 {
-	uint64_t cycles;
 
-	__asm __volatile("rdtime %0" : "=r" (cycles));
-
-	return (cycles);
+	return (rdtime());
 }
 
 static long
@@ -159,6 +158,32 @@ riscv_timer_intr(void *arg)
 }
 
 static int
+riscv_timer_get_timebase(device_t dev, uint32_t *freq)
+{
+	phandle_t node;
+	int len;
+
+	node = OF_finddevice("/cpus");
+	if (node == -1) {
+		if (bootverbose)
+			device_printf(dev, "Can't find cpus node.\n");
+		return (ENXIO);
+	}
+
+	len = OF_getproplen(node, "timebase-frequency");
+	if (len != 4) {
+		if (bootverbose)
+			device_printf(dev,
+			    "Can't find timebase-frequency property.\n");
+		return (ENXIO);
+	}
+
+	OF_getencprop(node, "timebase-frequency", freq, len);
+
+	return (0);
+}
+
+static int
 riscv_timer_probe(device_t dev)
 {
 
@@ -178,28 +203,18 @@ riscv_timer_attach(device_t dev)
 		return (ENXIO);
 
 	if (device_get_unit(dev) != 0)
-		return ENXIO;
+		return (ENXIO);
 
-	sc->clkfreq = DEFAULT_FREQ;
-	if (sc->clkfreq == 0) {
+	if (riscv_timer_get_timebase(dev, &sc->clkfreq) != 0) {
 		device_printf(dev, "No clock frequency specified\n");
 		return (ENXIO);
 	}
 
 	riscv_timer_sc = sc;
 
-	sc->intr_rid = 0;
-	sc->intr_res = bus_alloc_resource(dev,
-	    SYS_RES_IRQ, &sc->intr_rid, IRQ_TIMER_SUPERVISOR,
-	    IRQ_TIMER_SUPERVISOR, 1, RF_ACTIVE);
-	if (sc->intr_res == NULL) {
-		device_printf(dev, "failed to allocate irq\n");
-		return (ENXIO);
-	}
-
 	/* Setup IRQs handler */
-	error = bus_setup_intr(dev, sc->intr_res, INTR_TYPE_CLK,
-	    riscv_timer_intr, NULL, sc, &sc->ih);
+	error = riscv_setup_intr(device_get_nameunit(dev), riscv_timer_intr,
+	    NULL, sc, IRQ_TIMER_SUPERVISOR, INTR_TYPE_CLK, &sc->ih);
 	if (error) {
 		device_printf(dev, "Unable to alloc int resource.\n");
 		return (ENXIO);

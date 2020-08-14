@@ -1,8 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2015 Netflix, Inc
- * All rights reserved.
+ * Copyright (c) 2015 Netflix, Inc.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -49,6 +48,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/cons.h>
 #include <sys/proc.h>
 #include <sys/reboot.h>
+#include <sys/sbuf.h>
+#include <geom/geom.h>
 #include <geom/geom_disk.h>
 #endif /* _KERNEL */
 
@@ -75,6 +76,11 @@ typedef enum {
 	NDA_FLAG_DIRTY		= 0x0002,
 	NDA_FLAG_SCTX_INIT	= 0x0004,
 } nda_flags;
+#define NDA_FLAG_STRING		\
+	"\020"			\
+	"\001OPEN"		\
+	"\002DIRTY"		\
+	"\003SCTX_INIT"
 
 typedef enum {
 	NDA_Q_4K   = 0x01,
@@ -89,6 +95,7 @@ typedef enum {
 	NDA_CCB_BUFFER_IO	= 0x01,
 	NDA_CCB_DUMP            = 0x02,
 	NDA_CCB_TRIM            = 0x03,
+	NDA_CCB_PASS            = 0x04,
 	NDA_CCB_TYPE_MASK	= 0x0F,
 } nda_ccb_state;
 
@@ -106,12 +113,14 @@ struct nda_softc {
 	nda_quirks		quirks;
 	int			unmappedio;
 	quad_t			deletes;
-	quad_t			dsm_req;
 	uint32_t		nsid;			/* Namespace ID for this nda device */
 	struct disk		*disk;
 	struct task		sysctl_task;
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
+	uint64_t		trim_count;
+	uint64_t		trim_ranges;
+	uint64_t		trim_lbas;
 #ifdef CAM_TEST_FAILURE
 	int			force_read_error;
 	int			force_write_error;
@@ -128,21 +137,22 @@ struct nda_softc {
 };
 
 struct nda_trim_request {
-	union {
-		struct nvme_dsm_range dsm;
-		uint8_t		data[NVME_MAX_DSM_TRIM];
-	};
+	struct nvme_dsm_range	dsm[NVME_MAX_DSM_TRIM / sizeof(struct nvme_dsm_range)];
 	TAILQ_HEAD(, bio) bps;
 };
+_Static_assert(NVME_MAX_DSM_TRIM % sizeof(struct nvme_dsm_range) == 0,
+    "NVME_MAX_DSM_TRIM must be an integral number of ranges");
 
 /* Need quirk table */
 
+static	disk_ioctl_t	ndaioctl;
 static	disk_strategy_t	ndastrategy;
 static	dumper_t	ndadump;
 static	periph_init_t	ndainit;
 static	void		ndaasync(void *callback_arg, u_int32_t code,
 				struct cam_path *path, void *arg);
 static	void		ndasysctlinit(void *context, int pending);
+static	int		ndaflagssysctl(SYSCTL_HANDLER_ARGS);
 static	periph_ctor_t	ndaregister;
 static	periph_dtor_t	ndacleanup;
 static	periph_start_t	ndastart;
@@ -167,16 +177,22 @@ static void		ndasuspend(void *arg);
 #define NDA_MAX_TRIM_ENTRIES  (NVME_MAX_DSM_TRIM / sizeof(struct nvme_dsm_range))/* Number of DSM trims to use, max 256 */
 #endif
 
-static SYSCTL_NODE(_kern_cam, OID_AUTO, nda, CTLFLAG_RD, 0,
-            "CAM Direct Access Disk driver");
+static SYSCTL_NODE(_kern_cam, OID_AUTO, nda, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "CAM Direct Access Disk driver");
 
 //static int nda_retry_count = NDA_DEFAULT_RETRY;
 static int nda_send_ordered = NDA_DEFAULT_SEND_ORDERED;
 static int nda_default_timeout = NDA_DEFAULT_TIMEOUT;
 static int nda_max_trim_entries = NDA_MAX_TRIM_ENTRIES;
+static int nda_enable_biospeedup = 1;
+static int nda_nvd_compat = 1;
 SYSCTL_INT(_kern_cam_nda, OID_AUTO, max_trim, CTLFLAG_RDTUN,
     &nda_max_trim_entries, NDA_MAX_TRIM_ENTRIES,
     "Maximum number of BIO_DELETE to send down as a DSM TRIM.");
+SYSCTL_INT(_kern_cam_nda, OID_AUTO, enable_biospeedup, CTLFLAG_RDTUN,
+    &nda_enable_biospeedup, 0, "Enable BIO_SPEEDUP processing.");
+SYSCTL_INT(_kern_cam_nda, OID_AUTO, nvd_compat, CTLFLAG_RDTUN,
+    &nda_nvd_compat, 1, "Enable creation of nvd aliases.");
 
 /*
  * All NVMe media is non-rotational, so all nvme device instances
@@ -337,6 +353,8 @@ ndaclose(struct disk *dp)
 
 	while (softc->refcount != 0)
 		cam_periph_sleep(periph, &softc->refcount, PRIBIO, "ndaclose", 1);
+	KASSERT(softc->outstanding_cmds == 0,
+	    ("nda %d outstanding commands", softc->outstanding_cmds));
 	cam_periph_unlock(periph);
 	cam_periph_release(periph);
 	return (0);	
@@ -351,6 +369,92 @@ ndaschedule(struct cam_periph *periph)
 		return;
 
 	cam_iosched_schedule(softc->cam_iosched, periph);
+}
+
+static int
+ndaioctl(struct disk *dp, u_long cmd, void *data, int fflag,
+    struct thread *td)
+{
+	struct cam_periph *periph;
+	struct nda_softc *softc;
+
+	periph = (struct cam_periph *)dp->d_drv1;
+	softc = (struct nda_softc *)periph->softc;
+
+	switch (cmd) {
+	case NVME_IO_TEST:
+	case NVME_BIO_TEST:
+		/*
+		 * These don't map well to the underlying CCBs, so
+		 * they are usupported via CAM.
+		 */
+		return (ENOTTY);
+	case NVME_GET_NSID:
+	{
+		struct nvme_get_nsid *gnsid = (struct nvme_get_nsid *)data;
+		struct ccb_pathinq cpi;
+
+		xpt_path_inq(&cpi, periph->path);
+		strncpy(gnsid->cdev, cpi.xport_specific.nvme.dev_name,
+		    sizeof(gnsid->cdev));
+		gnsid->nsid = cpi.xport_specific.nvme.nsid;
+		return (0);
+	}
+	case NVME_PASSTHROUGH_CMD:
+	{
+		struct nvme_pt_command *pt;
+		union ccb *ccb;
+		struct cam_periph_map_info mapinfo;
+		u_int maxmap = dp->d_maxsize;
+		int error;
+
+		/*
+		 * Create a NVME_IO CCB to do the passthrough command.
+		 */
+		pt = (struct nvme_pt_command *)data;
+		ccb = xpt_alloc_ccb();
+		xpt_setup_ccb(&ccb->ccb_h, periph->path, CAM_PRIORITY_NORMAL);
+		ccb->ccb_state = NDA_CCB_PASS;
+		cam_fill_nvmeio(&ccb->nvmeio,
+		    0,			/* Retries */
+		    ndadone,
+		    (pt->is_read ? CAM_DIR_IN : CAM_DIR_OUT) | CAM_DATA_VADDR,
+		    pt->buf,
+		    pt->len,
+		    nda_default_timeout * 1000);
+		memcpy(&ccb->nvmeio.cmd, &pt->cmd, sizeof(pt->cmd));
+
+		/*
+		 * Wire the user memory in this request for the I/O
+		 */
+		memset(&mapinfo, 0, sizeof(mapinfo));
+		error = cam_periph_mapmem(ccb, &mapinfo, maxmap);
+		if (error)
+			goto out;
+
+		/*
+		 * Lock the periph and run the command.
+		 */
+		cam_periph_lock(periph);
+		cam_periph_runccb(ccb, NULL, CAM_RETRY_SELTO,
+		    SF_RETRY_UA | SF_NO_PRINT, NULL);
+
+		/*
+		 * Tear down mapping and return status.
+		 */
+		cam_periph_unlock(periph);
+		cam_periph_unmapmem(ccb, &mapinfo);
+		error = (ccb->ccb_h.status == CAM_REQ_CMP) ? 0 : EIO;
+out:
+		cam_periph_lock(periph);
+		xpt_release_ccb(ccb);
+		cam_periph_unlock(periph);
+		return (error);
+	}
+	default:
+		break;
+	}
+	return (ENOTTY);
 }
 
 /*
@@ -621,7 +725,7 @@ ndasysctlinit(void *context, int pending)
 	softc->flags |= NDA_FLAG_SCTX_INIT;
 	softc->sysctl_tree = SYSCTL_ADD_NODE_WITH_LABEL(&softc->sysctl_ctx,
 		SYSCTL_STATIC_CHILDREN(_kern_cam_nda), OID_AUTO, tmpstr2,
-		CTLFLAG_RD, 0, tmpstr, "device_index");
+		CTLFLAG_RD | CTLFLAG_MPSAFE, 0, tmpstr, "device_index");
 	if (softc->sysctl_tree == NULL) {
 		printf("ndasysctlinit: unable to allocate sysctl tree\n");
 		cam_periph_release(periph);
@@ -636,18 +740,32 @@ ndasysctlinit(void *context, int pending)
 	    OID_AUTO, "deletes", CTLFLAG_RD,
 	    &softc->deletes, "Number of BIO_DELETE requests");
 
-	SYSCTL_ADD_QUAD(&softc->sysctl_ctx, SYSCTL_CHILDREN(softc->sysctl_tree),
-	    OID_AUTO, "dsm_req", CTLFLAG_RD,
-	    &softc->dsm_req, "Number of DSM requests sent to SIM");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+		SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+		"trim_count", CTLFLAG_RD, &softc->trim_count,
+		"Total number of unmap/dsm commands sent");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+		SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+		"trim_ranges", CTLFLAG_RD, &softc->trim_ranges,
+		"Total number of ranges in unmap/dsm commands");
+	SYSCTL_ADD_UQUAD(&softc->sysctl_ctx,
+		SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO,
+		"trim_lbas", CTLFLAG_RD, &softc->trim_lbas,
+		"Total lbas in the unmap/dsm commands sent");
 
 	SYSCTL_ADD_INT(&softc->sysctl_ctx, SYSCTL_CHILDREN(softc->sysctl_tree),
 	    OID_AUTO, "rotating", CTLFLAG_RD, &nda_rotating_media, 1,
 	    "Rotating media");
 
+	SYSCTL_ADD_PROC(&softc->sysctl_ctx, SYSCTL_CHILDREN(softc->sysctl_tree),
+	    OID_AUTO, "flags", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    softc, 0, ndaflagssysctl, "A",
+	    "Flags for drive");
+
 #ifdef CAM_IO_STATS
 	softc->sysctl_stats_tree = SYSCTL_ADD_NODE(&softc->sysctl_stats_ctx,
 		SYSCTL_CHILDREN(softc->sysctl_tree), OID_AUTO, "stats",
-		CTLFLAG_RD, 0, "Statistics");
+		CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "Statistics");
 	if (softc->sysctl_stats_tree == NULL) {
 		printf("ndasysctlinit: unable to allocate sysctl tree for stats\n");
 		cam_periph_release(periph);
@@ -684,10 +802,31 @@ ndasysctlinit(void *context, int pending)
 }
 
 static int
+ndaflagssysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct sbuf sbuf;
+	struct nda_softc *softc = arg1;
+	int error;
+
+	sbuf_new_for_sysctl(&sbuf, NULL, 0, req);
+	if (softc->flags != 0)
+		sbuf_printf(&sbuf, "0x%b", (unsigned)softc->flags, NDA_FLAG_STRING);
+	else
+		sbuf_printf(&sbuf, "0");
+	error = sbuf_finish(&sbuf);
+	sbuf_delete(&sbuf);
+
+	return (error);
+}
+
+static int
 ndagetattr(struct bio *bp)
 {
 	int ret;
 	struct cam_periph *periph;
+
+	if (g_handleattr_int(bp, "GEOM::canspeedup", nda_enable_biospeedup))
+		return (EJUSTRETURN);
 
 	periph = (struct cam_periph *)bp->bio_disk->d_drv1;
 	cam_periph_lock(periph);
@@ -734,11 +873,8 @@ ndaregister(struct cam_periph *periph, void *arg)
 	/* ident_data parsing */
 
 	periph->softc = softc;
-
 	softc->quirks = NDA_Q_NONE;
-
 	xpt_path_inq(&cpi, periph->path);
-
 	TASK_INIT(&softc->sysctl_task, 0, ndasysctlinit, periph);
 
 	/*
@@ -758,14 +894,11 @@ ndaregister(struct cam_periph *periph, void *arg)
 	softc->quirks = quirks;
 	cam_iosched_set_sort_queue(softc->cam_iosched, 0);
 	softc->disk = disk = disk_alloc();
-	strlcpy(softc->disk->d_descr, cd->mn,
-	    MIN(sizeof(softc->disk->d_descr), sizeof(cd->mn)));
-	strlcpy(softc->disk->d_ident, cd->sn,
-	    MIN(sizeof(softc->disk->d_ident), sizeof(cd->sn)));
 	disk->d_rotation_rate = DISK_RR_NON_ROTATING;
 	disk->d_open = ndaopen;
 	disk->d_close = ndaclose;
 	disk->d_strategy = ndastrategy;
+	disk->d_ioctl = ndaioctl;
 	disk->d_getattr = ndagetattr;
 	disk->d_dump = ndadump;
 	disk->d_gone = ndadiskgonecb;
@@ -786,7 +919,7 @@ ndaregister(struct cam_periph *periph, void *arg)
 	disk->d_mediasize = (off_t)(disk->d_sectorsize * nsd->nsze);
 	disk->d_delmaxsize = disk->d_mediasize;
 	disk->d_flags = DISKFLAG_DIRECT_COMPLETION;
-//	if (cd->oncs.dsm) // XXX broken?
+	if (nvme_ctrlr_has_dataset_mgmt(cd))
 		disk->d_flags |= DISKFLAG_CANDELETE;
 	vwc_present = (cd->vwc >> NVME_CTRLR_DATA_VWC_PRESENT_SHIFT) &
 		NVME_CTRLR_DATA_VWC_PRESENT_MASK;
@@ -800,15 +933,21 @@ ndaregister(struct cam_periph *periph, void *arg)
 	 * d_ident and d_descr are both far bigger than the length of either
 	 *  the serial or model number strings.
 	 */
-	nvme_strvis(disk->d_descr, cd->mn,
-	    sizeof(disk->d_descr), NVME_MODEL_NUMBER_LENGTH);
-	nvme_strvis(disk->d_ident, cd->sn,
-	    sizeof(disk->d_ident), NVME_SERIAL_NUMBER_LENGTH);
+	cam_strvis(disk->d_descr, cd->mn,
+	    NVME_MODEL_NUMBER_LENGTH, sizeof(disk->d_descr));
+	cam_strvis(disk->d_ident, cd->sn,
+	    NVME_SERIAL_NUMBER_LENGTH, sizeof(disk->d_ident));
 	disk->d_hba_vendor = cpi.hba_vendor;
 	disk->d_hba_device = cpi.hba_device;
 	disk->d_hba_subvendor = cpi.hba_subvendor;
 	disk->d_hba_subdevice = cpi.hba_subdevice;
-	disk->d_stripesize = disk->d_sectorsize;
+	snprintf(disk->d_attachment, sizeof(disk->d_attachment),
+	    "%s%d", cpi.dev_name, cpi.unit_number);
+	if (((nsd->nsfeat >> NVME_NS_DATA_NSFEAT_NPVALID_SHIFT) &
+	    NVME_NS_DATA_NSFEAT_NPVALID_MASK) != 0 && nsd->npwg != 0)
+		disk->d_stripesize = ((nsd->npwg + 1) * disk->d_sectorsize);
+	else
+		disk->d_stripesize = nsd->noiob * disk->d_sectorsize;
 	disk->d_stripeoffset = 0;
 	disk->d_devstat = devstat_new_entry(periph->periph_name,
 	    periph->unit_number, disk->d_sectorsize,
@@ -818,7 +957,8 @@ ndaregister(struct cam_periph *periph, void *arg)
 	/*
 	 * Add alias for older nvd drives to ease transition.
 	 */
-	/* disk_add_alias(disk, "nvd"); Have reports of this causing problems */
+	if (nda_nvd_compat)
+		disk_add_alias(disk, "nvd");
 
 	/*
 	 * Acquire a reference to the periph before we register with GEOM.
@@ -938,6 +1078,7 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 			struct nda_trim_request *trim;
 			struct bio *bp1;
 			int ents;
+			uint32_t totalcount = 0, ranges = 0;
 
 			trim = malloc(sizeof(*trim), M_NVMEDA, M_ZERO | M_NOWAIT);
 			if (trim == NULL) {
@@ -948,9 +1089,9 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 			}
 			TAILQ_INIT(&trim->bps);
 			bp1 = bp;
-			ents = sizeof(trim->data) / sizeof(struct nvme_dsm_range);
-			ents = min(ents, nda_max_trim_entries);
-			dsm_range = &trim->dsm;
+			ents = min(nitems(trim->dsm), nda_max_trim_entries);
+			ents = max(ents, 1);
+			dsm_range = trim->dsm;
 			dsm_end = dsm_range + ents;
 			do {
 				TAILQ_INSERT_TAIL(&trim->bps, bp1, bio_queue);
@@ -958,6 +1099,8 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 				    htole32(bp1->bio_bcount / softc->disk->d_sectorsize);
 				dsm_range->starting_lba =
 				    htole64(bp1->bio_offset / softc->disk->d_sectorsize);
+				ranges++;
+				totalcount += dsm_range->length;
 				dsm_range++;
 				if (dsm_range >= dsm_end)
 					break;
@@ -966,10 +1109,12 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 				/* XXX -- Could limit based on total payload size */
 			} while (bp1 != NULL);
 			start_ccb->ccb_trim = trim;
-			softc->dsm_req++;
-			nda_nvme_trim(softc, &start_ccb->nvmeio, &trim->dsm,
-			    dsm_range - &trim->dsm);
+			nda_nvme_trim(softc, &start_ccb->nvmeio, trim->dsm,
+			    dsm_range - trim->dsm);
 			start_ccb->ccb_state = NDA_CCB_TRIM;
+			softc->trim_count++;
+			softc->trim_ranges += ranges;
+			softc->trim_lbas += totalcount;
 			/*
 			 * Note: We can have multiple TRIMs in flight, so we don't call
 			 * cam_iosched_submit_trim(softc->cam_iosched);
@@ -981,17 +1126,22 @@ ndastart(struct cam_periph *periph, union ccb *start_ccb)
 		case BIO_FLUSH:
 			nda_nvme_flush(softc, nvmeio);
 			break;
+		default:
+			biofinish(bp, NULL, EOPNOTSUPP);
+			xpt_release_ccb(start_ccb);
+			ndaschedule(periph);
+			return;
 		}
 		start_ccb->ccb_state = NDA_CCB_BUFFER_IO;
 		start_ccb->ccb_bp = bp;
 out:
 		start_ccb->ccb_h.flags |= CAM_UNLOCKED;
 		softc->outstanding_cmds++;
-		softc->refcount++;
+		softc->refcount++;			/* For submission only */
 		cam_periph_unlock(periph);
 		xpt_action(start_ccb);
 		cam_periph_lock(periph);
-		softc->refcount--;
+		softc->refcount--;			/* Submission done */
 
 		/* May have more work to do, so ensure we stay scheduled */
 		ndaschedule(periph);
@@ -1087,6 +1237,7 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 			bp1 = TAILQ_FIRST(&queue);
 			cam_iosched_bio_complete(softc->cam_iosched, bp1, done_ccb);
 			xpt_release_ccb(done_ccb);
+			softc->outstanding_cmds--;
 			ndaschedule(periph);
 			cam_periph_unlock(periph);
 			while ((bp2 = TAILQ_FIRST(&queue)) != NULL) {
@@ -1106,6 +1257,8 @@ ndadone(struct cam_periph *periph, union ccb *done_ccb)
 	}
 	case NDA_CCB_DUMP:
 		/* No-op.  We're polling */
+		return;
+	case NDA_CCB_PASS:
 		return;
 	default:
 		break;

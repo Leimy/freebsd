@@ -107,6 +107,10 @@
 #include <dev/ciss/cissio.h>
 #include <dev/ciss/cissvar.h>
 
+#ifdef CISS_DEBUG
+#include "opt_ddb.h"
+#endif
+
 static MALLOC_DEFINE(CISS_MALLOC_CLASS, "ciss_data",
     "ciss internal data buffers");
 
@@ -197,7 +201,9 @@ static void	ciss_notify_logical(struct ciss_softc *sc, struct ciss_notify *cn);
 static void	ciss_notify_physical(struct ciss_softc *sc, struct ciss_notify *cn);
 
 /* debugging output */
+#ifdef DDB
 static void	ciss_print_request(struct ciss_request *cr);
+#endif
 static void	ciss_print_ldrive(struct ciss_softc *sc, struct ciss_ldrive *ld);
 static const char *ciss_name_ldrive_status(int status);
 static int	ciss_decode_ldrive_status(int status);
@@ -221,11 +227,6 @@ static driver_t ciss_pci_driver = {
     ciss_methods,
     sizeof(struct ciss_softc)
 };
-
-static devclass_t	ciss_devclass;
-DRIVER_MODULE(ciss, pci, ciss_pci_driver, ciss_devclass, 0, 0);
-MODULE_DEPEND(ciss, cam, 1, 1, 1);
-MODULE_DEPEND(ciss, pci, 1, 1, 1);
 
 /*
  * Control device interface.
@@ -270,6 +271,7 @@ TUNABLE_INT("hw.ciss.force_transport", &ciss_force_transport);
  */
 static int ciss_force_interrupt = 0;
 TUNABLE_INT("hw.ciss.force_interrupt", &ciss_force_interrupt);
+
 
 /************************************************************************
  * CISS adapters amazingly don't have a defined programming interface
@@ -360,11 +362,18 @@ static struct
     { 0x103C, 0x21C8, CISS_BOARD_SA5,   "HP Smart Array H241" },
     { 0x103C, 0x21CA, CISS_BOARD_SA5,   "HP Smart Array P246br" },
     { 0x103C, 0x21CB, CISS_BOARD_SA5,   "HP Smart Array P840" },
-    { 0x103C, 0x21CC, CISS_BOARD_SA5,   "HP Smart Array TBD" },
+    { 0x103C, 0x21CC, CISS_BOARD_SA5,   "HP Smart Array P542d" },
     { 0x103C, 0x21CD, CISS_BOARD_SA5,   "HP Smart Array P240nr" },
     { 0x103C, 0x21CE, CISS_BOARD_SA5,   "HP Smart Array H240nr" },
     { 0, 0, 0, NULL }
 };
+
+static devclass_t	ciss_devclass;
+DRIVER_MODULE(ciss, pci, ciss_pci_driver, ciss_devclass, 0, 0);
+MODULE_PNP_INFO("U16:vendor;U16:device;", pci, ciss, ciss_vendor_data,
+    nitems(ciss_vendor_data) - 1);
+MODULE_DEPEND(ciss, cam, 1, 1, 1);
+MODULE_DEPEND(ciss, pci, 1, 1, 1);
 
 /************************************************************************
  * Find a match for the device in our list of known adapters.
@@ -3557,6 +3566,7 @@ ciss_disable_adapter(struct ciss_softc *sc)
     pci_disable_busmaster(sc->ciss_dev);
     sc->ciss_flags &= ~CISS_FLAG_RUNNING;
 
+    STAILQ_INIT(&qh);
     for (i = 1; i < sc->ciss_max_requests; i++) {
 	cr = &sc->ciss_request[i];
 	if ((cr->cr_flags & CISS_REQ_BUSY) == 0)
@@ -3808,8 +3818,9 @@ ciss_notify_abort(struct ciss_softc *sc)
     cnc->opcode = CISS_OPCODE_WRITE;
     cnc->command = CISS_COMMAND_ABORT_NOTIFY;
     cnc->length = htonl(CISS_NOTIFY_DATA_SIZE);
-
+#if 0
     ciss_print_request(cr);
+#endif
 
     /*
      * Submit the request and wait for it to complete.
@@ -4234,6 +4245,7 @@ ciss_kill_notify_thread(struct ciss_softc *sc)
 /************************************************************************
  * Print a request.
  */
+#ifdef DDB
 static void
 ciss_print_request(struct ciss_request *cr)
 {
@@ -4287,6 +4299,7 @@ ciss_print_request(struct ciss_request *cr)
 	}
     }
 }
+#endif
 
 /************************************************************************
  * Print information about the status of a logical drive.
@@ -4350,8 +4363,6 @@ ciss_print_ldrive(struct ciss_softc *sc, struct ciss_ldrive *ld)
     }
 }
 
-#ifdef CISS_DEBUG
-#include "opt_ddb.h"
 #ifdef DDB
 #include <ddb/ddb.h>
 /************************************************************************
@@ -4405,7 +4416,6 @@ DB_COMMAND(ciss_prt, db_ciss_prt)
 	ciss_print_adapter(sc);
     }
 }
-#endif
 #endif
 
 /************************************************************************

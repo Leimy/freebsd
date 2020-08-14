@@ -8,7 +8,7 @@
  *
  * 1. Copyright Notice
  *
- * Some or all of this work - Copyright (c) 1999 - 2018, Intel Corp.
+ * Some or all of this work - Copyright (c) 1999 - 2020, Intel Corp.
  * All rights reserved.
  *
  * 2. License
@@ -187,6 +187,7 @@
 #define ACPI_SIG_SBST           "SBST"      /* Smart Battery Specification Table */
 #define ACPI_SIG_SDEI           "SDEI"      /* Software Delegated Exception Interface Table */
 #define ACPI_SIG_SDEV           "SDEV"      /* Secure Devices table */
+#define ACPI_SIG_NHLT           "NHLT"      /* Non-HDAudio Link Table */
 
 
 /*
@@ -213,7 +214,7 @@
  * IORT - IO Remapping Table
  *
  * Conforms to "IO Remapping Table System Software on ARM Platforms",
- * Document number: ARM DEN 0049C, May 2017
+ * Document number: ARM DEN 0049D, March 2018
  *
  ******************************************************************************/
 
@@ -250,7 +251,8 @@ enum AcpiIortNodeType
     ACPI_IORT_NODE_NAMED_COMPONENT      = 0x01,
     ACPI_IORT_NODE_PCI_ROOT_COMPLEX     = 0x02,
     ACPI_IORT_NODE_SMMU                 = 0x03,
-    ACPI_IORT_NODE_SMMU_V3              = 0x04
+    ACPI_IORT_NODE_SMMU_V3              = 0x04,
+    ACPI_IORT_NODE_PMCG                 = 0x05
 };
 
 
@@ -302,7 +304,7 @@ typedef struct acpi_iort_memory_access
 typedef struct acpi_iort_its_group
 {
     UINT32                  ItsCount;
-    UINT32                  Identifiers[1];         /* GIC ITS identifier arrary */
+    UINT32                  Identifiers[1];         /* GIC ITS identifier array */
 
 } ACPI_IORT_ITS_GROUP;
 
@@ -316,12 +318,18 @@ typedef struct acpi_iort_named_component
 
 } ACPI_IORT_NAMED_COMPONENT;
 
+/* Masks for Flags field above */
+
+#define ACPI_IORT_NC_STALL_SUPPORTED    (1)
+#define ACPI_IORT_NC_PASID_BITS         (31<<1)
 
 typedef struct acpi_iort_root_complex
 {
     UINT64                  MemoryProperties;       /* Memory access properties */
     UINT32                  AtsAttribute;
     UINT32                  PciSegmentNumber;
+    UINT8                   MemoryAddressLimit;     /* Memory address size limit */
+    UINT8                   Reserved[3];            /* Reserved, must be zero */
 
 } ACPI_IORT_ROOT_COMPLEX;
 
@@ -383,9 +391,7 @@ typedef struct acpi_iort_smmu_v3
     UINT32                  PriGsiv;
     UINT32                  GerrGsiv;
     UINT32                  SyncGsiv;
-    UINT8                   Pxm;
-    UINT8                   Reserved1;
-    UINT16                  Reserved2;
+    UINT32                  Pxm;
     UINT32                  IdMappingIndex;
 
 } ACPI_IORT_SMMU_V3;
@@ -399,8 +405,17 @@ typedef struct acpi_iort_smmu_v3
 /* Masks for Flags field above */
 
 #define ACPI_IORT_SMMU_V3_COHACC_OVERRIDE   (1)
-#define ACPI_IORT_SMMU_V3_HTTU_OVERRIDE     (1<<1)
+#define ACPI_IORT_SMMU_V3_HTTU_OVERRIDE     (3<<1)
 #define ACPI_IORT_SMMU_V3_PXM_VALID         (1<<3)
+
+typedef struct acpi_iort_pmcg
+{
+    UINT64                  Page0BaseAddress;
+    UINT32                  OverflowGsiv;
+    UINT32                  NodeReference;
+    UINT64                  Page1BaseAddress;
+
+} ACPI_IORT_PMCG;
 
 
 /*******************************************************************************
@@ -443,7 +458,8 @@ typedef struct acpi_ivrs_header
 
 enum AcpiIvrsType
 {
-    ACPI_IVRS_TYPE_HARDWARE         = 0x10,
+    ACPI_IVRS_TYPE_HARDWARE1        = 0x10,
+    ACPI_IVRS_TYPE_HARDWARE2        = 0x11,
     ACPI_IVRS_TYPE_MEMORY1          = 0x20,
     ACPI_IVRS_TYPE_MEMORY2          = 0x21,
     ACPI_IVRS_TYPE_MEMORY3          = 0x22
@@ -471,16 +487,30 @@ enum AcpiIvrsType
 
 /* 0x10: I/O Virtualization Hardware Definition Block (IVHD) */
 
-typedef struct acpi_ivrs_hardware
+typedef struct acpi_ivrs_hardware_10
 {
     ACPI_IVRS_HEADER        Header;
     UINT16                  CapabilityOffset;   /* Offset for IOMMU control fields */
     UINT64                  BaseAddress;        /* IOMMU control registers */
     UINT16                  PciSegmentGroup;
     UINT16                  Info;               /* MSI number and unit ID */
-    UINT32                  Reserved;
+    UINT32                  FeatureReporting;
 
-} ACPI_IVRS_HARDWARE;
+} ACPI_IVRS_HARDWARE1;
+
+/* 0x11: I/O Virtualization Hardware Definition Block (IVHD) */
+
+typedef struct acpi_ivrs_hardware_11
+{
+    ACPI_IVRS_HEADER        Header;
+    UINT16                  CapabilityOffset;   /* Offset for IOMMU control fields */
+    UINT64                  BaseAddress;        /* IOMMU control registers */
+    UINT16                  PciSegmentGroup;
+    UINT16                  Info;               /* MSI number and unit ID */
+    UINT32                  Attributes;
+    UINT64                  EfrRegisterImage;
+    UINT64                  Reserved;
+} ACPI_IVRS_HARDWARE2;
 
 /* Masks for Info field above */
 
@@ -859,7 +889,7 @@ typedef struct acpi_madt_local_x2apic_nmi
 } ACPI_MADT_LOCAL_X2APIC_NMI;
 
 
-/* 11: Generic Interrupt (ACPI 5.0 + ACPI 6.0 changes) */
+/* 11: Generic Interrupt - GICC (ACPI 5.0 + ACPI 6.0 + ACPI 6.3 changes) */
 
 typedef struct acpi_madt_generic_interrupt
 {
@@ -878,7 +908,8 @@ typedef struct acpi_madt_generic_interrupt
     UINT64                  GicrBaseAddress;
     UINT64                  ArmMpidr;
     UINT8                   EfficiencyClass;
-    UINT8                   Reserved2[3];
+    UINT8                   Reserved2[1];
+    UINT16                  SpeInterrupt;       /* ACPI 6.3 */
 
 } ACPI_MADT_GENERIC_INTERRUPT;
 
@@ -1723,6 +1754,7 @@ typedef struct acpi_pdtt_channel
 
 #define ACPI_PDTT_RUNTIME_TRIGGER           (1)
 #define ACPI_PDTT_WAIT_COMPLETION           (1<<1)
+#define ACPI_PDTT_TRIGGER_ORDER             (1<<2)
 
 
 /*******************************************************************************
@@ -1859,8 +1891,11 @@ typedef struct acpi_pptt_processor
 
 /* Flags */
 
-#define ACPI_PPTT_PHYSICAL_PACKAGE          (1)     /* Physical package */
-#define ACPI_PPTT_ACPI_PROCESSOR_ID_VALID   (2)     /* ACPI Processor ID valid */
+#define ACPI_PPTT_PHYSICAL_PACKAGE          (1)
+#define ACPI_PPTT_ACPI_PROCESSOR_ID_VALID   (1<<1)
+#define ACPI_PPTT_ACPI_PROCESSOR_IS_THREAD  (1<<2)  /* ACPI 6.3 */
+#define ACPI_PPTT_ACPI_LEAF_NODE            (1<<3)  /* ACPI 6.3 */
+#define ACPI_PPTT_ACPI_IDENTICAL            (1<<4)  /* ACPI 6.3 */
 
 
 /* 1: Cache Type Structure */

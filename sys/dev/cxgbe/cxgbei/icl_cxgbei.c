@@ -47,6 +47,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/file.h>
 #include <sys/kernel.h>
 #include <sys/kthread.h>
+#include <sys/ktr.h>
 #include <sys/lock.h>
 #include <sys/mbuf.h>
 #include <sys/mutex.h>
@@ -99,7 +100,8 @@ __FBSDID("$FreeBSD$");
 #include "tom/t4_tom.h"
 #include "cxgbei.h"
 
-SYSCTL_NODE(_kern_icl, OID_AUTO, cxgbei, CTLFLAG_RD, 0, "Chelsio iSCSI offload");
+SYSCTL_NODE(_kern_icl, OID_AUTO, cxgbei, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Chelsio iSCSI offload");
 static int coalesce = 1;
 SYSCTL_INT(_kern_icl_cxgbei, OID_AUTO, coalesce, CTLFLAG_RWTUN,
 	&coalesce, 0, "Try to coalesce PDUs before sending");
@@ -589,9 +591,9 @@ set_ulp_mode_iscsi(struct adapter *sc, struct toepcb *toep, int hcrc, int dcrc)
 	CTR4(KTR_CXGBE, "%s: tid %u, ULP_MODE_ISCSI, CRC hdr=%d data=%d",
 	    __func__, toep->tid, hcrc, dcrc);
 
-	t4_set_tcb_field(sc, toep->ctrlq, toep->tid, W_TCB_ULP_TYPE,
+	t4_set_tcb_field(sc, toep->ctrlq, toep, W_TCB_ULP_TYPE,
 	    V_TCB_ULP_TYPE(M_TCB_ULP_TYPE) | V_TCB_ULP_RAW(M_TCB_ULP_RAW), val,
-	    0, 0, toep->ofld_rxq->iq.abs_id);
+	    0, 0);
 }
 
 /*
@@ -671,7 +673,7 @@ icl_cxgbei_conn_handoff(struct icl_conn *ic, int fd)
 		MPASS(tp->tod != NULL);
 		MPASS(tp->t_toe != NULL);
 		toep = tp->t_toe;
-		MPASS(toep->vi->pi->adapter == icc->sc);
+		MPASS(toep->vi->adapter == icc->sc);
 		icc->toep = toep;
 		icc->cwt = cxgbei_select_worker_thread(icc);
 
@@ -696,7 +698,7 @@ icl_cxgbei_conn_handoff(struct icl_conn *ic, int fd)
 			    ISCSI_DATA_DIGEST_SIZE;
 		}
 		so->so_options |= SO_NO_DDP;
-		toep->ulp_mode = ULP_MODE_ISCSI;
+		toep->params.ulp_mode = ULP_MODE_ISCSI;
 		toep->ulpcb = icc;
 
 		send_iscsi_flowc_wr(icc->sc, toep, ci->max_tx_pdu_len);

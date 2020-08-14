@@ -1,10 +1,6 @@
 .\" -*- nroff -*-
 .\"
-.\" Copyright (c) 2004 M. Warner Losh.
-.\"
-.\" All rights reserved.
-.\"
-.\" This program is free software.
+.\" Copyright (c) 2004 M. Warner Losh <imp@FreeBSD.org>
 .\"
 .\" Redistribution and use in source and binary forms, with or without
 .\" modification, are permitted provided that the following conditions
@@ -28,7 +24,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd October 28, 2015
+.Dd April 8, 2018
 .Dt BUS_ADD_CHILD 9
 .Os
 .Sh NAME
@@ -37,7 +33,7 @@
 .Sh SYNOPSIS
 .In sys/param.h
 .In sys/bus.h
-.Ft int
+.Ft device_t
 .Fn BUS_ADD_CHILD "device_t dev" "int order" "const char *name" "int unit"
 .Sh DESCRIPTION
 The

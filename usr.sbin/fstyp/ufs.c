@@ -50,9 +50,12 @@ fstyp_ufs(FILE *fp, char *label, size_t labelsize)
 {
 	struct fs *fs;
 
-	switch (sbget(fileno(fp), &fs, -1)) {
+	switch (sbget(fileno(fp), &fs, STDSB)) {
 	case 0:
 		strlcpy(label, fs->fs_volname, labelsize);
+		free(fs->fs_csp);
+		free(fs->fs_si);
+		free(fs);
 		return (0);
 	case ENOENT:
 		/* Cannot find file system superblock */

@@ -549,15 +549,16 @@ acpi_asus_probe(device_t dev)
 	ACPI_OBJECT		Arg, *Obj;
 	ACPI_OBJECT_LIST	Args;
 	static char		*asus_ids[] = { "ATK0100", "ASUS010", NULL };
+	int rv;
 	char *rstr;
 
 	ACPI_FUNCTION_TRACE((char *)(uintptr_t)__func__);
 
 	if (acpi_disabled("asus"))
 		return (ENXIO);
-	rstr = ACPI_ID_PROBE(device_get_parent(dev), dev, asus_ids);
-	if (rstr == NULL) {
-		return (ENXIO);
+	rv = ACPI_ID_PROBE(device_get_parent(dev), dev, asus_ids, &rstr);
+	if (rv > 0) {
+		return (rv);
 	}
 
 	sc = device_get_softc(dev);
@@ -595,7 +596,7 @@ acpi_asus_probe(device_t dev)
 			sc->model = &acpi_samsung_models[0];
 			device_set_desc(dev, "Samsung P30 Laptop Extras");
 			AcpiOsFree(Buf.Pointer);
-			return (0);
+			return (rv);
 		}
 
 		/* EeePC */
@@ -603,7 +604,7 @@ acpi_asus_probe(device_t dev)
 			sc->model = &acpi_eeepc_models[0];
 			device_set_desc(dev, "ASUS EeePC");
 			AcpiOsFree(Buf.Pointer);
-			return (0);
+			return (rv);
 		}
 	}
 
@@ -627,7 +628,7 @@ good:
 
 			sbuf_delete(sb);
 			AcpiOsFree(Buf.Pointer);
-			return (0);
+			return (rv);
 		}
 		
 		/*
@@ -730,7 +731,7 @@ acpi_asus_attach(device_t dev)
 	sysctl_ctx_init(&sc->sysctl_ctx);
 	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(acpi_sc->acpi_sysctl_tree),
-	    OID_AUTO, "asus", CTLFLAG_RD, 0, "");
+	    OID_AUTO, "asus", CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "");
 
 	/* Hook up nodes */
 	for (int i = 0; acpi_asus_sysctls[i].name != NULL; i++) {
@@ -741,14 +742,14 @@ acpi_asus_attach(device_t dev)
 			SYSCTL_ADD_PROC(&sc->sysctl_ctx,
 			    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 			    acpi_asus_sysctls[i].name,
-			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY,
-			    sc, i, acpi_asus_sysctl, "I",
+			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY |
+			    CTLFLAG_NEEDGIANT, sc, i, acpi_asus_sysctl, "I",
 			    acpi_asus_sysctls[i].description);
 		} else {
 			SYSCTL_ADD_PROC(&sc->sysctl_ctx,
 			    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 			    acpi_asus_sysctls[i].name,
-			    CTLTYPE_INT | CTLFLAG_RW,
+			    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
 			    sc, i, acpi_asus_sysctl, "I",
 			    acpi_asus_sysctls[i].description);
 		}

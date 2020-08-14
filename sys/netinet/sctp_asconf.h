@@ -43,7 +43,7 @@ __FBSDID("$FreeBSD$");
 /*
  * function prototypes
  */
-extern void sctp_asconf_cleanup(struct sctp_tcb *, struct sctp_nets *);
+extern void sctp_asconf_cleanup(struct sctp_tcb *);
 
 extern struct mbuf *sctp_compose_asconf(struct sctp_tcb *, int *, int);
 
@@ -56,14 +56,14 @@ sctp_handle_asconf_ack(struct mbuf *, int, struct sctp_asconf_ack_chunk *,
     struct sctp_tcb *, struct sctp_nets *, int *);
 
 extern uint32_t
-sctp_addr_mgmt_ep_sa(struct sctp_inpcb *, struct sockaddr *,
-    uint32_t, uint32_t, struct sctp_ifa *);
+sctp_addr_mgmt_ep_sa(struct sctp_inpcb *, struct sockaddr *, uint32_t,
+    uint32_t);
 
 
-extern int 
+extern int
 sctp_asconf_iterator_ep(struct sctp_inpcb *inp, void *ptr,
     uint32_t val);
-extern void 
+extern void
 sctp_asconf_iterator_stcb(struct sctp_inpcb *inp,
     struct sctp_tcb *stcb,
     void *ptr, uint32_t type);

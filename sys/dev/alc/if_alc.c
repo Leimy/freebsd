@@ -50,6 +50,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/taskqueue.h>
 
 #include <net/bpf.h>
+#include <net/debugnet.h>
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/if_arp.h>
@@ -199,6 +200,7 @@ static int	alc_shutdown(device_t);
 static void	alc_start(struct ifnet *);
 static void	alc_start_locked(struct ifnet *);
 static void	alc_start_queue(struct alc_softc *);
+static void	alc_start_tx(struct alc_softc *);
 static void	alc_stats_clear(struct alc_softc *);
 static void	alc_stats_update(struct alc_softc *);
 static void	alc_stop(struct alc_softc *);
@@ -212,6 +214,8 @@ static void	alc_watchdog(struct alc_softc *);
 static int	sysctl_int_range(SYSCTL_HANDLER_ARGS, int, int);
 static int	sysctl_hw_alc_proc_limit(SYSCTL_HANDLER_ARGS);
 static int	sysctl_hw_alc_int_mod(SYSCTL_HANDLER_ARGS);
+
+DEBUGNET_DEFINE(alc);
 
 static device_method_t alc_methods[] = {
 	/* Device interface. */
@@ -227,7 +231,7 @@ static device_method_t alc_methods[] = {
 	DEVMETHOD(miibus_writereg,	alc_miibus_writereg),
 	DEVMETHOD(miibus_statchg,	alc_miibus_statchg),
 
-	{ NULL, NULL }
+	DEVMETHOD_END
 };
 
 static driver_t alc_driver = {
@@ -239,6 +243,8 @@ static driver_t alc_driver = {
 static devclass_t alc_devclass;
 
 DRIVER_MODULE(alc, pci, alc_driver, alc_devclass, 0, 0);
+MODULE_PNP_INFO("U16:vendor;U16:device", pci, alc, alc_ident_table,
+    nitems(alc_ident_table) - 1);
 DRIVER_MODULE(miibus, alc, miibus_driver, miibus_devclass, 0, 0);
 
 static struct resource_spec alc_res_spec_mem[] = {
@@ -1381,7 +1387,7 @@ alc_attach(device_t dev)
 	mtx_init(&sc->alc_mtx, device_get_nameunit(dev), MTX_NETWORK_LOCK,
 	    MTX_DEF);
 	callout_init_mtx(&sc->alc_tick_ch, &sc->alc_mtx, 0);
-	TASK_INIT(&sc->alc_int_task, 0, alc_int_task, sc);
+	NET_TASK_INIT(&sc->alc_int_task, 0, alc_int_task, sc);
 	sc->alc_ident = alc_find_ident(dev);
 
 	/* Map the device. */
@@ -1651,6 +1657,9 @@ alc_attach(device_t dev)
 		goto fail;
 	}
 
+	/* Attach driver debugnet methods. */
+	DEBUGNET_SET(ifp, alc);
+
 fail:
 	if (error != 0)
 		alc_detach(dev);
@@ -1738,11 +1747,11 @@ alc_sysctl_node(struct alc_softc *sc)
 	child = SYSCTL_CHILDREN(device_get_sysctl_tree(sc->alc_dev));
 
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "int_rx_mod",
-	    CTLTYPE_INT | CTLFLAG_RW, &sc->alc_int_rx_mod, 0,
-	    sysctl_hw_alc_int_mod, "I", "alc Rx interrupt moderation");
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, &sc->alc_int_rx_mod,
+	    0, sysctl_hw_alc_int_mod, "I", "alc Rx interrupt moderation");
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "int_tx_mod",
-	    CTLTYPE_INT | CTLFLAG_RW, &sc->alc_int_tx_mod, 0,
-	    sysctl_hw_alc_int_mod, "I", "alc Tx interrupt moderation");
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, &sc->alc_int_tx_mod,
+	    0, sysctl_hw_alc_int_mod, "I", "alc Tx interrupt moderation");
 	/* Pull in device tunables. */
 	sc->alc_int_rx_mod = ALC_IM_RX_TIMER_DEFAULT;
 	error = resource_int_value(device_get_name(sc->alc_dev),
@@ -1769,8 +1778,8 @@ alc_sysctl_node(struct alc_softc *sc)
 		}
 	}
 	SYSCTL_ADD_PROC(ctx, child, OID_AUTO, "process_limit",
-	    CTLTYPE_INT | CTLFLAG_RW, &sc->alc_process_limit, 0,
-	    sysctl_hw_alc_proc_limit, "I",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
+	    &sc->alc_process_limit, 0, sysctl_hw_alc_proc_limit, "I",
 	    "max number of Rx events to process");
 	/* Pull in device tunables. */
 	sc->alc_process_limit = ALC_PROC_DEFAULT;
@@ -1787,13 +1796,13 @@ alc_sysctl_node(struct alc_softc *sc)
 		}
 	}
 
-	tree = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "stats", CTLFLAG_RD,
-	    NULL, "ALC statistics");
+	tree = SYSCTL_ADD_NODE(ctx, child, OID_AUTO, "stats",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "ALC statistics");
 	parent = SYSCTL_CHILDREN(tree);
 
 	/* Rx statistics. */
-	tree = SYSCTL_ADD_NODE(ctx, parent, OID_AUTO, "rx", CTLFLAG_RD,
-	    NULL, "Rx MAC statistics");
+	tree = SYSCTL_ADD_NODE(ctx, parent, OID_AUTO, "rx",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Rx MAC statistics");
 	child = SYSCTL_CHILDREN(tree);
 	ALC_SYSCTL_STAT_ADD32(ctx, child, "good_frames",
 	    &stats->rx_frames, "Good frames");
@@ -1846,8 +1855,8 @@ alc_sysctl_node(struct alc_softc *sc)
 	    "Frames dropped due to address filtering");
 
 	/* Tx statistics. */
-	tree = SYSCTL_ADD_NODE(ctx, parent, OID_AUTO, "tx", CTLFLAG_RD,
-	    NULL, "Tx MAC statistics");
+	tree = SYSCTL_ADD_NODE(ctx, parent, OID_AUTO, "tx",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Tx MAC statistics");
 	child = SYSCTL_CHILDREN(tree);
 	ALC_SYSCTL_STAT_ADD32(ctx, child, "good_frames",
 	    &stats->tx_frames, "Good frames");
@@ -2974,22 +2983,28 @@ alc_start_locked(struct ifnet *ifp)
 		ETHER_BPF_MTAP(ifp, m_head);
 	}
 
-	if (enq > 0) {
-		/* Sync descriptors. */
-		bus_dmamap_sync(sc->alc_cdata.alc_tx_ring_tag,
-		    sc->alc_cdata.alc_tx_ring_map, BUS_DMASYNC_PREWRITE);
-		/* Kick. Assume we're using normal Tx priority queue. */
-		if ((sc->alc_flags & ALC_FLAG_AR816X_FAMILY) != 0)
-			CSR_WRITE_2(sc, ALC_MBOX_TD_PRI0_PROD_IDX,
-			    (uint16_t)sc->alc_cdata.alc_tx_prod);
-		else
-			CSR_WRITE_4(sc, ALC_MBOX_TD_PROD_IDX,
-			    (sc->alc_cdata.alc_tx_prod <<
-			    MBOX_TD_PROD_LO_IDX_SHIFT) &
-			    MBOX_TD_PROD_LO_IDX_MASK);
-		/* Set a timeout in case the chip goes out to lunch. */
-		sc->alc_watchdog_timer = ALC_TX_TIMEOUT;
-	}
+	if (enq > 0)
+		alc_start_tx(sc);
+}
+
+static void
+alc_start_tx(struct alc_softc *sc)
+{
+
+	/* Sync descriptors. */
+	bus_dmamap_sync(sc->alc_cdata.alc_tx_ring_tag,
+	    sc->alc_cdata.alc_tx_ring_map, BUS_DMASYNC_PREWRITE);
+	/* Kick. Assume we're using normal Tx priority queue. */
+	if ((sc->alc_flags & ALC_FLAG_AR816X_FAMILY) != 0)
+		CSR_WRITE_2(sc, ALC_MBOX_TD_PRI0_PROD_IDX,
+		    (uint16_t)sc->alc_cdata.alc_tx_prod);
+	else
+		CSR_WRITE_4(sc, ALC_MBOX_TD_PROD_IDX,
+		    (sc->alc_cdata.alc_tx_prod <<
+		    MBOX_TD_PROD_LO_IDX_SHIFT) &
+		    MBOX_TD_PROD_LO_IDX_MASK);
+	/* Set a timeout in case the chip goes out to lunch. */
+	sc->alc_watchdog_timer = ALC_TX_TIMEOUT;
 }
 
 static void
@@ -4566,12 +4581,22 @@ alc_rxvlan(struct alc_softc *sc)
 	CSR_WRITE_4(sc, ALC_MAC_CFG, reg);
 }
 
+static u_int
+alc_hash_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	uint32_t *mchash = arg;
+	uint32_t crc;
+
+	crc = ether_crc32_be(LLADDR(sdl), ETHER_ADDR_LEN);
+	mchash[crc >> 31] |= 1 << ((crc >> 26) & 0x1f);
+
+	return (1);
+}
+
 static void
 alc_rxfilter(struct alc_softc *sc)
 {
 	struct ifnet *ifp;
-	struct ifmultiaddr *ifma;
-	uint32_t crc;
 	uint32_t mchash[2];
 	uint32_t rxcfg;
 
@@ -4594,15 +4619,7 @@ alc_rxfilter(struct alc_softc *sc)
 		goto chipit;
 	}
 
-	if_maddr_rlock(ifp);
-	TAILQ_FOREACH(ifma, &sc->alc_ifp->if_multiaddrs, ifma_link) {
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-		crc = ether_crc32_be(LLADDR((struct sockaddr_dl *)
-		    ifma->ifma_addr), ETHER_ADDR_LEN);
-		mchash[crc >> 31] |= 1 << ((crc >> 26) & 0x1f);
-	}
-	if_maddr_runlock(ifp);
+	if_foreach_llmaddr(ifp, alc_hash_maddr, mchash);
 
 chipit:
 	CSR_WRITE_4(sc, ALC_MAR0, mchash[0]);
@@ -4642,3 +4659,54 @@ sysctl_hw_alc_int_mod(SYSCTL_HANDLER_ARGS)
 	return (sysctl_int_range(oidp, arg1, arg2, req,
 	    ALC_IM_TIMER_MIN, ALC_IM_TIMER_MAX));
 }
+
+#ifdef DEBUGNET
+static void
+alc_debugnet_init(struct ifnet *ifp, int *nrxr, int *ncl, int *clsize)
+{
+	struct alc_softc *sc;
+
+	sc = if_getsoftc(ifp);
+	KASSERT(sc->alc_buf_size <= MCLBYTES, ("incorrect cluster size"));
+
+	*nrxr = ALC_RX_RING_CNT;
+	*ncl = DEBUGNET_MAX_IN_FLIGHT;
+	*clsize = MCLBYTES;
+}
+
+static void
+alc_debugnet_event(struct ifnet *ifp __unused, enum debugnet_ev event __unused)
+{
+}
+
+static int
+alc_debugnet_transmit(struct ifnet *ifp, struct mbuf *m)
+{
+	struct alc_softc *sc;
+	int error;
+
+	sc = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING)
+		return (EBUSY);
+
+	error = alc_encap(sc, &m);
+	if (error == 0)
+		alc_start_tx(sc);
+	return (error);
+}
+
+static int
+alc_debugnet_poll(struct ifnet *ifp, int count)
+{
+	struct alc_softc *sc;
+
+	sc = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING)
+		return (EBUSY);
+
+	alc_txeof(sc);
+	return (alc_rxintr(sc, count));
+}
+#endif /* DEBUGNET */

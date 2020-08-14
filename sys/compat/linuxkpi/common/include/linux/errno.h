@@ -33,15 +33,17 @@
 
 #include <sys/errno.h>
 
+#define	EBADRQC		56	/* Bad request code */
+
 #define	ECHRNG		EDOM
 #define	ETIME		ETIMEDOUT
-#define	ECOMM           ESTALE
-#define	ENODATA         ECONNREFUSED
+#define	ECOMM		ESTALE
+#define	ENODATA		ECONNREFUSED
 #define	ENOIOCTLCMD     ENOIOCTL
 /* Use same value as Linux, because BSD's ERESTART is negative */
 #define	ERESTARTSYS     512
-#define	ENOTSUPP        EOPNOTSUPP
-#define	ENONET          EHOSTDOWN
+#define	ENOTSUPP	EOPNOTSUPP
+#define	ENONET		EHOSTDOWN
 
 #define	ERESTARTNOINTR	513
 #define	ERESTARTNOHAND	514

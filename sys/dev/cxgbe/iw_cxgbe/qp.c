@@ -65,7 +65,7 @@ struct cpl_set_tcb_rpl;
 
 #include "iw_cxgbe.h"
 #include "user.h"
-extern int use_dsgl;
+
 static int creds(struct toepcb *toep, struct inpcb *inp, size_t wrsize);
 static int max_fr_immd = T4_MAX_FR_IMMD;//SYSCTL parameter later...
 
@@ -236,7 +236,7 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	/* build fw_ri_res_wr */
 	wr_len = sizeof *res_wr + 2 * sizeof *res;
 
-	wr = alloc_wrqe(wr_len, &sc->sge.mgmtq);
+	wr = alloc_wrqe(wr_len, &sc->sge.ctrlq[0]);
 	if (wr == NULL) {
 		ret = -ENOMEM;
 		goto free_rq_dma;
@@ -266,7 +266,8 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	res->u.sqrq.dcaen_to_eqsize = cpu_to_be32(
 		V_FW_RI_RES_WR_DCAEN(0) |
 		V_FW_RI_RES_WR_DCACPU(0) |
-		V_FW_RI_RES_WR_FBMIN(2) |
+		V_FW_RI_RES_WR_FBMIN(chip_id(sc) <= CHELSIO_T5 ?
+		    X_FETCHBURSTMIN_64B : X_FETCHBURSTMIN_64B_T6) |
 		V_FW_RI_RES_WR_FBMAX(3) |
 		V_FW_RI_RES_WR_CIDXFTHRESHO(0) |
 		V_FW_RI_RES_WR_CIDXFTHRESH(0) |
@@ -288,7 +289,8 @@ static int create_qp(struct c4iw_rdev *rdev, struct t4_wq *wq,
 	res->u.sqrq.dcaen_to_eqsize = cpu_to_be32(
 		V_FW_RI_RES_WR_DCAEN(0) |
 		V_FW_RI_RES_WR_DCACPU(0) |
-		V_FW_RI_RES_WR_FBMIN(2) |
+		V_FW_RI_RES_WR_FBMIN(chip_id(sc) <= CHELSIO_T5 ?
+		    X_FETCHBURSTMIN_64B : X_FETCHBURSTMIN_64B_T6) |
 		V_FW_RI_RES_WR_FBMAX(3) |
 		V_FW_RI_RES_WR_CIDXFTHRESHO(0) |
 		V_FW_RI_RES_WR_CIDXFTHRESH(0) |
@@ -576,7 +578,7 @@ static void free_qp_work(struct work_struct *work)
 	ucontext = qhp->ucontext;
 	rhp = qhp->rhp;
 
-	CTR3(KTR_IW_CXGBE, "%s qhp %p ucontext %p\n", __func__,
+	CTR3(KTR_IW_CXGBE, "%s qhp %p ucontext %p", __func__,
 			qhp, ucontext);
 	destroy_qp(&rhp->rdev, &qhp->wq,
 		   ucontext ? &ucontext->uctx : &rhp->rdev.uctx);
@@ -667,10 +669,13 @@ static void complete_rq_drain_wr(struct c4iw_qp *qhp, struct ib_recv_wr *wr)
 	spin_unlock_irqrestore(&rchp->comp_handler_lock, flag);
 }
 
-static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
+static int build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
 		struct ib_reg_wr *wr, struct c4iw_mr *mhp, u8 *len16)
 {
 	__be64 *p = (__be64 *)fr->pbl;
+
+	if (wr->mr->page_size > C4IW_MAX_PAGE_SIZE)
+		return -EINVAL;
 
 	fr->r2 = cpu_to_be32(0);
 	fr->stag = cpu_to_be32(mhp->ibmr.rkey);
@@ -687,8 +692,8 @@ static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
 	fr->tpte.nosnoop_pbladdr = cpu_to_be32(V_FW_RI_TPTE_PBLADDR(
 			      PBL_OFF(&mhp->rhp->rdev, mhp->attr.pbl_addr)>>3));
 	fr->tpte.dca_mwbcnt_pstag = cpu_to_be32(0);
-	fr->tpte.len_hi = cpu_to_be32(0);
-	fr->tpte.len_lo = cpu_to_be32(mhp->ibmr.length);
+	fr->tpte.len_hi = cpu_to_be32(mhp->ibmr.length >> 32);
+	fr->tpte.len_lo = cpu_to_be32(mhp->ibmr.length & 0xffffffff);
 	fr->tpte.va_hi = cpu_to_be32(mhp->ibmr.iova >> 32);
 	fr->tpte.va_lo_fbo = cpu_to_be32(mhp->ibmr.iova & 0xffffffff);
 
@@ -696,6 +701,7 @@ static void build_tpte_memreg(struct fw_ri_fr_nsmr_tpte_wr *fr,
 	p[1] = cpu_to_be64((u64)mhp->mpl[1]);
 
 	*len16 = DIV_ROUND_UP(sizeof(*fr), 16);
+	return 0;
 }
 
 static int build_memreg(struct t4_sq *sq, union t4_wr *wqe,
@@ -710,17 +716,18 @@ static int build_memreg(struct t4_sq *sq, union t4_wr *wqe,
 
 	if (mhp->mpl_len > t4_max_fr_depth(use_dsgl && dsgl_supported))
 		return -EINVAL;
+	if (wr->mr->page_size > C4IW_MAX_PAGE_SIZE)
+		return -EINVAL;
 
 	wqe->fr.qpbinde_to_dcacpu = 0;
 	wqe->fr.pgsz_shift = ilog2(wr->mr->page_size) - 12;
 	wqe->fr.addr_type = FW_RI_VA_BASED_TO;
 	wqe->fr.mem_perms = c4iw_ib_to_tpt_access(wr->access);
-	wqe->fr.len_hi = 0;
-	wqe->fr.len_lo = cpu_to_be32(mhp->ibmr.length);
+	wqe->fr.len_hi = cpu_to_be32(mhp->ibmr.length >> 32);
+	wqe->fr.len_lo = cpu_to_be32(mhp->ibmr.length & 0xffffffff);
 	wqe->fr.stag = cpu_to_be32(wr->key);
 	wqe->fr.va_hi = cpu_to_be32(mhp->ibmr.iova >> 32);
-	wqe->fr.va_lo_fbo = cpu_to_be32(mhp->ibmr.iova &
-			0xffffffff);
+	wqe->fr.va_lo_fbo = cpu_to_be32(mhp->ibmr.iova & 0xffffffff);
 
 	if (dsgl_supported && use_dsgl && (pbllen > max_fr_immd)) {
 		struct fw_ri_dsgl *sglp;
@@ -851,16 +858,16 @@ int c4iw_post_send(struct ib_qp *ibqp, struct ib_send_wr *wr,
 			if (rdev->adap->params.fr_nsmr_tpte_wr_support &&
 					!mhp->attr.state && mhp->mpl_len <= 2) {
 				fw_opcode = FW_RI_FR_NSMR_TPTE_WR;
-				build_tpte_memreg(&wqe->fr_tpte, reg_wr(wr),
+				err = build_tpte_memreg(&wqe->fr_tpte, reg_wr(wr),
 						mhp, &len16);
 			} else {
 				fw_opcode = FW_RI_FR_NSMR_WR;
 				err = build_memreg(&qhp->wq.sq, wqe, reg_wr(wr),
 					mhp, &len16,
 					rdev->adap->params.ulptx_memwrite_dsgl);
-				if (err)
-					break;
 			}
+			if (err)
+				break;
 			mhp->attr.state = 1;
 			break;
 		}
@@ -1415,7 +1422,7 @@ static int rdma_init(struct c4iw_dev *rhp, struct c4iw_qp *qhp)
 	ret = c4iw_wait_for_reply(rdev, &ep->com.wr_wait, ep->hwtid,
 			qhp->wq.sq.qid, ep->com.so, __func__);
 
-	toep->ulp_mode = ULP_MODE_RDMA;
+	toep->params.ulp_mode = ULP_MODE_RDMA;
 	free_ird(rhp, qhp->attr.max_ird);
 
 	return ret;
@@ -1474,6 +1481,22 @@ int c4iw_modify_qp(struct c4iw_dev *rhp, struct c4iw_qp *qhp,
 		goto out;
 	if (qhp->attr.state == attrs->next_state)
 		goto out;
+
+	/* Return EINPROGRESS if QP is already in transition state.
+	 * Eg: CLOSING->IDLE transition or *->ERROR transition.
+	 * This can happen while connection is switching(due to rdma_fini)
+	 * from iWARP/RDDP to TOE mode and any inflight RDMA RX data will
+	 * reach TOE driver -> TCP stack -> iWARP driver. In this way
+	 * iWARP driver keep receiving inflight RDMA RX data until socket
+	 * is closed or aborted. And if iWARP CM is in FPDU sate, then
+	 * it tries to put QP in TERM state and disconnects endpoint.
+	 * But as QP is already in transition state, this event is ignored.
+	 */
+	if ((qhp->attr.state >= C4IW_QP_STATE_ERROR) &&
+		(attrs->next_state == C4IW_QP_STATE_TERMINATE)) {
+		ret = -EINPROGRESS;
+		goto out;
+	}
 
 	switch (qhp->attr.state) {
 	case C4IW_QP_STATE_IDLE:
@@ -1862,10 +1885,10 @@ c4iw_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attrs,
 	qhp->ibqp.qp_num = qhp->wq.sq.qid;
 	init_timer(&(qhp->timer));
 
-	CTR5(KTR_IW_CXGBE, "%s sq id %u size %u memsize %zu num_entries %u\n",
+	CTR5(KTR_IW_CXGBE, "%s sq id %u size %u memsize %zu num_entries %u",
 		 __func__, qhp->wq.sq.qid,
 		 qhp->wq.sq.size, qhp->wq.sq.memsize, attrs->cap.max_send_wr);
-	CTR5(KTR_IW_CXGBE, "%s rq id %u size %u memsize %zu num_entries %u\n",
+	CTR5(KTR_IW_CXGBE, "%s rq id %u size %u memsize %zu num_entries %u",
 		 __func__, qhp->wq.rq.qid,
 		 qhp->wq.rq.size, qhp->wq.rq.memsize, attrs->cap.max_recv_wr);
 	return &qhp->ibqp;

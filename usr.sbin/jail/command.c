@@ -147,8 +147,9 @@ next_command(struct cfjail *j)
 		}
 		if (j->comstring == NULL || j->comstring->len == 0 ||
 		    (create_failed && (comparam == IP_EXEC_PRESTART ||
-		    comparam == IP_EXEC_START || comparam == IP_COMMAND ||
-		    comparam == IP_EXEC_POSTSTART)))
+		    comparam == IP_EXEC_CREATED || comparam == IP_EXEC_START ||
+		    comparam == IP_COMMAND || comparam == IP_EXEC_POSTSTART ||
+		    comparam == IP_EXEC_PREPARE)))
 			continue;
 		switch (run_command(j)) {
 		case -1:
@@ -374,7 +375,7 @@ run_command(struct cfjail *j)
 			argc = 4;
 		}
 
-		if (!down) {
+		if (!down && extrap != NULL) {
 			for (cs = strtok(extrap, " "); cs;
 			     cs = strtok(NULL, " ")) {
 				size_t len = strlen(cs) + 1;
@@ -497,7 +498,7 @@ run_command(struct cfjail *j)
 		argv = alloca(7 * sizeof(char *));
 		path = string_param(j->intparams[KP_PATH]);
 		if (path == NULL) {
-			jail_warnx(j, "mount.devfs: no path");
+			jail_warnx(j, "mount.devfs: no jail root path defined");
 			return -1;
 		}
 		devpath = alloca(strlen(path) + 5);
@@ -528,7 +529,7 @@ run_command(struct cfjail *j)
 		argv = alloca(7 * sizeof(char *));
 		path = string_param(j->intparams[KP_PATH]);
 		if (path == NULL) {
-			jail_warnx(j, "mount.fdescfs: no path");
+			jail_warnx(j, "mount.fdescfs: no jail root path defined");
 			return -1;
 		}
 		devpath = alloca(strlen(path) + 8);
@@ -554,7 +555,7 @@ run_command(struct cfjail *j)
 		argv = alloca(7 * sizeof(char *));
 		path = string_param(j->intparams[KP_PATH]);
 		if (path == NULL) {
-			jail_warnx(j, "mount.procfs: no path");
+			jail_warnx(j, "mount.procfs: no jail root path defined");
 			return -1;
 		}
 		devpath = alloca(strlen(path) + 6);

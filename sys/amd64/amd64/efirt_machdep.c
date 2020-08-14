@@ -55,6 +55,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/vmparam.h>
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_extern.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
@@ -73,7 +74,7 @@ efi_destroy_1t1_map(void)
 	if (obj_1t1_pt != NULL) {
 		VM_OBJECT_RLOCK(obj_1t1_pt);
 		TAILQ_FOREACH(m, &obj_1t1_pt->memq, listq)
-			m->wire_count = 0;
+			m->ref_count = VPRC_OBJREF;
 		vm_wire_sub(obj_1t1_pt->resident_page_count);
 		VM_OBJECT_RUNLOCK(obj_1t1_pt);
 		vm_object_deallocate(obj_1t1_pt);
@@ -82,6 +83,19 @@ efi_destroy_1t1_map(void)
 	obj_1t1_pt = NULL;
 	efi_pml4 = NULL;
 	efi_pml4_page = NULL;
+}
+
+/*
+ * Map a physical address from EFI runtime space into KVA space.  Returns 0 to
+ * indicate a failed mapping so that the caller may handle error.
+ */
+vm_offset_t
+efi_phys_to_kva(vm_paddr_t paddr)
+{
+
+	if (paddr >= dmaplimit)
+		return (0);
+	return (PHYS_TO_DMAP(paddr));
 }
 
 static vm_page_t
@@ -253,6 +267,7 @@ efi_arch_enter(void)
 
 	curpmap = PCPU_GET(curpmap);
 	PMAP_LOCK_ASSERT(curpmap, MA_OWNED);
+	curthread->td_md.md_efirt_dis_pf = vm_fault_disable_pagefaults();
 
 	/*
 	 * IPI TLB shootdown handler invltlb_pcid_handler() reloads
@@ -287,6 +302,7 @@ efi_arch_leave(void)
 	    curpmap->pm_pcids[PCPU_GET(cpuid)].pm_pcid : 0));
 	if (!pmap_pcid_enabled)
 		invltlb();
+	vm_fault_enable_pagefaults(curthread->td_md.md_efirt_dis_pf);
 }
 
 /* XXX debug stuff */
@@ -309,5 +325,7 @@ efi_time_sysctl_handler(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_debug, OID_AUTO, efi_time, CTLTYPE_INT | CTLFLAG_RW, NULL, 0,
-    efi_time_sysctl_handler, "I", "");
+SYSCTL_PROC(_debug, OID_AUTO, efi_time,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    efi_time_sysctl_handler, "I",
+    "");

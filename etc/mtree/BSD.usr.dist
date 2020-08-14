@@ -11,7 +11,19 @@
         private
             bsdstat
             ..
-            event
+            event1
+            ..
+            gmock
+                internal
+                    custom
+                    ..
+                ..
+            ..
+            gtest
+                internal
+                    custom
+                    ..
+                ..
             ..
             sqlite3
             ..
@@ -25,9 +37,21 @@
         aout
         ..
         clang
-            6.0.0
+            10.0.1
                 include
+                    cuda_wrappers
+                    ..
+                    fuzzer
+                    ..
+                    openmp_wrappers
+                    ..
+                    ppc_wrappers
+                    ..
+                    profile
+                    ..
                     sanitizer
+                    ..
+                    xray
                     ..
                 ..
                 lib
@@ -43,6 +67,8 @@
         dtrace
         ..
         engines
+        ..
+        flua
         ..
         i18n
         ..
@@ -182,12 +208,20 @@
             uk_UA.KOI8-U
             ..
         ..
+        certs
+            blacklisted tags=package=caroot
+            ..
+            trusted tags=package=caroot
+            ..
+        ..
         dict
         ..
         doc
             IPv6
             ..
             atf
+            ..
+            kyua
             ..
             legal
             ..
@@ -251,8 +285,6 @@
             ..
             hostapd
             ..
-            ibcs2
-            ..
             indent
             ..
             ipfilter
@@ -285,6 +317,8 @@
                     ..
                 ..
             ..
+            kyua
+            ..
             libusb20
             ..
             libvgl
@@ -292,8 +326,6 @@
             mdoc
             ..
             netgraph
-            ..
-            pc-sysinstall
             ..
             perfmon
             ..
@@ -339,6 +371,8 @@
             ..
         ..
         firmware
+        ..
+        flua
         ..
         games
             fortune
@@ -418,10 +452,16 @@
         ..
         keys
             pkg
-                revoked
+                revoked tags=package=runtime
                 ..
-                trusted
+                trusted tags=package=runtime
                 ..
+            ..
+        ..
+        kyua
+            misc
+            ..
+            store
             ..
         ..
         locale
@@ -635,6 +675,8 @@
             ..
             fr_FR.UTF-8
             ..
+            ga_IE.UTF-8
+            ..
             he_IL.UTF-8
             ..
             hi_IN.ISCII-DEV
@@ -816,6 +858,8 @@
             man3
             ..
             man4
+                aarch64
+                ..
                 amd64
                 ..
                 arm
@@ -823,8 +867,6 @@
                 i386
                 ..
                 powerpc
-                ..
-                sparc64
                 ..
             ..
             man5
@@ -839,8 +881,6 @@
                 i386
                 ..
                 powerpc
-                ..
-                sparc64
                 ..
             ..
             man9
@@ -1152,20 +1192,10 @@
                 ..
                 man3
                 ..
-            ..
-        ..
-        pc-sysinstall
-            backend
-            ..
-            backend-partmanager
-            ..
-            backend-query
-            ..
-            conf
-                license
+                man5
                 ..
-            ..
-            doc
+                man7
+                ..
             ..
         ..
         security
@@ -1223,15 +1253,25 @@
             ..
             Australia
             ..
+            Brazil
+            ..
+            Canada
+            ..
+            Chile
+            ..
             Etc
             ..
             Europe
             ..
             Indian
             ..
+            Mexico
+            ..
             Pacific
             ..
             SystemV
+            ..
+            US
             ..
         ..
     ..

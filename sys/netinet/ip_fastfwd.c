@@ -57,7 +57,7 @@
  *
  * We try to do the least expensive (in CPU ops) checks and operations
  * first to catch junk with as little overhead as possible.
- * 
+ *
  * We take full advantage of hardware support for IP checksum and
  * fragmentation offloading.
  *
@@ -90,12 +90,13 @@ __FBSDID("$FreeBSD$");
 #include <sys/socket.h>
 #include <sys/sysctl.h>
 
-#include <net/pfil.h>
 #include <net/if.h>
 #include <net/if_types.h>
 #include <net/if_var.h>
 #include <net/if_dl.h>
+#include <net/pfil.h>
 #include <net/route.h>
+#include <net/route/nhop.h>
 #include <net/vnet.h>
 
 #include <netinet/in.h>
@@ -111,11 +112,13 @@ __FBSDID("$FreeBSD$");
 #include <machine/in_cksum.h>
 
 static int
-ip_findroute(struct nhop4_basic *pnh, struct in_addr dest, struct mbuf *m)
+ip_findroute(struct nhop_object **pnh, struct in_addr dest, struct mbuf *m)
 {
+	struct nhop_object *nh;
 
-	bzero(pnh, sizeof(*pnh));
-	if (fib4_lookup_nh_basic(M_GETFIB(m), dest, 0, 0, pnh) != 0) {
+	nh = fib4_lookup(M_GETFIB(m), dest, 0, NHR_NONE,
+	    m->m_pkthdr.flowid);
+	if (nh == NULL) {
 		IPSTAT_INC(ips_noroute);
 		IPSTAT_INC(ips_cantforward);
 		icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_HOST, 0, 0);
@@ -124,17 +127,19 @@ ip_findroute(struct nhop4_basic *pnh, struct in_addr dest, struct mbuf *m)
 	/*
 	 * Drop blackholed traffic and directed broadcasts.
 	 */
-	if ((pnh->nh_flags & (NHF_BLACKHOLE | NHF_BROADCAST)) != 0) {
+	if ((nh->nh_flags & (NHF_BLACKHOLE | NHF_BROADCAST)) != 0) {
 		IPSTAT_INC(ips_cantforward);
 		m_freem(m);
 		return (EHOSTUNREACH);
 	}
 
-	if (pnh->nh_flags & NHF_REJECT) {
+	if (nh->nh_flags & NHF_REJECT) {
 		IPSTAT_INC(ips_cantforward);
 		icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_HOST, 0, 0);
 		return (EHOSTUNREACH);
 	}
+
+	*pnh = nh;
 
 	return (0);
 }
@@ -151,9 +156,9 @@ ip_tryforward(struct mbuf *m)
 {
 	struct ip *ip;
 	struct mbuf *m0 = NULL;
-	struct nhop4_basic nh;
+	struct nhop_object *nh;
 	struct sockaddr_in dst;
-	struct in_addr odest, dest;
+	struct in_addr dest, odest, rtdest;
 	uint16_t ip_len, ip_off;
 	int error = 0;
 	struct m_tag *fwd_tag = NULL;
@@ -228,12 +233,11 @@ ip_tryforward(struct mbuf *m)
 	/*
 	 * Run through list of ipfilter hooks for input packets
 	 */
-	if (!PFIL_HOOKED(&V_inet_pfil_hook))
+	if (!PFIL_HOOKED_IN(V_inet_pfil_head))
 		goto passin;
 
-	if (pfil_run_hooks(
-	    &V_inet_pfil_hook, &m, m->m_pkthdr.rcvif, PFIL_IN, NULL) ||
-	    m == NULL)
+	if (pfil_run_hooks(V_inet_pfil_head, &m, m->m_pkthdr.rcvif, PFIL_IN,
+	    NULL) != PFIL_PASS)
 		goto drop;
 
 	M_ASSERTVALID(m);
@@ -294,21 +298,39 @@ passin:
 #endif
 
 	/*
+	 * Next hop forced by pfil(9) hook?
+	 */
+	if ((m->m_flags & M_IP_NEXTHOP) &&
+	    ((fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL)) != NULL)) {
+		/*
+		 * Now we will find route to forced destination.
+		 */
+		dest.s_addr = ((struct sockaddr_in *)
+			    (fwd_tag + 1))->sin_addr.s_addr;
+		m_tag_delete(m, fwd_tag);
+		m->m_flags &= ~M_IP_NEXTHOP;
+	}
+
+	/*
 	 * Find route to destination.
 	 */
 	if (ip_findroute(&nh, dest, m) != 0)
 		return (NULL);	/* icmp unreach already sent */
 
 	/*
+	 * Avoid second route lookup by caching destination.
+	 */
+	rtdest.s_addr = dest.s_addr;
+
+	/*
 	 * Step 5: outgoing firewall packet processing
 	 */
-	if (!PFIL_HOOKED(&V_inet_pfil_hook))
+	if (!PFIL_HOOKED_OUT(V_inet_pfil_head))
 		goto passout;
 
-	if (pfil_run_hooks(&V_inet_pfil_hook, &m, nh.nh_ifp, PFIL_OUT, NULL) ||
-	    m == NULL) {
+	if (pfil_run_hooks(V_inet_pfil_head, &m, nh->nh_ifp,
+	    PFIL_OUT | PFIL_FWD, NULL) != PFIL_PASS)
 		goto drop;
-	}
 
 	M_ASSERTVALID(m);
 	M_ASSERTPKTHDR(m);
@@ -321,6 +343,8 @@ passin:
 	 */
 	if (m->m_flags & M_IP_NEXTHOP)
 		fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
+	else
+		fwd_tag = NULL;
 	if (odest.s_addr != dest.s_addr || fwd_tag != NULL) {
 		/*
 		 * Is it now for a local address on this host?
@@ -342,7 +366,8 @@ forwardlocal:
 			m_tag_delete(m, fwd_tag);
 			m->m_flags &= ~M_IP_NEXTHOP;
 		}
-		if (ip_findroute(&nh, dest, m) != 0)
+		if (dest.s_addr != rtdest.s_addr &&
+		    ip_findroute(&nh, dest, m) != 0)
 			return (NULL);	/* icmp unreach already sent */
 	}
 
@@ -356,12 +381,15 @@ passout:
 	bzero(&dst, sizeof(dst));
 	dst.sin_family = AF_INET;
 	dst.sin_len = sizeof(dst);
-	dst.sin_addr = nh.nh_addr;
+	if (nh->nh_flags & NHF_GATEWAY)
+		dst.sin_addr = nh->gw4_sa.sin_addr;
+	else
+		dst.sin_addr = dest;
 
 	/*
 	 * Check if packet fits MTU or if hardware will fragment for us
 	 */
-	if (ip_len <= nh.nh_mtu) {
+	if (ip_len <= nh->nh_mtu) {
 		/*
 		 * Avoid confusing lower layers.
 		 */
@@ -369,8 +397,8 @@ passout:
 		/*
 		 * Send off the packet via outgoing interface
 		 */
-		IP_PROBE(send, NULL, NULL, ip, nh.nh_ifp, ip, NULL);
-		error = (*nh.nh_ifp->if_output)(nh.nh_ifp, m,
+		IP_PROBE(send, NULL, NULL, ip, nh->nh_ifp, ip, NULL);
+		error = (*nh->nh_ifp->if_output)(nh->nh_ifp, m,
 		    (struct sockaddr *)&dst, NULL);
 	} else {
 		/*
@@ -379,15 +407,15 @@ passout:
 		if (ip_off & IP_DF) {
 			IPSTAT_INC(ips_cantfrag);
 			icmp_error(m, ICMP_UNREACH, ICMP_UNREACH_NEEDFRAG,
-				0, nh.nh_mtu);
+				0, nh->nh_mtu);
 			goto consumed;
 		} else {
 			/*
 			 * We have to fragment the packet
 			 */
 			m->m_pkthdr.csum_flags |= CSUM_IP;
-			if (ip_fragment(ip, &m, nh.nh_mtu,
-			    nh.nh_ifp->if_hwassist) != 0)
+			if (ip_fragment(ip, &m, nh->nh_mtu,
+			    nh->nh_ifp->if_hwassist) != 0)
 				goto drop;
 			KASSERT(m != NULL, ("null mbuf and no error"));
 			/*
@@ -403,10 +431,9 @@ passout:
 				m_clrprotoflags(m);
 
 				IP_PROBE(send, NULL, NULL,
-				    mtod(m, struct ip *), nh.nh_ifp,
+				    mtod(m, struct ip *), nh->nh_ifp,
 				    mtod(m, struct ip *), NULL);
-				/* XXX: we can use cached route here */
-				error = (*nh.nh_ifp->if_output)(nh.nh_ifp, m,
+				error = (*nh->nh_ifp->if_output)(nh->nh_ifp, m,
 				    (struct sockaddr *)&dst, NULL);
 				if (error)
 					break;

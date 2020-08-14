@@ -166,7 +166,7 @@ grp_id_func(char *buffer, size_t *buffer_size, va_list ap, void *cache_mdata)
 	enum nss_lookup_type lookup_type;
 
 
-	lookup_type = (enum nss_lookup_type)cache_mdata;
+	lookup_type = (enum nss_lookup_type)(uintptr_t)cache_mdata;
 	switch (lookup_type) {
 	case nss_lt_name:
 		name = va_arg(ap, char *);
@@ -220,7 +220,7 @@ grp_marshal_func(char *buffer, size_t *buffer_size, void *retval, va_list ap,
 	size_t desired_size, size, mem_size;
 	char *p, **mem;
 
-	switch ((enum nss_lookup_type)cache_mdata) {
+	switch ((enum nss_lookup_type)(uintptr_t)cache_mdata) {
 	case nss_lt_name:
 		name = va_arg(ap, char *);
 		break;
@@ -315,7 +315,7 @@ grp_unmarshal_func(char *buffer, size_t buffer_size, void *retval, va_list ap,
 	char *p;
 	char **mem;
 
-	switch ((enum nss_lookup_type)cache_mdata) {
+	switch ((enum nss_lookup_type)(uintptr_t)cache_mdata) {
 	case nss_lt_name:
 		name = va_arg(ap, char *);
 		break;
@@ -804,7 +804,7 @@ files_setgrent(void *retval, void *mdata, va_list ap)
 	rv = files_getstate(&st);
 	if (rv != 0) 
 		return (NS_UNAVAIL);
-	switch ((enum constants)mdata) {
+	switch ((enum constants)(uintptr_t)mdata) {
 	case SETGRENT:
 		stayopen = va_arg(ap, int);
 		if (st->fp != NULL)
@@ -836,11 +836,12 @@ files_group(void *retval, void *mdata, va_list ap)
 	char			*buffer;
 	size_t			 bufsize, linesize;
 	off_t			 pos;
-	int			 rv, stayopen, *errnop;
+	int			 fresh, rv, stayopen, *errnop;
 
+	fresh = 0;
 	name = NULL;
 	gid = (gid_t)-1;
-	how = (enum nss_lookup_type)mdata;
+	how = (enum nss_lookup_type)(uintptr_t)mdata;
 	switch (how) {
 	case nss_lt_name:
 		name = va_arg(ap, const char *);
@@ -860,19 +861,24 @@ files_group(void *retval, void *mdata, va_list ap)
 	*errnop = files_getstate(&st);
 	if (*errnop != 0)
 		return (NS_UNAVAIL);
-	if (st->fp == NULL &&
-	    ((st->fp = fopen(_PATH_GROUP, "re")) == NULL)) {
-		*errnop = errno;
-		return (NS_UNAVAIL);
+	if (st->fp == NULL) {
+		st->fp = fopen(_PATH_GROUP, "re");
+		if (st->fp == NULL) {
+			*errnop = errno;
+			return (NS_UNAVAIL);
+		}
+		fresh = 1;
 	}
 	if (how == nss_lt_all)
 		stayopen = 1;
 	else {
-		rewind(st->fp);
+		if (!fresh)
+			rewind(st->fp);
 		stayopen = st->stayopen;
 	}
 	rv = NS_NOTFOUND;
-	pos = ftello(st->fp);
+	if (stayopen)
+		pos = ftello(st->fp);
 	while ((line = fgetln(st->fp, &linesize)) != NULL) {
 		if (line[linesize-1] == '\n')
 			linesize--;
@@ -894,7 +900,8 @@ files_group(void *retval, void *mdata, va_list ap)
 		    &buffer[linesize + 1], bufsize - linesize - 1, errnop);
 		if (rv & NS_TERMINATE)
 			break;
-		pos = ftello(st->fp);
+		if (stayopen)
+			pos = ftello(st->fp);
 	}
 	if (st->fp != NULL && !stayopen) {
 		fclose(st->fp);
@@ -1087,7 +1094,7 @@ nis_group(void *retval, void *mdata, va_list ap)
 	
 	name = NULL;
 	gid = (gid_t)-1;
-	how = (enum nss_lookup_type)mdata;
+	how = (enum nss_lookup_type)(uintptr_t)mdata;
 	switch (how) {
 	case nss_lt_name:
 		name = va_arg(ap, const char *);
@@ -1246,7 +1253,7 @@ compat_setgrent(void *retval, void *mdata, va_list ap)
 	rv = compat_getstate(&st);
 	if (rv != 0)
 		return (NS_UNAVAIL);
-	switch ((enum constants)mdata) {
+	switch ((enum constants)(uintptr_t)mdata) {
 	case SETGRENT:
 		stayopen = va_arg(ap, int);
 		if (st->fp != NULL)
@@ -1304,7 +1311,7 @@ compat_group(void *retval, void *mdata, va_list ap)
 	void			*discard;
 	size_t			 bufsize, linesize;
 	off_t			 pos;
-	int			 rv, stayopen, *errnop;
+	int			 fresh, rv, stayopen, *errnop;
 
 #define set_lookup_type(x, y) do { 				\
 	int i;							\
@@ -1312,9 +1319,10 @@ compat_group(void *retval, void *mdata, va_list ap)
 		x[i].mdata = (void *)y;				\
 } while (0)
 
+	fresh = 0;
 	name = NULL;
 	gid = (gid_t)-1;
-	how = (enum nss_lookup_type)mdata;
+	how = (enum nss_lookup_type)(uintptr_t)mdata;
 	switch (how) {
 	case nss_lt_name:
 		name = va_arg(ap, const char *);
@@ -1334,16 +1342,20 @@ compat_group(void *retval, void *mdata, va_list ap)
 	*errnop = compat_getstate(&st);
 	if (*errnop != 0)
 		return (NS_UNAVAIL);
-	if (st->fp == NULL &&
-	    ((st->fp = fopen(_PATH_GROUP, "re")) == NULL)) {
-		*errnop = errno;
-		rv = NS_UNAVAIL;
-		goto fin;
+	if (st->fp == NULL) {
+		st->fp = fopen(_PATH_GROUP, "re");
+		if (st->fp == NULL) {
+			*errnop = errno;
+			rv = NS_UNAVAIL;
+			goto fin;
+		}
+		fresh = 1;
 	}
 	if (how == nss_lt_all)
 		stayopen = 1;
 	else {
-		rewind(st->fp);
+		if (!fresh)
+			rewind(st->fp);
 		stayopen = st->stayopen;
 	}
 docompat:
@@ -1406,7 +1418,8 @@ docompat:
 		break;
 	}
 	rv = NS_NOTFOUND;
-	pos = ftello(st->fp);
+	if (stayopen)
+		pos = ftello(st->fp);
 	while ((line = fgetln(st->fp, &linesize)) != NULL) {
 		if (line[linesize-1] == '\n')
 			linesize--;
@@ -1447,7 +1460,8 @@ docompat:
 		    &buffer[linesize + 1], bufsize - linesize - 1, errnop);
 		if (rv & NS_TERMINATE)
 			break;
-		pos = ftello(st->fp);
+		if (stayopen)
+			pos = ftello(st->fp);
 	}
 fin:
 	if (st->fp != NULL && !stayopen) {

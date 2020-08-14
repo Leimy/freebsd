@@ -94,7 +94,7 @@
 #include <machine/cpuregs.h>
 #include <machine/pcb.h>
 
-#include "assym.s"
+#include "assym.inc"
 
 	.set	noreorder		# Noreorder is default style!
 
@@ -105,44 +105,22 @@
 	.text
 
 /*
- * See if access to addr with a len type instruction causes a machine check.
- * len is length of access (1=byte, 2=short, 4=int)
+ * Copy a null terminated string from the user address space into
+ * the kernel address space.
  *
- * badaddr(addr, len)
- *	char *addr;
- *	int len;
+ *	copyinstr(fromaddr, toaddr, maxlength, &lencopied)
+ *		caddr_t fromaddr;
+ *		caddr_t toaddr;
+ *		u_int maxlength;
+ *		u_int *lencopied;
  */
-LEAF(badaddr)
-	PTR_LA	v0, baderr
+LEAF(copyinstr)
+	PTR_LA		v0, __copyinstr_err
+	blt		a0, zero, __copyinstr_err  # make sure address is in user space
 	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	bne	a1, 1, 2f
-	PTR_S	v0, U_PCB_ONFAULT(v1)
-	b	5f
-	lbu	v0, (a0)
-2:
-	bne	a1, 2, 4f
-	nop
-	b	5f
-	lhu	v0, (a0)
-4:
-	lw	v0, (a0)
-5:
-	PTR_S	zero, U_PCB_ONFAULT(v1)
-	j	ra
-	move	v0, zero		# made it w/o errors
-baderr:
-	j	ra
-	li	v0, 1			# trap sends us here
-END(badaddr)
+	PTR_L		v1, PC_CURPCB(v1)
+	PTR_S		v0, U_PCB_ONFAULT(v1)
 
-/*
- * int copystr(void *kfaddr, void *kdaddr, size_t maxlen, size_t *lencopied)
- * Copy a NIL-terminated string, at most maxlen characters long.  Return the
- * number of characters copied (including the NIL) in *lencopied.  If the
- * string is too long, return ENAMETOOLONG; else return 0.
- */
-LEAF(copystr)
 	move		t0, a2
 	beq		a2, zero, 4f
 1:
@@ -160,66 +138,15 @@ LEAF(copystr)
 	PTR_SUBU	a2, t0, a2		# if the 4th arg was non-NULL
 	PTR_S		a2, 0(a3)
 3:
-	j		ra			# v0 is 0 or ENAMETOOLONG
+
+	PTR_S		zero, U_PCB_ONFAULT(v1)
+	j		ra
 	nop
-END(copystr)
 
-
-/*
- * Copy a null terminated string from the user address space into
- * the kernel address space.
- *
- *	copyinstr(fromaddr, toaddr, maxlength, &lencopied)
- *		caddr_t fromaddr;
- *		caddr_t toaddr;
- *		u_int maxlength;
- *		u_int *lencopied;
- */
-NESTED(copyinstr, CALLFRAME_SIZ, ra)
-	PTR_SUBU	sp, sp, CALLFRAME_SIZ
-	.mask	0x80000000, (CALLFRAME_RA - CALLFRAME_SIZ)
-	PTR_LA	v0, copyerr
-	blt	a0, zero, _C_LABEL(copyerr)  # make sure address is in user space
-	REG_S	ra, CALLFRAME_RA(sp)
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	jal	_C_LABEL(copystr)
-	PTR_S	v0, U_PCB_ONFAULT(v1)
-	REG_L	ra, CALLFRAME_RA(sp)
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	PTR_S	zero, U_PCB_ONFAULT(v1)
-	j	ra
-	PTR_ADDU	sp, sp, CALLFRAME_SIZ
+__copyinstr_err:
+	j		ra
+	li		v0, EFAULT
 END(copyinstr)
-
-/*
- * Copy a null terminated string from the kernel address space into
- * the user address space.
- *
- *	copyoutstr(fromaddr, toaddr, maxlength, &lencopied)
- *		caddr_t fromaddr;
- *		caddr_t toaddr;
- *		u_int maxlength;
- *		u_int *lencopied;
- */
-NESTED(copyoutstr, CALLFRAME_SIZ, ra)
-	PTR_SUBU	sp, sp, CALLFRAME_SIZ
-	.mask	0x80000000, (CALLFRAME_RA - CALLFRAME_SIZ)
-	PTR_LA	v0, copyerr
-	blt	a1, zero, _C_LABEL(copyerr)  # make sure address is in user space
-	REG_S	ra, CALLFRAME_RA(sp)
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	jal	_C_LABEL(copystr)
-	PTR_S	v0, U_PCB_ONFAULT(v1)
-	REG_L	ra, CALLFRAME_RA(sp)
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	PTR_S	zero, U_PCB_ONFAULT(v1)
-	j	ra
-	PTR_ADDU	sp, sp, CALLFRAME_SIZ
-END(copyoutstr)
 
 /*
  * Copy specified amount of data from user space into the kernel
@@ -396,19 +323,15 @@ XLEAF(casueword)
 	GET_CPU_PCPU(v1)
 	PTR_L	v1, PC_CURPCB(v1)
 	PTR_S	v0, U_PCB_ONFAULT(v1)
-1:
+
+	li	v0, 1
 	move	t0, a3
 	ll	t1, 0(a0)
-	bne	a1, t1, 2f
+	bne	a1, t1, 1f
 	nop
 	sc	t0, 0(a0)		# store word
-	beqz	t0, 1b
-	nop
-	j	3f
-	li	v0, 0
-2:
-	li	v0, -1
-3:
+	xori	v0, t0, 1
+1:
 	PTR_S	zero, U_PCB_ONFAULT(v1)
 	jr	ra
 	sw	t1, 0(a2)		# unconditionally store old word
@@ -423,19 +346,15 @@ XLEAF(casueword)
 	GET_CPU_PCPU(v1)
 	PTR_L	v1, PC_CURPCB(v1)
 	PTR_S	v0, U_PCB_ONFAULT(v1)
-1:
+
+	li	v0, 1
 	move	t0, a3
 	lld	t1, 0(a0)
-	bne	a1, t1, 2f
+	bne	a1, t1, 1f
 	nop
 	scd	t0, 0(a0)		# store double word
-	beqz	t0, 1b
-	nop
-	j	3f
-	li	v0, 0
-2:
-	li	v0, -1
-3:
+	xori	v0, t0, 1
+1:
 	PTR_S	zero, U_PCB_ONFAULT(v1)
 	jr	ra
 	sd	t1, 0(a2)		# unconditionally store old word
@@ -475,41 +394,6 @@ LEAF(fswberr)
 	j	ra
 	li	v0, -1
 END(fswberr)
-
-/*
- * fuswintr and suswintr are just like fusword and susword except that if
- * the page is not in memory or would cause a trap, then we return an error.
- * The important thing is to prevent sleep() and switch().
- */
-LEAF(fuswintr)
-	PTR_LA	v0, fswintrberr
-	blt	a0, zero, fswintrberr	# make sure address is in user space
-	nop
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	PTR_S	v0, U_PCB_ONFAULT(v1)
-	lhu	v0, 0(a0)		# fetch short
-	j	ra
-	PTR_S	zero, U_PCB_ONFAULT(v1)
-END(fuswintr)
-
-LEAF(suswintr)
-	PTR_LA	v0, fswintrberr
-	blt	a0, zero, fswintrberr	# make sure address is in user space
-	nop
-	GET_CPU_PCPU(v1)
-	PTR_L	v1, PC_CURPCB(v1)
-	PTR_S	v0, U_PCB_ONFAULT(v1)
-	sh	a1, 0(a0)		# store short
-	PTR_S	zero, U_PCB_ONFAULT(v1)
-	j	ra
-	move	v0, zero
-END(suswintr)
-
-LEAF(fswintrberr)
-	j	ra
-	li	v0, -1
-END(fswintrberr)
 
 /*
  * memset(void *s1, int c, int len)
@@ -960,78 +844,3 @@ LEAF(longjmp)
 	jr	ra
 	li	v0, 1			# longjmp return
 END(longjmp)
-
-LEAF(mips3_ld)
-	.set push
-	.set noreorder
-	.set mips64
-#if defined(__mips_o32)
-	mfc0	t0, MIPS_COP_0_STATUS		# turn off interrupts
-	and	t1, t0, ~(MIPS_SR_INT_IE)
-	mtc0	t1, MIPS_COP_0_STATUS
-	COP0_SYNC
-	nop
-	nop
-	nop
-
-	ld	v0, 0(a0)
-#if _BYTE_ORDER == _BIG_ENDIAN
-	dsll	v1, v0, 32
-	dsra	v1, v1, 32			# low word in v1
-	dsra	v0, v0, 32			# high word in v0
-#else
-	dsra	v1, v0, 32			# high word in v1
-	dsll	v0, v0, 32
-	dsra	v0, v0, 32			# low word in v0
-#endif
-
-	mtc0	t0, MIPS_COP_0_STATUS		# restore intr status.
-	COP0_SYNC
-	nop
-#else /* !__mips_o32 */
-	ld	v0, 0(a0)
-#endif /* !__mips_o32 */
-
-	jr	ra
-	nop
-	.set pop
-END(mips3_ld)
-
-LEAF(mips3_sd)
-	.set push
-	.set mips64
-	.set noreorder
-#if defined(__mips_o32)
-	mfc0	t0, MIPS_COP_0_STATUS		# turn off interrupts
-	and	t1, t0, ~(MIPS_SR_INT_IE)
-	mtc0	t1, MIPS_COP_0_STATUS
-	COP0_SYNC
-	nop
-	nop
-	nop
-
-	# NOTE: a1 is padding!
-
-#if _BYTE_ORDER == _BIG_ENDIAN
-	dsll	a2, a2, 32			# high word in a2
-	dsll	a3, a3, 32			# low word in a3
-	dsrl	a3, a3, 32
-#else
-	dsll	a2, a2, 32			# low word in a2
-	dsrl	a2, a2, 32
-	dsll	a3, a3, 32			# high word in a3
-#endif
-	or	a1, a2, a3
-	sd	a1, 0(a0)
-
-	mtc0	t0, MIPS_COP_0_STATUS		# restore intr status.
-	COP0_SYNC
-	nop
-#else /* !__mips_o32 */
-	sd	a1, 0(a0)
-#endif /* !__mips_o32 */
-
-	jr	ra
-	nop
-	.set pop
-END(mips3_sd)

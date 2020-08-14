@@ -340,8 +340,8 @@ ti_pinmux_configure_pins(device_t dev, phandle_t cfgxref)
 
 	sc = device_get_softc(dev);
 	cfgnode = OF_node_from_xref(cfgxref);
-	ntuples = OF_getencprop_alloc(cfgnode, "pinctrl-single,pins", sizeof(*cfgtuples),
-	    (void **)&cfgtuples);
+	ntuples = OF_getencprop_alloc_multi(cfgnode, "pinctrl-single,pins",
+	    sizeof(*cfgtuples), (void **)&cfgtuples);
 
 	if (ntuples < 0)
 		return (ENOENT);
@@ -459,3 +459,5 @@ static driver_t ti_pinmux_driver = {
 static devclass_t ti_pinmux_devclass;
 
 DRIVER_MODULE(ti_pinmux, simplebus, ti_pinmux_driver, ti_pinmux_devclass, 0, 0);
+MODULE_VERSION(ti_pinmux, 1);
+MODULE_DEPEND(ti_pinmux, ti_scm, 1, 1, 1);

@@ -63,7 +63,9 @@ SYSCTL_INT(_debug, OID_AUTO, rcluster, CTLFLAG_RW, &rcluster, 0,
 #endif
 
 static MALLOC_DEFINE(M_SEGMENT, "cl_savebuf", "cluster_save buffer");
+static uma_zone_t cluster_pbuf_zone;
 
+static void cluster_init(void *);
 static struct cluster_save *cluster_collectbufs(struct vnode *vp,
 	    struct buf *last_bp, int gbflags);
 static struct buf *cluster_rbuild(struct vnode *vp, u_quad_t filesize,
@@ -83,6 +85,15 @@ static int read_min = 1;
 SYSCTL_INT(_vfs, OID_AUTO, read_min, CTLFLAG_RW, &read_min, 0,
     "Cluster read min block count");
 
+SYSINIT(cluster, SI_SUB_CPU, SI_ORDER_ANY, cluster_init, NULL);
+
+static void
+cluster_init(void *dummy)
+{
+
+	cluster_pbuf_zone = pbuf_zsecond_create("clpbuf", nswbuf / 2);
+}
+
 /*
  * Read data to a buf, including read-ahead if we find this to be beneficial.
  * cluster_read replaces bread.
@@ -94,12 +105,14 @@ cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
 {
 	struct buf *bp, *rbp, *reqbp;
 	struct bufobj *bo;
+	struct thread *td;
 	daddr_t blkno, origblkno;
 	int maxra, racluster;
 	int error, ncontig;
 	int i;
 
 	error = 0;
+	td = curthread;
 	bo = &vp->v_bufobj;
 	if (!unmapped_buf_allowed)
 		gbflags &= ~GB_UNMAPPED;
@@ -118,10 +131,14 @@ cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
 	/*
 	 * get the requested block
 	 */
-	*bpp = reqbp = bp = getblk(vp, lblkno, size, 0, 0, gbflags);
-	if (bp == NULL)
-		return (EBUSY);
+	error = getblkx(vp, lblkno, lblkno, size, 0, 0, gbflags, &bp);
+	if (error != 0) {
+		*bpp = NULL;
+		return (error);
+	}
+	gbflags &= ~GB_NOSPARSE;
 	origblkno = lblkno;
+	*bpp = reqbp = bp;
 
 	/*
 	 * if it is in the cache, then check to see if the reads have been
@@ -156,7 +173,7 @@ cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
 					LK_EXCLUSIVE | LK_NOWAIT, NULL))) {
 					rbp->b_flags |= B_RAM;
 					BUF_UNLOCK(rbp);
-				}			
+				}
 			}
 			BO_RUNLOCK(bo);
 			if (i >= maxra) {
@@ -243,12 +260,12 @@ cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
 		bstrategy(bp);
 #ifdef RACCT
 		if (racct_enable) {
-			PROC_LOCK(curproc);
-			racct_add_buf(curproc, bp, 0);
-			PROC_UNLOCK(curproc);
+			PROC_LOCK(td->td_proc);
+			racct_add_buf(td->td_proc, bp, 0);
+			PROC_UNLOCK(td->td_proc);
 		}
 #endif /* RACCT */
-		curthread->td_ru.ru_inblock++;
+		td->td_ru.ru_inblock++;
 	}
 
 	/*
@@ -303,12 +320,12 @@ cluster_read(struct vnode *vp, u_quad_t filesize, daddr_t lblkno, long size,
 		bstrategy(rbp);
 #ifdef RACCT
 		if (racct_enable) {
-			PROC_LOCK(curproc);
-			racct_add_buf(curproc, rbp, 0);
-			PROC_UNLOCK(curproc);
+			PROC_LOCK(td->td_proc);
+			racct_add_buf(td->td_proc, rbp, 0);
+			PROC_UNLOCK(td->td_proc);
 		}
 #endif /* RACCT */
-		curthread->td_ru.ru_inblock++;
+		td->td_ru.ru_inblock++;
 	}
 
 	if (reqbp) {
@@ -366,7 +383,7 @@ cluster_rbuild(struct vnode *vp, u_quad_t filesize, daddr_t lbn,
 		((tbp->b_flags & B_VMIO) == 0) || (run <= 1) )
 		return tbp;
 
-	bp = trypbuf(&cluster_pbuf_freecnt);
+	bp = uma_zalloc(cluster_pbuf_zone, M_NOWAIT);
 	if (bp == NULL)
 		return tbp;
 
@@ -400,13 +417,9 @@ cluster_rbuild(struct vnode *vp, u_quad_t filesize, daddr_t lbn,
 	inc = btodb(size);
 	for (bn = blkno, i = 0; i < run; ++i, bn += inc) {
 		if (i == 0) {
-			VM_OBJECT_WLOCK(tbp->b_bufobj->bo_object);
-			vfs_drain_busy_pages(tbp);
 			vm_object_pip_add(tbp->b_bufobj->bo_object,
 			    tbp->b_npages);
-			for (k = 0; k < tbp->b_npages; k++)
-				vm_page_sbusy(tbp->b_pages[k]);
-			VM_OBJECT_WUNLOCK(tbp->b_bufobj->bo_object);
+			vfs_busy_pages_acquire(tbp);
 		} else {
 			if ((bp->b_npages * PAGE_SIZE) +
 			    round_page(size) > vp->v_mount->mnt_iosize_max) {
@@ -443,33 +456,31 @@ cluster_rbuild(struct vnode *vp, u_quad_t filesize, daddr_t lbn,
 			 */
 			off = tbp->b_offset;
 			tsize = size;
-			VM_OBJECT_WLOCK(tbp->b_bufobj->bo_object);
 			for (j = 0; tsize > 0; j++) {
 				toff = off & PAGE_MASK;
 				tinc = tsize;
 				if (toff + tinc > PAGE_SIZE)
 					tinc = PAGE_SIZE - toff;
-				VM_OBJECT_ASSERT_WLOCKED(tbp->b_pages[j]->object);
+				if (vm_page_trysbusy(tbp->b_pages[j]) == 0)
+					break;
 				if ((tbp->b_pages[j]->valid &
-				    vm_page_bits(toff, tinc)) != 0)
+				    vm_page_bits(toff, tinc)) != 0) {
+					vm_page_sunbusy(tbp->b_pages[j]);
 					break;
-				if (vm_page_xbusied(tbp->b_pages[j]))
-					break;
+				}
 				vm_object_pip_add(tbp->b_bufobj->bo_object, 1);
-				vm_page_sbusy(tbp->b_pages[j]);
 				off += tinc;
 				tsize -= tinc;
 			}
 			if (tsize > 0) {
 clean_sbusy:
-				vm_object_pip_add(tbp->b_bufobj->bo_object, -j);
+				vm_object_pip_wakeupn(tbp->b_bufobj->bo_object,
+				    j);
 				for (k = 0; k < j; k++)
 					vm_page_sunbusy(tbp->b_pages[k]);
-				VM_OBJECT_WUNLOCK(tbp->b_bufobj->bo_object);
 				bqrelse(tbp);
 				break;
 			}
-			VM_OBJECT_WUNLOCK(tbp->b_bufobj->bo_object);
 
 			/*
 			 * Set a read-ahead mark as appropriate
@@ -489,7 +500,6 @@ clean_sbusy:
 			if (tbp->b_blkno == tbp->b_lblkno) {
 				tbp->b_blkno = bn;
 			} else if (tbp->b_blkno != bn) {
-				VM_OBJECT_WLOCK(tbp->b_bufobj->bo_object);
 				goto clean_sbusy;
 			}
 		}
@@ -500,19 +510,19 @@ clean_sbusy:
 		BUF_KERNPROC(tbp);
 		TAILQ_INSERT_TAIL(&bp->b_cluster.cluster_head,
 			tbp, b_cluster.cluster_entry);
-		VM_OBJECT_WLOCK(tbp->b_bufobj->bo_object);
 		for (j = 0; j < tbp->b_npages; j += 1) {
 			vm_page_t m;
+
 			m = tbp->b_pages[j];
 			if ((bp->b_npages == 0) ||
 			    (bp->b_pages[bp->b_npages-1] != m)) {
 				bp->b_pages[bp->b_npages] = m;
 				bp->b_npages++;
 			}
-			if (m->valid == VM_PAGE_BITS_ALL)
+			if (vm_page_all_valid(m))
 				tbp->b_pages[j] = bogus_page;
 		}
-		VM_OBJECT_WUNLOCK(tbp->b_bufobj->bo_object);
+
 		/*
 		 * Don't inherit tbp->b_bufsize as it may be larger due to
 		 * a non-page-aligned size.  Instead just aggregate using
@@ -530,13 +540,10 @@ clean_sbusy:
 	 * Fully valid pages in the cluster are already good and do not need
 	 * to be re-read from disk.  Replace the page with bogus_page
 	 */
-	VM_OBJECT_WLOCK(bp->b_bufobj->bo_object);
 	for (j = 0; j < bp->b_npages; j++) {
-		VM_OBJECT_ASSERT_WLOCKED(bp->b_pages[j]->object);
-		if (bp->b_pages[j]->valid == VM_PAGE_BITS_ALL)
+		if (vm_page_all_valid(bp->b_pages[j]))
 			bp->b_pages[j] = bogus_page;
 	}
-	VM_OBJECT_WUNLOCK(bp->b_bufobj->bo_object);
 	if (bp->b_bufsize > bp->b_kvasize)
 		panic("cluster_rbuild: b_bufsize(%ld) > b_kvasize(%d)\n",
 		    bp->b_bufsize, bp->b_kvasize);
@@ -555,8 +562,7 @@ clean_sbusy:
  * that we will need to shift around.
  */
 static void
-cluster_callback(bp)
-	struct buf *bp;
+cluster_callback(struct buf *bp)
 {
 	struct buf *nbp, *tbp;
 	int error = 0;
@@ -598,7 +604,7 @@ cluster_callback(bp)
 		bufdone(tbp);
 	}
 	pbrelvp(bp);
-	relpbuf(bp, &cluster_pbuf_freecnt);
+	uma_zfree(cluster_pbuf_zone, bp);
 }
 
 /*
@@ -701,6 +707,14 @@ cluster_write(struct vnode *vp, struct buf *bp, u_quad_t filesize, int seqcount,
 				struct cluster_save *buflist;
 
 				buflist = cluster_collectbufs(vp, bp, gbflags);
+				if (buflist == NULL) {
+					/*
+					 * Cluster build failed so just write
+					 * it now.
+					 */
+					bawrite(bp);
+					return;
+				}
 				endbp = &buflist->bs_children
 				    [buflist->bs_nchildren - 1];
 				if (VOP_REALLOCBLKS(vp, buflist)) {
@@ -788,7 +802,6 @@ cluster_write(struct vnode *vp, struct buf *bp, u_quad_t filesize, int seqcount,
 	vp->v_lasta = bp->b_blkno;
 }
 
-
 /*
  * This is an awful lot like cluster_rbuild...wish they could be combined.
  * The last lbn argument is the current block on which I/O is being
@@ -851,9 +864,7 @@ cluster_wbuild(struct vnode *vp, long size, daddr_t start_lbn, int len,
 		  (tbp->b_bcount != tbp->b_bufsize) ||
 		  (tbp->b_bcount != size) ||
 		  (len == 1) ||
-		  ((bp = (vp->v_vflag & VV_MD) != 0 ?
-		  trypbuf(&cluster_pbuf_freecnt) :
-		  getpbuf(&cluster_pbuf_freecnt)) == NULL)) {
+		  ((bp = uma_zalloc(cluster_pbuf_zone, M_NOWAIT)) == NULL)) {
 			totalwritten += tbp->b_bufsize;
 			bawrite(tbp);
 			++start_lbn;
@@ -965,31 +976,30 @@ cluster_wbuild(struct vnode *vp, long size, daddr_t start_lbn, int len,
 			if (tbp->b_flags & B_VMIO) {
 				vm_page_t m;
 
-				VM_OBJECT_WLOCK(tbp->b_bufobj->bo_object);
 				if (i == 0) {
-					vfs_drain_busy_pages(tbp);
+					vfs_busy_pages_acquire(tbp);
 				} else { /* if not first buffer */
 					for (j = 0; j < tbp->b_npages; j += 1) {
 						m = tbp->b_pages[j];
-						if (vm_page_xbusied(m)) {
-							VM_OBJECT_WUNLOCK(
-							    tbp->b_object);
+						if (vm_page_trysbusy(m) == 0) {
+							for (j--; j >= 0; j--)
+								vm_page_sunbusy(
+								    tbp->b_pages[j]);
 							bqrelse(tbp);
 							goto finishcluster;
 						}
 					}
 				}
+				vm_object_pip_add(tbp->b_bufobj->bo_object,
+				    tbp->b_npages);
 				for (j = 0; j < tbp->b_npages; j += 1) {
 					m = tbp->b_pages[j];
-					vm_page_sbusy(m);
-					vm_object_pip_add(m->object, 1);
 					if ((bp->b_npages == 0) ||
 					  (bp->b_pages[bp->b_npages - 1] != m)) {
 						bp->b_pages[bp->b_npages] = m;
 						bp->b_npages++;
 					}
 				}
-				VM_OBJECT_WUNLOCK(tbp->b_bufobj->bo_object);
 			}
 			bp->b_bcount += size;
 			bp->b_bufsize += size;
@@ -1040,7 +1050,7 @@ cluster_collectbufs(struct vnode *vp, struct buf *last_bp, int gbflags)
 	struct cluster_save *buflist;
 	struct buf *bp;
 	daddr_t lbn;
-	int i, len;
+	int i, j, len, error;
 
 	len = vp->v_lastw - vp->v_cstart + 1;
 	buflist = malloc(sizeof(struct buf *) * (len + 1) + sizeof(*buflist),
@@ -1048,8 +1058,18 @@ cluster_collectbufs(struct vnode *vp, struct buf *last_bp, int gbflags)
 	buflist->bs_nchildren = 0;
 	buflist->bs_children = (struct buf **) (buflist + 1);
 	for (lbn = vp->v_cstart, i = 0; i < len; lbn++, i++) {
-		(void)bread_gb(vp, lbn, last_bp->b_bcount, NOCRED,
+		error = bread_gb(vp, lbn, last_bp->b_bcount, NOCRED,
 		    gbflags, &bp);
+		if (error != 0) {
+			/*
+			 * If read fails, release collected buffers
+			 * and return failure.
+			 */
+			for (j = 0; j < i; j++)
+				brelse(buflist->bs_children[j]);
+			free(buflist, M_SEGMENT);
+			return (NULL);
+		}
 		buflist->bs_children[i] = bp;
 		if (bp->b_blkno == bp->b_lblkno)
 			VOP_BMAP(vp, bp->b_lblkno, NULL, &bp->b_blkno,

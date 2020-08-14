@@ -24,8 +24,6 @@ include 	"../altera/socfpga/std.socfpga"
 
 makeoptions	MODULES_OVERRIDE=""
 
-makeoptions	WERROR="-Werror"
-
 options 	SCHED_ULE		# ULE scheduler
 options 	PLATFORM		# Platform based SoC
 options 	SMP			# Enable multiple cores
@@ -42,10 +40,13 @@ options 	SOC_ALTERA_CYCLONE5
 
 # Interrupt controller
 device		gic
-options 	INTRNG
 
 # ARM MPCore timer
 device		mpcore_timer
+
+# DMA support
+device		xdma
+device		pl330
 
 # MMC/SD/SDIO Card slot support
 device		mmc			# mmc/sd bus
@@ -55,7 +56,6 @@ device		dwmmc
 # Pseudo devices
 
 device		loop
-device		random
 device		pty
 device		md
 device		gpio
@@ -80,6 +80,8 @@ device		iicbus
 
 # SPI
 device		spibus
+device		cqspi
+device		n25q
 
 # Ethernet
 device		ether

@@ -168,7 +168,45 @@ static vm_offset_t	of_bounce_phys;
 static caddr_t		of_bounce_virt;
 static off_t		of_bounce_offset;
 static size_t		of_bounce_size;
+
+/*
+ * To be able to use OFW console on PPC, that requires real mode OFW,
+ * the mutex that guards the mapping/unmapping of virtual to physical
+ * buffers (of_real_mtx) must be of SPIN type. This is needed because
+ * kernel console first locks a SPIN mutex before calling OFW real.
+ * By default, of_real_mtx is a sleepable mutex. To make it of SPIN
+ * type, use the following tunnable:
+ * machdep.ofw.mtx_spin=1
+ *
+ * Besides that, a few more tunables are needed to select and use the
+ * OFW console with real mode OFW.
+ *
+ * In order to disable the use of OFW FrameBuffer and fallback to the
+ * OFW console, use:
+ * hw.ofwfb.disable=1
+ *
+ * To disable the use of FDT (that doesn't support OFW read/write methods)
+ * and use real OFW instead, unset the following loader variable:
+ * unset usefdt
+ *
+ * OFW is put in quiesce state in early kernel boot, which usually disables
+ * OFW read/write capabilities (in QEMU write continue to work, but
+ * read doesn't). To avoid OFW quiesce, use:
+ * debug.quiesce_ofw=0
+ *
+ * Note that disabling OFW quiesce can cause conflicts between kernel and
+ * OFW trying to control the same hardware. Thus, it must be used with care.
+ * Some conflicts can be avoided by disabling kernel drivers with hints.
+ * For instance, to disable a xhci controller and an USB keyboard connected
+ * to it, that may be already being used for input by OFW, use:
+ * hint.xhci.0.disabled=1
+ */
+
 static struct mtx	of_bounce_mtx;
+static struct mtx	of_spin_mtx;
+static struct mtx	*of_real_mtx;
+static void		(*of_mtx_lock)(void);
+static void		(*of_mtx_unlock)(void);
 
 extern int		ofw_real_mode;
 
@@ -182,21 +220,47 @@ SYSINIT(ofw_real_bounce_alloc, SI_SUB_KMEM, SI_ORDER_ANY,
     ofw_real_bounce_alloc, NULL);
 
 static void
+ofw_real_mtx_lock_spin(void)
+{
+	mtx_lock_spin(of_real_mtx);
+}
+
+static void
+ofw_real_mtx_lock(void)
+{
+	mtx_lock(of_real_mtx);
+}
+
+static void
+ofw_real_mtx_unlock_spin(void)
+{
+	mtx_unlock_spin(of_real_mtx);
+}
+
+static void
+ofw_real_mtx_unlock(void)
+{
+	mtx_unlock(of_real_mtx);
+}
+
+static void
 ofw_real_start(void)
 {
-	mtx_lock(&of_bounce_mtx);
+	(*of_mtx_lock)();
 	of_bounce_offset = 0;
 }
-	
+
 static void
 ofw_real_stop(void)
 {
-	mtx_unlock(&of_bounce_mtx);
+	(*of_mtx_unlock)();
 }
 
 static void
 ofw_real_bounce_alloc(void *junk)
 {
+	caddr_t temp;
+
 	/*
 	 * Check that ofw_real is actually in use before allocating wads 
 	 * of memory. Do this by checking if our mutex has been set up.
@@ -208,12 +272,15 @@ ofw_real_bounce_alloc(void *junk)
 	 * Allocate a page of contiguous, wired physical memory that can
 	 * fit into a 32-bit address space and accessed from real mode.
 	 */
+	temp = contigmalloc(4 * PAGE_SIZE, M_OFWREAL, 0, 0,
+	    ulmin(platform_real_maxaddr(), BUS_SPACE_MAXADDR_32BIT), PAGE_SIZE,
+	    4 * PAGE_SIZE);
+	if (temp == NULL)
+		panic("%s: Not able to allocated contiguous memory\n", __func__);
 
 	mtx_lock(&of_bounce_mtx);
 
-	of_bounce_virt = contigmalloc(4 * PAGE_SIZE, M_OFWREAL, 0, 0,
-	    ulmin(platform_real_maxaddr(), BUS_SPACE_MAXADDR_32BIT), PAGE_SIZE,
-	    4 * PAGE_SIZE);
+	of_bounce_virt = temp;
 
 	of_bounce_phys = vtophys(of_bounce_virt);
 	of_bounce_size = 4 * PAGE_SIZE;
@@ -223,7 +290,7 @@ ofw_real_bounce_alloc(void *junk)
 	 * we have a 32-bit virtual address to give OF.
 	 */
 
-	if (!ofw_real_mode && (!hw_direct_map || DMAP_BASE_ADDRESS != 0)) 
+	if (!ofw_real_mode && (!hw_direct_map || DMAP_BASE_ADDRESS != 0))
 		pmap_kenter(of_bounce_phys, of_bounce_phys);
 
 	mtx_unlock(&of_bounce_mtx);
@@ -235,7 +302,7 @@ ofw_real_map(const void *buf, size_t len)
 	static char emergency_buffer[255];
 	cell_t phys;
 
-	mtx_assert(&of_bounce_mtx, MA_OWNED);
+	mtx_assert(of_real_mtx, MA_OWNED);
 
 	if (of_bounce_virt == NULL) {
 		/*
@@ -285,7 +352,7 @@ ofw_real_map(const void *buf, size_t len)
 static void
 ofw_real_unmap(cell_t physaddr, void *buf, size_t len)
 {
-	mtx_assert(&of_bounce_mtx, MA_OWNED);
+	mtx_assert(of_real_mtx, MA_OWNED);
 
 	if (of_bounce_virt == NULL)
 		return;
@@ -301,9 +368,24 @@ ofw_real_unmap(cell_t physaddr, void *buf, size_t len)
 static int
 ofw_real_init(ofw_t ofw, void *openfirm)
 {
-	openfirmware = (int (*)(void *))openfirm;
+	int mtx_spin;
 
+	openfirmware = (int (*)(void *))openfirm;
 	mtx_init(&of_bounce_mtx, "OF Bounce Page", NULL, MTX_DEF);
+
+	mtx_spin = 0;
+	TUNABLE_INT_FETCH("machdep.ofw.mtx_spin", &mtx_spin);
+	if (mtx_spin) {
+		mtx_init(&of_spin_mtx, "OF Real", NULL, MTX_SPIN);
+		of_real_mtx = &of_spin_mtx;
+		of_mtx_lock = ofw_real_mtx_lock_spin;
+		of_mtx_unlock = ofw_real_mtx_unlock_spin;
+	} else {
+		of_real_mtx = &of_bounce_mtx;
+		of_mtx_lock = ofw_real_mtx_lock;
+		of_mtx_unlock = ofw_real_mtx_unlock;
+	}
+
 	of_bounce_virt = NULL;
 	return (0);
 }

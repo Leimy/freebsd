@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2015 Ruslan Bukin <br@bsdpad.com>
+ * Copyright (c) 2015-2018 Ruslan Bukin <br@bsdpad.com>
  * All rights reserved.
  *
  * Portions of this software were developed by SRI International and the
@@ -59,8 +59,16 @@
 	.set alias,sym
 
 #define	SET_FAULT_HANDLER(handler, tmp)					\
-	ld	tmp, PC_CURTHREAD(gp);					\
+	ld	tmp, PC_CURTHREAD(tp);					\
 	ld	tmp, TD_PCB(tmp);		/* Load the pcb */	\
 	sd	handler, PCB_ONFAULT(tmp)	/* Set the handler */
+
+#define	ENTER_USER_ACCESS(tmp)						\
+	li	tmp, SSTATUS_SUM;					\
+	csrs	sstatus, tmp
+
+#define	EXIT_USER_ACCESS(tmp)						\
+	li	tmp, SSTATUS_SUM;					\
+	csrc	sstatus, tmp
 
 #endif /* _MACHINE_ASM_H_ */

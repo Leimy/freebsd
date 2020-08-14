@@ -94,6 +94,8 @@ static char	*map;
 static char	lnkbuf[MAXPATHLEN + 1];
 static int	pathlen;
 
+struct context	curfile;	/* describes next file available on the tape */
+union u_spcl	u_spcl;		/* mapping of variables in a control block */
 int		Bcvt;		/* Swap Bytes */
 int		oldinofmt;	/* FreeBSD 1 inode format needs cvt */
 
@@ -1314,8 +1316,8 @@ gethead(struct s_spcl *buf)
 			return (FAIL);
 		}
 		if (swabl(buf->c_magic) != FS_UFS2_MAGIC &&
-		    buf->c_magic != NFS_MAGIC) {
-			if (buf->c_magic == OFS_MAGIC) {
+		    swabl(buf->c_magic) != NFS_MAGIC) {
+			if (swabl(buf->c_magic) == OFS_MAGIC) {
 				fprintf(stderr,
 				  "Format of dump tape is too old. Must use\n");
 				fprintf(stderr,

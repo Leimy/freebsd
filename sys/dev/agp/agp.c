@@ -154,9 +154,9 @@ agp_alloc_gatt(device_t dev)
 		return 0;
 
 	gatt->ag_entries = entries;
-	gatt->ag_virtual = (void *)kmem_alloc_contig(kernel_arena,
-	    entries * sizeof(u_int32_t), M_NOWAIT | M_ZERO, 0, ~0, PAGE_SIZE,
-	    0, VM_MEMATTR_WRITE_COMBINING);
+	gatt->ag_virtual = (void *)kmem_alloc_contig(entries *
+	    sizeof(u_int32_t), M_NOWAIT | M_ZERO, 0, ~0, PAGE_SIZE, 0,
+	    VM_MEMATTR_WRITE_COMBINING);
 	if (!gatt->ag_virtual) {
 		if (bootverbose)
 			device_printf(dev, "contiguous allocation failed\n");
@@ -171,8 +171,8 @@ agp_alloc_gatt(device_t dev)
 void
 agp_free_gatt(struct agp_gatt *gatt)
 {
-	kmem_free(kernel_arena, (vm_offset_t)gatt->ag_virtual,
-	    gatt->ag_entries * sizeof(u_int32_t));
+	kmem_free((vm_offset_t)gatt->ag_virtual, gatt->ag_entries *
+	    sizeof(u_int32_t));
 	free(gatt, M_AGP);
 }
 
@@ -616,9 +616,7 @@ bad:
 		m = vm_page_lookup(mem->am_obj, OFF_TO_IDX(k));
 		if (k >= i)
 			vm_page_xunbusy(m);
-		vm_page_lock(m);
 		vm_page_unwire(m, PQ_INACTIVE);
-		vm_page_unlock(m);
 	}
 	VM_OBJECT_WUNLOCK(mem->am_obj);
 
@@ -653,9 +651,7 @@ agp_generic_unbind_memory(device_t dev, struct agp_memory *mem)
 	VM_OBJECT_WLOCK(mem->am_obj);
 	for (i = 0; i < mem->am_size; i += PAGE_SIZE) {
 		m = vm_page_lookup(mem->am_obj, atop(i));
-		vm_page_lock(m);
 		vm_page_unwire(m, PQ_INACTIVE);
-		vm_page_unlock(m);
 	}
 	VM_OBJECT_WUNLOCK(mem->am_obj);
 
@@ -1003,7 +999,7 @@ agp_bind_pages(device_t dev, vm_page_t *pages, vm_size_t size,
 	mtx_lock(&sc->as_lock);
 	for (i = 0; i < size; i += PAGE_SIZE) {
 		m = pages[OFF_TO_IDX(i)];
-		KASSERT(m->wire_count > 0,
+		KASSERT(vm_page_wired(m),
 		    ("agp_bind_pages: page %p hasn't been wired", m));
 
 		/*

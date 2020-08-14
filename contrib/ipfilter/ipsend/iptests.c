@@ -21,7 +21,6 @@ static const char rcsid[] = "@(#)$Id$";
 typedef	int	boolean_t;
 #endif
 #include <sys/time.h>
-#if !defined(__osf__)
 # ifdef __NetBSD__
 #  include <machine/lock.h>
 #  include <machine/mutex.h>
@@ -37,19 +36,13 @@ typedef	int	boolean_t;
 # endif
 # undef  _KERNEL
 # undef  KERNEL
-#endif
-#if !defined(solaris) && !defined(linux) && !defined(__sgi)
+#if !defined(solaris)
 # include <nlist.h>
 # include <sys/user.h>
 # include <sys/proc.h>
 #endif
-#if !defined(ultrix) && !defined(hpux) && !defined(linux) && \
-    !defined(__sgi) && !defined(__osf__) && !defined(_AIX51)
 # include <kvm.h>
-#endif
-#ifndef	ultrix
 # include <sys/socket.h>
-#endif
 #if defined(solaris)
 # include <sys/stream.h>
 #else
@@ -59,55 +52,35 @@ typedef	int	boolean_t;
 #include <sys/systm.h>
 #include <sys/session.h>
 #endif
-#if BSD >= 199103
 # include <sys/sysctl.h>
 # include <sys/filedesc.h>
 # include <paths.h>
-#endif
 #include <netinet/in_systm.h>
 #include <sys/socket.h>
-#ifdef __hpux
-# define _NET_ROUTE_INCLUDED
-#endif
 #include <net/if.h>
-#if defined(linux) && (LINUX >= 0200)
-# include <asm/atomic.h>
-#endif
-#if !defined(linux)
 # if defined(__FreeBSD__)
 #  include "radix_ipf.h"
 # endif
 # if !defined(solaris)
 #  include <net/route.h>
 # endif
-#else
-# define __KERNEL__	/* because there's a macro not wrapped by this */
-# include <net/route.h>	/* in this file :-/ */
-#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/ip.h>
-#if defined(__SVR4) || defined(__svr4__) || defined(__sgi)
+#if defined(__SVR4) || defined(__svr4__)
 # include <sys/sysmacros.h>
 #endif
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef __hpux
-# undef _NET_ROUTE_INCLUDED
-#endif
-#if !defined(linux)
 # include <netinet/ip_var.h>
-# if !defined(__hpux) && !defined(solaris)
+# if !defined(solaris)
 #  include <netinet/in_pcb.h>
 # endif
-#endif
 #include "ipsend.h"
-#if !defined(linux) && !defined(__hpux)
 # include <netinet/tcp_timer.h>
 # include <netinet/tcp_var.h>
-#endif
 #if defined(__NetBSD_Version__) && (__NetBSD_Version__ >= 106000000)
 # define USE_NANOSLEEP
 #endif
@@ -951,9 +924,7 @@ void	ip_test5(dev, mtu, ip, gwip, ptest)
 	int	nfd, i;
 
 	t = (tcphdr_t *)((char *)ip + (IP_HL(ip) << 2));
-#if !defined(linux) && !defined(__osf__)
 	t->th_x2 = 0;
-#endif
 	TCP_OFF_A(t, 0);
 	t->th_sport = htons(1);
 	t->th_dport = htons(1);

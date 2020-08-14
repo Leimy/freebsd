@@ -105,6 +105,14 @@ struct	nfsmount {
 /* Private flags. */
 #define	NFSMNTP_FORCEDISM	0x00000001
 #define	NFSMNTP_CANCELRPCS	0x00000002
+#define	NFSMNTP_IOADVISETHRUMDS	0x00000004
+#define	NFSMNTP_NOCOPY		0x00000008
+#define	NFSMNTP_NOCONSECUTIVE	0x00000010
+#define	NFSMNTP_SEEK		0x00000020
+#define	NFSMNTP_SEEKTESTED	0x00000040
+#define	NFSMNTP_NOXATTR		0x00000080
+#define	NFSMNTP_NOADVISE	0x00000100
+#define	NFSMNTP_NOALLOCATE	0x00000200
 
 #define	NFSMNT_DIRPATH(m)	(&((m)->nm_name[(m)->nm_krbnamelen + 1]))
 #define	NFSMNT_SRVKRBNAME(m)						\
@@ -115,25 +123,6 @@ struct	nfsmount {
  * Convert mount ptr to nfsmount ptr.
  */
 #define	VFSTONFS(mp)	((struct nfsmount *)((mp)->mnt_data))
-
-/*
- * Get a pointer to the MDS session, which is always the first element
- * in the list.
- * This macro can only be safely used when the NFSLOCKMNT() lock is held.
- * The inline function can be used when the lock isn't held.
- */
-#define	NFSMNT_MDSSESSION(m)	(&(TAILQ_FIRST(&((m)->nm_sess))->nfsclds_sess))
-
-static __inline struct nfsclsession *
-nfsmnt_mdssession(struct nfsmount *nmp)
-{
-	struct nfsclsession *tsep;
-
-	mtx_lock(&nmp->nm_mtx);
-	tsep = NFSMNT_MDSSESSION(nmp);
-	mtx_unlock(&nmp->nm_mtx);
-	return (tsep);
-}
 
 #ifndef NFS_DEFAULT_NAMETIMEO
 #define NFS_DEFAULT_NAMETIMEO		60

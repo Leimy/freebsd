@@ -128,7 +128,7 @@ mlx5_fwp_alloc(struct mlx5_core_dev *dev, gfp_t flags, unsigned num)
 
 		/* load memory into DMA */
 		MLX5_DMA_LOCK(dev);
-		err = bus_dmamap_load(
+		(void) bus_dmamap_load(
 		    dev->cmd.dma_tag, fwp[x].dma_map, fwp[x].virt_addr,
 		    MLX5_ADAPTER_PAGE_SIZE, &mlx5_fwp_load_mem_cb,
 		    fwp + x, BUS_DMA_WAITOK | BUS_DMA_COHERENT);
@@ -153,6 +153,7 @@ failure:
 		bus_dmamem_free(dev->cmd.dma_tag, fwp[x].virt_addr, fwp[x].dma_map);
 	}
 	sx_xunlock(&dev->cmd.dma_sx);
+	kfree(fwp);
 	return (NULL);
 }
 
@@ -380,6 +381,37 @@ out_free:
 	return err;
 }
 
+static int reclaim_pages_cmd(struct mlx5_core_dev *dev,
+			     u32 *in, int in_size, u32 *out, int out_size)
+{
+	struct mlx5_fw_page *fwp;
+	struct rb_node *p;
+	u32 func_id;
+	u32 npages;
+	u32 i = 0;
+
+	if (dev->state != MLX5_DEVICE_STATE_INTERNAL_ERROR)
+		return mlx5_cmd_exec(dev, in, in_size, out, out_size);
+
+	/* No hard feelings, we want our pages back! */
+	npages = MLX5_GET(manage_pages_in, in, input_num_entries);
+	func_id = MLX5_GET(manage_pages_in, in, function_id);
+
+	p = rb_first(&dev->priv.page_root);
+	while (p && i < npages) {
+		fwp = rb_entry(p, struct mlx5_fw_page, rb_node);
+		p = rb_next(p);
+		if (fwp->func_id != func_id)
+			continue;
+
+		MLX5_ARRAY_SET64(manage_pages_out, out, pas, i, fwp->dma_addr);
+		i++;
+	}
+
+	MLX5_SET(manage_pages_out, out, output_num_entries, i);
+	return 0;
+}
+
 static int reclaim_pages(struct mlx5_core_dev *dev, u32 func_id, int npages,
 			 int *nclaimed)
 {
@@ -404,7 +436,7 @@ static int reclaim_pages(struct mlx5_core_dev *dev, u32 func_id, int npages,
 	MLX5_SET(manage_pages_in, in, input_num_entries, npages);
 
 	mlx5_core_dbg(dev, "npages %d, outlen %d\n", npages, outlen);
-	err = mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
+	err = reclaim_pages_cmd(dev, in, sizeof(in), out, outlen);
 	if (err) {
 		mlx5_core_err(dev, "failed reclaiming pages\n");
 		goto out_free;
@@ -531,19 +563,13 @@ int mlx5_reclaim_startup_pages(struct mlx5_core_dev *dev)
 		p = rb_first(&dev->priv.page_root);
 		if (p) {
 			fwp = rb_entry(p, struct mlx5_fw_page, rb_node);
-			if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
-				--dev->priv.fw_pages;
-				free_4k(dev, fwp->dma_addr);
-				nclaimed = 1;
-			} else {
-				err = reclaim_pages(dev, fwp->func_id,
-						    optimal_reclaimed_pages(),
-						    &nclaimed);
-				if (err) {
-					mlx5_core_warn(dev, "failed reclaiming pages (%d)\n",
-						       err);
-					return err;
-				}
+			err = reclaim_pages(dev, fwp->func_id,
+					    optimal_reclaimed_pages(),
+					    &nclaimed);
+			if (err) {
+				mlx5_core_warn(dev, "failed reclaiming pages (%d)\n",
+					       err);
+				return err;
 			}
 
 			if (nclaimed)

@@ -32,10 +32,11 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <sys/sysctl.h>
-#include <sys/file.h>
+#include <sys/jail.h>
 #include <sys/user.h>
 
 #include <sys/un.h>
@@ -57,6 +58,7 @@ __FBSDID("$FreeBSD$");
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <jail.h>
 #include <netdb.h>
 #include <pwd.h>
 #include <stdarg.h>
@@ -107,8 +109,8 @@ struct addr {
 };
 
 struct sock {
-	void *socket;
-	void *pcb;
+	kvaddr_t socket;
+	kvaddr_t pcb;
 	int shown;
 	int vflag;
 	int family;
@@ -788,8 +790,8 @@ gather_unix(int proto)
 			warnx("struct xunpcb size mismatch");
 			goto out;
 		}
-		if ((xup->unp_conn == NULL && !opt_l) ||
-		    (xup->unp_conn != NULL && !opt_c))
+		if ((xup->unp_conn == 0 && !opt_l) ||
+		    (xup->unp_conn != 0 && !opt_c))
 			continue;
 		if ((sock = calloc(1, sizeof(*sock))) == NULL)
 			err(1, "malloc()");
@@ -805,8 +807,8 @@ gather_unix(int proto)
 		if (xup->xu_addr.sun_family == AF_UNIX)
 			laddr->address =
 			    *(struct sockaddr_storage *)(void *)&xup->xu_addr;
-		else if (xup->unp_conn != NULL)
-			*(void **)&(faddr->address) = xup->unp_conn;
+		else if (xup->unp_conn != 0)
+			*(kvaddr_t*)&(faddr->address) = xup->unp_conn;
 		laddr->next = NULL;
 		faddr->next = NULL;
 		sock->laddr = laddr;
@@ -1007,7 +1009,7 @@ sctp_path_state(int state)
 static void
 displaysock(struct sock *s, int pos)
 {
-	void *p;
+	kvaddr_t p;
 	int hash, first, offset;
 	struct addr *laddr, *faddr;
 	struct sock *s_tmp;
@@ -1053,8 +1055,8 @@ displaysock(struct sock *s, int pos)
 				break;
 			}
 			/* client */
-			p = *(void **)&(faddr->address);
-			if (p == NULL) {
+			p = *(kvaddr_t*)&(faddr->address);
+			if (p == 0) {
 				pos += xprintf("(not connected)");
 				offset += opt_w ? 92 : 44;
 				break;
@@ -1173,13 +1175,13 @@ display(void)
 	}
 	setpassent(1);
 	for (xf = xfiles, n = 0; n < nxfiles; ++n, ++xf) {
-		if (xf->xf_data == NULL)
+		if (xf->xf_data == 0)
 			continue;
 		if (opt_j >= 0 && opt_j != getprocjid(xf->xf_pid))
 			continue;
 		hash = (int)((uintptr_t)xf->xf_data % HASHSIZE);
 		for (s = sockhash[hash]; s != NULL; s = s->next) {
-			if ((void *)s->socket != xf->xf_data)
+			if (s->socket != xf->xf_data)
 				continue;
 			if (!check_ports(s))
 				continue;
@@ -1217,7 +1219,8 @@ display(void)
 	}
 }
 
-static int set_default_protos(void)
+static int
+set_default_protos(void)
 {
 	struct protoent *prot;
 	const char *pname;
@@ -1234,6 +1237,38 @@ static int set_default_protos(void)
 	}
 	numprotos = pindex;
 	return (pindex);
+}
+
+/*
+ * Return the vnet property of the jail, or -1 on error.
+ */
+static int
+jail_getvnet(int jid)
+{
+	struct iovec jiov[6];
+	int vnet;
+
+	vnet = -1;
+	jiov[0].iov_base = __DECONST(char *, "jid");
+	jiov[0].iov_len = sizeof("jid");
+	jiov[1].iov_base = &jid;
+	jiov[1].iov_len = sizeof(jid);
+	jiov[2].iov_base = __DECONST(char *, "vnet");
+	jiov[2].iov_len = sizeof("vnet");
+	jiov[3].iov_base = &vnet;
+	jiov[3].iov_len = sizeof(vnet);
+	jiov[4].iov_base = __DECONST(char *, "errmsg");
+	jiov[4].iov_len = sizeof("errmsg");
+	jiov[5].iov_base = jail_errmsg;
+	jiov[5].iov_len = JAIL_ERRMSGLEN;
+	jail_errmsg[0] = '\0';
+	if (jail_get(jiov, nitems(jiov), 0) < 0) {
+		if (!jail_errmsg[0])
+			snprintf(jail_errmsg, JAIL_ERRMSGLEN,
+			    "jail_get: %s", strerror(errno));
+		return (-1);
+	}
+	return (vnet);
 }
 
 static void
@@ -1263,7 +1298,9 @@ main(int argc, char *argv[])
 			opt_c = 1;
 			break;
 		case 'j':
-			opt_j = atoi(optarg);
+			opt_j = jail_getid(optarg);
+			if (opt_j < 0)
+				errx(1, "%s", jail_errmsg);
 			break;
 		case 'L':
 			opt_L = 1;
@@ -1307,6 +1344,21 @@ main(int argc, char *argv[])
 
 	if (argc > 0)
 		usage();
+
+	if (opt_j > 0) {
+		switch (jail_getvnet(opt_j)) {
+		case -1:
+			errx(2, "%s", jail_errmsg);
+		case JAIL_SYS_NEW:
+			if (jail_attach(opt_j) < 0)
+				errx(3, "%s", jail_errmsg);
+			/* Set back to -1 for normal output in vnet jail. */
+			opt_j = -1;
+			break;
+		default:
+			break;
+		}
+	}
 
 	if ((!opt_4 && !opt_6) && protos_defined != -1)
 		opt_4 = opt_6 = 1;

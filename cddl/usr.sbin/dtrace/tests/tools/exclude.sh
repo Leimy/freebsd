@@ -23,7 +23,22 @@
 
 exclude()
 {
-    eval $1=\"\$$1\\n$2\"
+    case $2 in
+    # Handle globbing later
+    *"*"*) ;;
+    # No globbing needed
+    *)
+        eval $1=\"\$$1\\n$2\"
+        return
+        ;;
+    esac
+    for file in ${TESTBASE}/${2}; do
+        case ${file} in
+            # Invalid glob
+            "${TESTBASE}/${2}") echo "Invalid exclude for $2" >&2; exit 1; ;;
+        esac
+        exclude "$1" "${file##${TESTBASE}/}"
+    done
 }
 
 exclude EXFAIL common/aggs/tst.subr.d
@@ -33,7 +48,6 @@ exclude EXFAIL common/funcs/tst.copyin.d
 exclude EXFAIL common/funcs/tst.copyinto.d
 exclude EXFAIL common/funcs/tst.ddi_pathname.d
 exclude EXFAIL common/io/tst.fds.d
-exclude EXFAIL common/ip/tst.ipv4localudp.ksh
 exclude EXFAIL common/mdb/tst.dtracedcmd.ksh
 exclude EXFAIL common/misc/tst.dofmax.ksh
 exclude EXFAIL common/misc/tst.include.ksh
@@ -118,13 +132,13 @@ exclude SKIP common/builtinvar/tst.ipl.d
 exclude SKIP common/builtinvar/tst.ipl1.d
 
 # These tests rely on being able to find a host via broadcast pings.
+exclude EXFAIL common/ip/tst.ipv4remotesctp.ksh
 exclude EXFAIL common/ip/tst.ipv4remotetcp.ksh
 exclude EXFAIL common/ip/tst.ipv4remoteudp.ksh
+exclude EXFAIL common/ip/tst.ipv4remoteudplite.ksh
 exclude EXFAIL common/ip/tst.ipv6remoteicmp.ksh
 exclude EXFAIL common/ip/tst.ipv4remoteicmp.ksh
-
-# FreeBSD never places tcpcbs in the TIME_WAIT state, so the probe never fires.
-exclude EXFAIL common/ip/tst.localtcpstate.ksh
+exclude EXFAIL common/ip/tst.remotesctpstate.ksh
 exclude EXFAIL common/ip/tst.remotetcpstate.ksh
 
 # Tries to enable pid$target:libc::entry, though there's no "libc" module.

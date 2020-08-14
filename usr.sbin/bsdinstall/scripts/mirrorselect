@@ -89,7 +89,6 @@ MIRROR=`dialog --backtitle "FreeBSD Installer" \
 	ftp://ftp2.gr.freebsd.org 	"Greece #2"\
 	ftp://ftp3.ie.freebsd.org 	"Ireland #3"\
 	ftp://ftp.il.freebsd.org 	"Israel"\
-	ftp://ftp.it.freebsd.org 	"Italy"\
 	ftp://ftp.jp.freebsd.org 	"Japan"\
 	ftp://ftp2.jp.freebsd.org 	"Japan #2"\
 	ftp://ftp3.jp.freebsd.org 	"Japan #3"\
@@ -161,7 +160,7 @@ _UNAME_R=`uname -r`
 _UNAME_R=${_UNAME_R%-p*}
 
 case ${_UNAME_R} in
-	*-CURRENT|*-STABLE|*-PRERELEASE)
+	*-ALPHA*|*-CURRENT|*-STABLE|*-PRERELEASE)
 		RELDIR="snapshots"
 		;;
 	*)

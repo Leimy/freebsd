@@ -62,6 +62,8 @@ __FBSDID("$FreeBSD$");
 #include <sys/syslog.h>
 #include <sys/cons.h>
 #include <sys/uio.h>
+#else /* !_KERNEL */
+#include <errno.h>
 #endif
 #include <sys/ctype.h>
 #include <sys/sbuf.h>
@@ -120,9 +122,21 @@ static void  putchar(int ch, void *arg);
 static char *ksprintn(char *nbuf, uintmax_t num, int base, int *len, int upper);
 static void  snprintf_func(int ch, void *arg);
 
-static int msgbufmapped;		/* Set when safe to use msgbuf */
+static bool msgbufmapped;		/* Set when safe to use msgbuf */
 int msgbuftrigger;
 struct msgbuf *msgbufp;
+
+#ifndef BOOT_TAG_SZ
+#define	BOOT_TAG_SZ	32
+#endif
+#ifndef BOOT_TAG
+/* Tag used to mark the start of a boot in dmesg */
+#define	BOOT_TAG	"---<<BOOT>>---"
+#endif
+
+static char current_boot_tag[BOOT_TAG_SZ + 1] = BOOT_TAG;
+SYSCTL_STRING(_kern, OID_AUTO, boot_tag, CTLFLAG_RDTUN | CTLFLAG_NOFETCH,
+    current_boot_tag, 0, "Tag added to dmesg at start of boot");
 
 static int log_console_output = 1;
 SYSCTL_INT(_kern, OID_AUTO, log_console_output, CTLFLAG_RWTUN,
@@ -244,27 +258,6 @@ vtprintf(struct proc *p, int pri, const char *fmt, va_list ap)
 	if (sess != NULL)
 		sess_release(sess);
 	msgbuftrigger = 1;
-}
-
-/*
- * Ttyprintf displays a message on a tty; it should be used only by
- * the tty driver, or anything that knows the underlying tty will not
- * be revoke(2)'d away.  Other callers should use tprintf.
- */
-int
-ttyprintf(struct tty *tp, const char *fmt, ...)
-{
-	va_list ap;
-	struct putchar_arg pca;
-	int retval;
-
-	va_start(ap, fmt);
-	pca.tty = tp;
-	pca.flags = TOTTY;
-	pca.p_bufr = NULL;
-	retval = kvprintf(fmt, putchar, &pca, 10, ap);
-	va_end(ap);
-	return (retval);
 }
 
 static int
@@ -416,7 +409,7 @@ vprintf(const char *fmt, va_list ap)
 
 	retval = _vprintf(-1, TOCONS | TOLOG, fmt, ap);
 
-	if (!panicstr)
+	if (!KERNEL_PANICKED())
 		msgbuftrigger = 1;
 
 	return (retval);
@@ -430,7 +423,7 @@ prf_putbuf(char *bufr, int flags, int pri)
 		msglogstr(bufr, pri, /*filter_cr*/1);
 
 	if (flags & TOCONS) {
-		if ((panicstr == NULL) && (constty != NULL))
+		if ((!KERNEL_PANICKED()) && (constty != NULL))
 			msgbuf_addstr(&consmsgbuf, -1,
 			    bufr, /*filter_cr*/ 0);
 
@@ -499,7 +492,7 @@ putchar(int c, void *arg)
 		return;
 	}
 
-	if ((flags & TOTTY) && tp != NULL && panicstr == NULL)
+	if ((flags & TOTTY) && tp != NULL && !KERNEL_PANICKED())
 		tty_putchar(tp, c);
 
 	if ((flags & (TOCONS | TOLOG)) && c != '\0')
@@ -660,6 +653,7 @@ kvprintf(char const *fmt, void (*func)(int, void*), void *arg, int radix, va_lis
 	int stop = 0, retval = 0;
 
 	num = 0;
+	q = NULL;
 	if (!func)
 		d = (char *) arg;
 	else
@@ -715,6 +709,7 @@ reswitch:	switch (ch = (u_char)*fmt++) {
 				padc = '0';
 				goto reswitch;
 			}
+			/* FALLTHROUGH */
 		case '1': case '2': case '3': case '4':
 		case '5': case '6': case '7': case '8': case '9':
 				for (n = 0;; ++fmt) {
@@ -780,20 +775,24 @@ reswitch:	switch (ch = (u_char)*fmt++) {
 				lflag = 1;
 			goto reswitch;
 		case 'n':
+			/*
+			 * We do not support %n in kernel, but consume the
+			 * argument.
+			 */
 			if (jflag)
-				*(va_arg(ap, intmax_t *)) = retval;
+				(void)va_arg(ap, intmax_t *);
 			else if (qflag)
-				*(va_arg(ap, quad_t *)) = retval;
+				(void)va_arg(ap, quad_t *);
 			else if (lflag)
-				*(va_arg(ap, long *)) = retval;
+				(void)va_arg(ap, long *);
 			else if (zflag)
-				*(va_arg(ap, size_t *)) = retval;
+				(void)va_arg(ap, size_t *);
 			else if (hflag)
-				*(va_arg(ap, short *)) = retval;
+				(void)va_arg(ap, short *);
 			else if (cflag)
-				*(va_arg(ap, char *)) = retval;
+				(void)va_arg(ap, char *);
 			else
-				*(va_arg(ap, int *)) = retval;
+				(void)va_arg(ap, int *);
 			break;
 		case 'o':
 			base = 8;
@@ -1020,21 +1019,24 @@ msgbufinit(void *ptr, int size)
 {
 	char *cp;
 	static struct msgbuf *oldp = NULL;
+	bool print_boot_tag;
 
 	size -= sizeof(*msgbufp);
 	cp = (char *)ptr;
+	print_boot_tag = !msgbufmapped;
+	/* Attempt to fetch kern.boot_tag tunable on first mapping */
+	if (!msgbufmapped)
+		TUNABLE_STR_FETCH("kern.boot_tag", current_boot_tag,
+		    sizeof(current_boot_tag));
 	msgbufp = (struct msgbuf *)(cp + size);
 	msgbuf_reinit(msgbufp, cp, size);
 	if (msgbufmapped && oldp != msgbufp)
 		msgbuf_copy(oldp, msgbufp);
-	msgbufmapped = 1;
+	msgbufmapped = true;
+	if (print_boot_tag && *current_boot_tag != '\0')
+		printf("%s\n", current_boot_tag);
 	oldp = msgbufp;
 }
-
-static int unprivileged_read_msgbuf = 1;
-SYSCTL_INT(_security_bsd, OID_AUTO, unprivileged_read_msgbuf,
-    CTLFLAG_RW, &unprivileged_read_msgbuf, 0,
-    "Unprivileged processes may read the kernel message buffer");
 
 /* Sysctls for accessing/clearing the msgbuf */
 static int
@@ -1044,11 +1046,9 @@ sysctl_kern_msgbuf(SYSCTL_HANDLER_ARGS)
 	u_int seq;
 	int error, len;
 
-	if (!unprivileged_read_msgbuf) {
-		error = priv_check(req->td, PRIV_MSGBUF);
-		if (error)
-			return (error);
-	}
+	error = priv_check(req->td, PRIV_MSGBUF);
+	if (error)
+		return (error);
 
 	/* Read the whole buffer, one chunk at a time. */
 	mtx_lock(&msgbuf_lock);
@@ -1260,3 +1260,42 @@ sbuf_putbuf(struct sbuf *sb)
 	printf("%s", sbuf_data(sb));
 }
 #endif
+
+int
+sbuf_printf_drain(void *arg, const char *data, int len)
+{
+	size_t *retvalptr;
+	int r;
+#ifdef _KERNEL
+	char *dataptr;
+	char oldchr;
+
+	/*
+	 * This is allowed as an extra byte is always resvered for
+	 * terminating NUL byte.  Save and restore the byte because
+	 * we might be flushing a record, and there may be valid
+	 * data after the buffer.
+	 */
+	oldchr = data[len];
+	dataptr = __DECONST(char *, data);
+	dataptr[len] = '\0';
+
+	prf_putbuf(dataptr, TOLOG | TOCONS, -1);
+	r = len;
+
+	dataptr[len] = oldchr;
+
+#else /* !_KERNEL */
+
+	r = printf("%.*s", len, data);
+	if (r < 0)
+		return (-errno);
+
+#endif
+
+	retvalptr = arg;
+	if (retvalptr != NULL)
+		*retvalptr += r;
+
+	return (r);
+}

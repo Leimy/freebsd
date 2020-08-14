@@ -35,34 +35,37 @@
 /*
  * libufs structures.
  */
+union dinodep {
+	struct ufs1_dinode *dp1;
+	struct ufs2_dinode *dp2;
+};
 
 /*
  * userland ufs disk.
  */
 struct uufsd {
-	const char *d_name;	/* disk name */
-	int d_ufs;		/* decimal UFS version */
-	int d_fd;		/* raw device file descriptor */
-	long d_bsize;		/* device bsize */
-	ufs2_daddr_t d_sblock;	/* superblock location */
-	struct csum *d_sbcsum;	/* Superblock summary info */
-	caddr_t d_inoblock;	/* inode block */
-	uint32_t d_inomin;	/* low inode (not ino_t for ABI compat) */
-	uint32_t d_inomax;	/* high inode (not ino_t for ABI compat) */
+	const char *d_name;		/* disk name */
+	int d_ufs;			/* decimal UFS version */
+	int d_fd;			/* raw device file descriptor */
+	long d_bsize;			/* device bsize */
+	ufs2_daddr_t d_sblock;		/* superblock location */
+	struct fs_summary_info *d_si;	/* Superblock summary info */
+	caddr_t d_inoblock;		/* inode block */
+	uint32_t d_inomin;		/* low ino, not ino_t for ABI compat */
+	uint32_t d_inomax;		/* high ino, not ino_t for ABI compat */
+	union dinodep d_dp;		/* pointer to currently active inode */
 	union {
-		struct fs d_fs;	/* filesystem information */
-		char d_sb[MAXBSIZE];
-				/* superblock as buffer */
+		struct fs d_fs;		/* filesystem information */
+		char d_sb[MAXBSIZE];	/* superblock as buffer */
 	} d_sbunion;
 	union {
-		struct cg d_cg;	/* cylinder group */
-		char d_buf[MAXBSIZE];
-				/* cylinder group storage */
+		struct cg d_cg;		/* cylinder group */
+		char d_buf[MAXBSIZE];	/* cylinder group storage */
 	} d_cgunion;
-	int d_ccg;		/* current cylinder group */
-	int d_lcg;		/* last cylinder group (in d_cg) */
-	const char *d_error;	/* human readable disk error */
-	int d_mine;		/* internal flags */
+	int d_ccg;			/* current cylinder group */
+	int d_lcg;			/* last cylinder group (in d_cg) */
+	const char *d_error;		/* human readable disk error */
+	int d_mine;			/* internal flags */
 #define	d_fs	d_sbunion.d_fs
 #define	d_sb	d_sbunion.d_sb
 #define	d_cg	d_cgunion.d_cg
@@ -111,6 +114,14 @@ int	ffs_sbget(void *, struct fs **, off_t, char *,
 	    int (*)(void *, off_t, void **, int));
 int	ffs_sbput(void *, struct fs *, off_t,
 	    int (*)(void *, off_t, void *, int));
+void	ffs_update_dinode_ckhash(struct fs *, struct ufs2_dinode *);
+int	ffs_verify_dinode_ckhash(struct fs *, struct ufs2_dinode *);
+
+/*
+ * Request standard superblock location in ffs_sbget
+ */
+#define	STDSB			-1	/* Fail if check-hash is bad */
+#define	STDSB_NOHASHFAIL	-2	/* Ignore check-hash failure */
 
 /*
  * block.c
@@ -135,8 +146,8 @@ int cgwrite1(struct uufsd *, int);
 /*
  * inode.c
  */
-int getino(struct uufsd *, void **, ino_t, int *);
-int putino(struct uufsd *);
+int getinode(struct uufsd *, union dinodep *, ino_t);
+int putinode(struct uufsd *);
 
 /*
  * sblock.c

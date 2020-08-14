@@ -34,10 +34,6 @@
 
 #include "t4_hw.h"
 
-#define GLBL_INTR_MASK (F_CIM | F_MPS | F_PL | F_PCIE | F_MC0 | F_EDC0 | \
-		F_EDC1 | F_LE | F_TP | F_MA | F_PM_TX | F_PM_RX | F_ULP_RX | \
-		F_CPL_SWITCH | F_SGE | F_ULP_TX)
-
 enum {
 	MAX_NPORTS     = 4,     /* max # of ports */
 	SERNUM_LEN     = 24,    /* Serial # length */
@@ -66,9 +62,21 @@ enum {
 };
 
 enum {
-	FEC_RS        = 1 << 0,
-	FEC_BASER_RS  = 1 << 1,
-	FEC_RESERVED  = 1 << 2,
+	/*
+	 * Real FECs.  In the same order as the FEC portion of caps32 so that
+	 * the code can do (fec & M_FW_PORT_CAP32_FEC) to get all the real FECs.
+	 */
+	FEC_RS        = 1 << 0,	/* Reed-Solomon */
+	FEC_BASER_RS  = 1 << 1,	/* BASE-R, aka Firecode */
+	FEC_NONE      = 1 << 2,	/* no FEC */
+
+	/*
+	 * Pseudo FECs that translate to real FECs.  The firmware knows nothing
+	 * about these and they start at M_FW_PORT_CAP32_FEC + 1.  AUTO should
+	 * be set all by itself.
+	 */
+	FEC_AUTO      = 1 << 5,
+	FEC_MODULE    = 1 << 6,	/* FEC suggested by the cable/transceiver. */
 };
 
 enum t4_bar2_qtype { T4_BAR2_QTYPE_EGRESS, T4_BAR2_QTYPE_INGRESS };
@@ -238,6 +246,7 @@ struct tp_params {
 
 	uint32_t vlan_pri_map;
 	uint32_t ingress_config;
+	uint64_t hash_filter_mask;
 	__be16 err_vec_mask;
 
 	int8_t fcoe_shift;
@@ -290,6 +299,7 @@ struct chip_params {
 	u16 vfcount;
 	u32 sge_fl_db;
 	u16 mps_tcam_size;
+	u16 rss_nentries;
 };
 
 /* VF-only parameters. */
@@ -354,11 +364,6 @@ struct adapter_params {
 	unsigned short a_wnd[NCCTRL_WIN];
 	unsigned short b_wnd[NCCTRL_WIN];
 
-	u_int ftid_min;
-	u_int ftid_max;
-	u_int etid_min;
-	u_int netids;
-
 	unsigned int cim_la_size;
 
 	uint8_t nports;		/* # of ethernet ports */
@@ -370,6 +375,10 @@ struct adapter_params {
 				   resources for TOE operation. */
 	unsigned int bypass:1;	/* this is a bypass card */
 	unsigned int ethoffload:1;
+	unsigned int hash_filter:1;
+	unsigned int filter2_wr_support:1;
+	unsigned int port_caps32:1;
+	unsigned int smac_add_support:1;
 
 	unsigned int ofldq_wr_cred;
 	unsigned int eo_wr_cred;
@@ -379,8 +388,10 @@ struct adapter_params {
 
 	uint32_t mps_bg_map;	/* rx buffer group map for all ports (upto 4) */
 
-	bool ulptx_memwrite_dsgl;        /* use of T5 DSGL allowed */
-	bool fr_nsmr_tpte_wr_support;    /* FW support for FR_NSMR_TPTE_WR */
+	bool ulptx_memwrite_dsgl;	/* use of T5 DSGL allowed */
+	bool fr_nsmr_tpte_wr_support;	/* FW support for FR_NSMR_TPTE_WR */
+	bool viid_smt_extn_support;	/* FW returns vin, vfvld & smt index? */
+	unsigned int max_pkts_per_eth_tx_pkts_wr;
 };
 
 #define CHELSIO_T4		0x4
@@ -411,20 +422,21 @@ struct trace_params {
 };
 
 struct link_config {
-	/* OS-specific code owns all the requested_* fields */
-	unsigned char  requested_aneg;   /* link aneg user has requested */
-	unsigned char  requested_fc;     /* flow control user has requested */
-	unsigned char  requested_fec;    /* FEC user has requested */
-	unsigned int   requested_speed;  /* speed user has requested */
+	/* OS-specific code owns all the requested_* fields. */
+	int8_t requested_aneg;	/* link autonegotiation */
+	int8_t requested_fc;	/* flow control */
+	int8_t requested_fec;	/* FEC */
+	u_int requested_speed;	/* speed (Mbps) */
 
-	unsigned short supported;        /* link capabilities */
-	unsigned short advertising;      /* advertised capabilities */
-	unsigned short lp_advertising;   /* peer advertised capabilities */
-	unsigned int   speed;            /* actual link speed */
-	unsigned char  fc;               /* actual link flow control */
-	unsigned char  fec;              /* actual FEC */
-	unsigned char  link_ok;          /* link up? */
-	unsigned char  link_down_rc;     /* link down reason */
+	uint32_t pcaps;		/* link capabilities */
+	uint32_t acaps;		/* advertised capabilities */
+	uint32_t lpacaps;	/* peer advertised capabilities */
+	u_int speed;		/* actual link speed (Mbps) */
+	int8_t fc;		/* actual link flow control */
+	int8_t fec_hint;	/* cable/transceiver recommended fec */
+	int8_t fec;		/* actual FEC */
+	bool link_ok;		/* link up? */
+	uint8_t link_down_rc;	/* link down reason */
 };
 
 #include "adapter.h"
@@ -439,13 +451,22 @@ struct link_config {
 static inline int is_ftid(const struct adapter *sc, u_int tid)
 {
 
-	return (tid >= sc->params.ftid_min && tid <= sc->params.ftid_max);
+	return (sc->tids.nftids > 0 && tid >= sc->tids.ftid_base &&
+	    tid <= sc->tids.ftid_end);
+}
+
+static inline int is_hpftid(const struct adapter *sc, u_int tid)
+{
+
+	return (sc->tids.nhpftids > 0 && tid >= sc->tids.hpftid_base &&
+	    tid <= sc->tids.hpftid_end);
 }
 
 static inline int is_etid(const struct adapter *sc, u_int tid)
 {
 
-	return (tid >= sc->params.etid_min);
+	return (sc->tids.netids > 0 && tid >= sc->tids.etid_base &&
+	    tid <= sc->tids.etid_end);
 }
 
 static inline int is_offload(const struct adapter *adap)
@@ -456,6 +477,11 @@ static inline int is_offload(const struct adapter *adap)
 static inline int is_ethoffload(const struct adapter *adap)
 {
 	return adap->params.ethoffload;
+}
+
+static inline int is_hashfilter(const struct adapter *adap)
+{
+	return adap->params.hash_filter;
 }
 
 static inline int chip_id(struct adapter *adap)
@@ -519,6 +545,12 @@ static inline u_int us_to_tcp_ticks(const struct adapter *adap, u_long us)
 	return (us * adap->params.vpd.cclk / 1000 >> adap->params.tp.tre);
 }
 
+static inline u_int tcp_ticks_to_us(const struct adapter *adap, u_int ticks)
+{
+	return ((uint64_t)ticks << adap->params.tp.tre) /
+	    core_ticks_per_usec(adap);
+}
+
 void t4_set_reg_field(struct adapter *adap, unsigned int addr, u32 mask, u32 val);
 
 int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
@@ -560,7 +592,7 @@ struct fw_filter_wr;
 void t4_intr_enable(struct adapter *adapter);
 void t4_intr_disable(struct adapter *adapter);
 void t4_intr_clear(struct adapter *adapter);
-int t4_slow_intr_handler(struct adapter *adapter);
+int t4_slow_intr_handler(struct adapter *adapter, bool verbose);
 
 int t4_hash_mac_addr(const u8 *addr);
 int t4_link_l1cfg(struct adapter *adap, unsigned int mbox, unsigned int port,
@@ -584,6 +616,7 @@ int t4_flash_erase_sectors(struct adapter *adapter, int start, int end);
 int t4_flash_cfg_addr(struct adapter *adapter);
 int t4_load_cfg(struct adapter *adapter, const u8 *cfg_data, unsigned int size);
 int t4_get_fw_version(struct adapter *adapter, u32 *vers);
+int t4_get_fw_hdr(struct adapter *adapter, struct fw_hdr *hdr);
 int t4_get_bs_version(struct adapter *adapter, u32 *vers);
 int t4_get_tp_version(struct adapter *adapter, u32 *vers);
 int t4_get_exprom_version(struct adapter *adapter, u32 *vers);
@@ -599,9 +632,7 @@ int t4_init_sge_params(struct adapter *adapter);
 int t4_init_tp_params(struct adapter *adap, bool sleep_ok);
 int t4_filter_field_shift(const struct adapter *adap, int filter_sel);
 int t4_port_init(struct adapter *adap, int mbox, int pf, int vf, int port_id);
-void t4_fatal_err(struct adapter *adapter);
-void t4_db_full(struct adapter *adapter);
-void t4_db_dropped(struct adapter *adapter);
+void t4_fatal_err(struct adapter *adapter, bool fw_error);
 int t4_set_trace_filter(struct adapter *adapter, const struct trace_params *tp,
 			int filter_index, int enable);
 void t4_get_trace_filter(struct adapter *adapter, struct trace_params *tp,
@@ -715,11 +746,9 @@ int t4_fw_hello(struct adapter *adap, unsigned int mbox, unsigned int evt_mbox,
 int t4_fw_bye(struct adapter *adap, unsigned int mbox);
 int t4_fw_reset(struct adapter *adap, unsigned int mbox, int reset);
 int t4_fw_halt(struct adapter *adap, unsigned int mbox, int force);
-int t4_fw_restart(struct adapter *adap, unsigned int mbox, int reset);
+int t4_fw_restart(struct adapter *adap, unsigned int mbox);
 int t4_fw_upgrade(struct adapter *adap, unsigned int mbox,
 		  const u8 *fw_data, unsigned int size, int force);
-int t4_fw_forceinstall(struct adapter *adap, const u8 *fw_data,
-    unsigned int size);
 int t4_fw_initialize(struct adapter *adap, unsigned int mbox);
 int t4_query_params(struct adapter *adap, unsigned int mbox, unsigned int pf,
 		    unsigned int vf, unsigned int nparams, const u32 *params,
@@ -742,10 +771,11 @@ int t4_cfg_pfvf(struct adapter *adap, unsigned int mbox, unsigned int pf,
 int t4_alloc_vi_func(struct adapter *adap, unsigned int mbox,
 		     unsigned int port, unsigned int pf, unsigned int vf,
 		     unsigned int nmac, u8 *mac, u16 *rss_size,
+		     uint8_t *vfvld, uint16_t *vin,
 		     unsigned int portfunc, unsigned int idstype);
 int t4_alloc_vi(struct adapter *adap, unsigned int mbox, unsigned int port,
 		unsigned int pf, unsigned int vf, unsigned int nmac, u8 *mac,
-		u16 *rss_size);
+		u16 *rss_size, uint8_t *vfvld, uint16_t *vin);
 int t4_free_vi(struct adapter *adap, unsigned int mbox,
 	       unsigned int pf, unsigned int vf,
 	       unsigned int viid);
@@ -755,8 +785,27 @@ int t4_set_rxmode(struct adapter *adap, unsigned int mbox, unsigned int viid,
 int t4_alloc_mac_filt(struct adapter *adap, unsigned int mbox, unsigned int viid,
 		      bool free, unsigned int naddr, const u8 **addr, u16 *idx,
 		      u64 *hash, bool sleep_ok);
+int t4_free_mac_filt(struct adapter *adap, unsigned int mbox,
+		      unsigned int viid, unsigned int naddr,
+		      const u8 **addr, bool sleep_ok);
+int t4_free_encap_mac_filt(struct adapter *adap, unsigned int viid,
+			   int idx, bool sleep_ok);
+int t4_free_raw_mac_filt(struct adapter *adap, unsigned int viid,
+			 const u8 *addr, const u8 *mask, unsigned int idx,
+			 u8 lookup_type, u8 port_id, bool sleep_ok);
+int t4_alloc_raw_mac_filt(struct adapter *adap, unsigned int viid,
+			  const u8 *addr, const u8 *mask, unsigned int idx,
+			  u8 lookup_type, u8 port_id, bool sleep_ok);
+int t4_alloc_encap_mac_filt(struct adapter *adap, unsigned int viid,
+			    const u8 *addr, const u8 *mask, unsigned int vni,
+			    unsigned int vni_mask, u8 dip_hit, u8 lookup_type,
+			    bool sleep_ok);
 int t4_change_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
-		  int idx, const u8 *addr, bool persist, bool add_smt);
+		  int idx, const u8 *addr, bool persist, uint16_t *smt_idx);
+int t4_del_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
+	       const u8 *addr, bool smac);
+int t4_add_mac(struct adapter *adap, unsigned int mbox, unsigned int viid,
+	       int idx, const u8 *addr, bool persist, u8 *smt_idx, bool smac);
 int t4_set_addr_hash(struct adapter *adap, unsigned int mbox, unsigned int viid,
 		     bool ucast, u64 vec, bool sleep_ok);
 int t4_enable_vi_params(struct adapter *adap, unsigned int mbox,
@@ -769,6 +818,10 @@ int t4_mdio_rd(struct adapter *adap, unsigned int mbox, unsigned int phy_addr,
 	       unsigned int mmd, unsigned int reg, unsigned int *valp);
 int t4_mdio_wr(struct adapter *adap, unsigned int mbox, unsigned int phy_addr,
 	       unsigned int mmd, unsigned int reg, unsigned int val);
+int t4_i2c_io(struct adapter *adap, unsigned int mbox,
+	      int port, unsigned int devid,
+	      unsigned int offset, unsigned int len,
+	      u8 *buf, bool write);
 int t4_i2c_rd(struct adapter *adap, unsigned int mbox,
 	      int port, unsigned int devid,
 	      unsigned int offset, unsigned int len,
@@ -793,7 +846,7 @@ int t4_sge_ctxt_rd(struct adapter *adap, unsigned int mbox, unsigned int cid,
 		   enum ctxt_type ctype, u32 *data);
 int t4_sge_ctxt_rd_bd(struct adapter *adap, unsigned int cid, enum ctxt_type ctype,
 		      u32 *data);
-int t4_sge_ctxt_flush(struct adapter *adap, unsigned int mbox);
+int t4_sge_ctxt_flush(struct adapter *adap, unsigned int mbox, int ctxt_type);
 const char *t4_link_down_rc_str(unsigned char link_down_rc);
 int t4_update_port_info(struct port_info *pi);
 int t4_handle_fw_rpl(struct adapter *adap, const __be64 *rpl);
@@ -803,7 +856,7 @@ int t4_sched_config(struct adapter *adapter, int type, int minmaxen,
 int t4_sched_params(struct adapter *adapter, int type, int level, int mode,
 		    int rateunit, int ratemode, int channel, int cl,
 		    int minrate, int maxrate, int weight, int pktsize,
-		    int sleep_ok);
+		    int burstsize, int sleep_ok);
 int t4_sched_params_ch_rl(struct adapter *adapter, int channel, int ratemode,
 			  unsigned int maxrate, int sleep_ok);
 int t4_sched_params_cl_wrr(struct adapter *adapter, int channel, int cl,
@@ -826,6 +879,10 @@ void t4_tp_tm_pio_read(struct adapter *adap, u32 *buff, u32 nregs,
 		       u32 start_index, bool sleep_ok);
 void t4_tp_mib_read(struct adapter *adap, u32 *buff, u32 nregs,
 		    u32 start_index, bool sleep_ok);
+int t4_configure_ringbb(struct adapter *adap);
+int t4_configure_add_smac(struct adapter *adap);
+int t4_set_vlan_acl(struct adapter *adap, unsigned int mbox, unsigned int vf,
+		    u16 vlan);
 
 static inline int t4vf_query_params(struct adapter *adapter,
 				    unsigned int nparams, const u32 *params,
@@ -856,5 +913,16 @@ int t4vf_prep_adapter(struct adapter *adapter);
 int t4_bar2_sge_qregs(struct adapter *adapter, unsigned int qid,
 		enum t4_bar2_qtype qtype, int user, u64 *pbar2_qoffset,
 		unsigned int *pbar2_qid);
+unsigned int fwcap_to_speed(uint32_t caps);
+uint32_t speed_to_fwcap(unsigned int speed);
+uint32_t fwcap_top_speed(uint32_t caps);
+
+static inline int
+port_top_speed(const struct port_info *pi)
+{
+
+	/* Mbps -> Gbps */
+	return (fwcap_to_speed(pi->link_cfg.pcaps) / 1000);
+}
 
 #endif /* __CHELSIO_COMMON_H */

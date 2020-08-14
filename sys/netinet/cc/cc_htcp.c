@@ -170,8 +170,8 @@ static int htcp_rtt_ref;
 static int htcp_max_diff = INT_MAX / ((1 << HTCP_ALPHA_INC_SHIFT) * 10);
 
 /* Per-netstack vars. */
-static VNET_DEFINE(u_int, htcp_adaptive_backoff) = 0;
-static VNET_DEFINE(u_int, htcp_rtt_scaling) = 0;
+VNET_DEFINE_STATIC(u_int, htcp_adaptive_backoff) = 0;
+VNET_DEFINE_STATIC(u_int, htcp_rtt_scaling) = 0;
 #define	V_htcp_adaptive_backoff    VNET(htcp_adaptive_backoff)
 #define	V_htcp_rtt_scaling    VNET(htcp_rtt_scaling)
 
@@ -238,9 +238,7 @@ htcp_ack_received(struct cc_var *ccv, uint16_t type)
 static void
 htcp_cb_destroy(struct cc_var *ccv)
 {
-
-	if (ccv->cc_data != NULL)
-		free(ccv->cc_data, M_HTCP);
+	free(ccv->cc_data, M_HTCP);
 }
 
 static int
@@ -366,9 +364,14 @@ htcp_post_recovery(struct cc_var *ccv)
 			pipe = tcp_compute_pipe(ccv->ccvc.tcp);
 		else
 			pipe = CCV(ccv, snd_max) - ccv->curack;
-		
+
 		if (pipe < CCV(ccv, snd_ssthresh))
-			CCV(ccv, snd_cwnd) = pipe + CCV(ccv, t_maxseg);
+			/*
+			 * Ensure that cwnd down not collape to 1 MSS under
+			 * adverse conditions. Implements RFC6582
+			 */
+			CCV(ccv, snd_cwnd) = max(pipe, CCV(ccv, t_maxseg)) +
+			    CCV(ccv, t_maxseg);
 		else
 			CCV(ccv, snd_cwnd) = max(1, ((htcp_data->beta *
 			    htcp_data->prev_cwnd / CCV(ccv, t_maxseg))
@@ -517,8 +520,8 @@ htcp_ssthresh_update(struct cc_var *ccv)
 
 
 SYSCTL_DECL(_net_inet_tcp_cc_htcp);
-SYSCTL_NODE(_net_inet_tcp_cc, OID_AUTO, htcp, CTLFLAG_RW,
-    NULL, "H-TCP related settings");
+SYSCTL_NODE(_net_inet_tcp_cc, OID_AUTO, htcp, CTLFLAG_RW | CTLFLAG_MPSAFE, NULL,
+    "H-TCP related settings");
 SYSCTL_UINT(_net_inet_tcp_cc_htcp, OID_AUTO, adaptive_backoff,
     CTLFLAG_VNET | CTLFLAG_RW, &VNET_NAME(htcp_adaptive_backoff), 0,
     "enable H-TCP adaptive backoff");
@@ -527,3 +530,4 @@ SYSCTL_UINT(_net_inet_tcp_cc_htcp, OID_AUTO, rtt_scaling,
     "enable H-TCP RTT scaling");
 
 DECLARE_CC_MODULE(htcp, &htcp_cc_algo);
+MODULE_VERSION(htcp, 1);

@@ -112,15 +112,10 @@ free_pageset(struct tom_data *td, struct pageset *ps)
 	if (ps->prsv.prsv_nppods > 0)
 		t4_free_page_pods(&ps->prsv);
 
-	if (ps->flags & PS_WIRED) {
-		for (i = 0; i < ps->npages; i++) {
-			p = ps->pages[i];
-			vm_page_lock(p);
-			vm_page_unwire(p, PQ_INACTIVE);
-			vm_page_unlock(p);
-		}
-	} else
-		vm_page_unhold_pages(ps->pages, ps->npages);
+	for (i = 0; i < ps->npages; i++) {
+		p = ps->pages[i];
+		vm_page_unwire(p, PQ_INACTIVE);
+	}
 	mtx_lock(&ddp_orphan_pagesets_lock);
 	TAILQ_INSERT_TAIL(&ddp_orphan_pagesets, ps, link);
 	taskqueue_enqueue(taskqueue_thread, &ddp_orphan_task);
@@ -150,7 +145,7 @@ recycle_pageset(struct toepcb *toep, struct pageset *ps)
 {
 
 	DDP_ASSERT_LOCKED(toep);
-	if (!(toep->ddp.flags & DDP_DEAD) && ps->flags & PS_WIRED) {
+	if (!(toep->ddp.flags & DDP_DEAD)) {
 		KASSERT(toep->ddp.cached_count + toep->ddp.active_count <
 		    nitems(toep->ddp.db), ("too many wired pagesets"));
 		TAILQ_INSERT_HEAD(&toep->ddp.cached_pagesets, ps, link);
@@ -220,7 +215,7 @@ release_ddp_resources(struct toepcb *toep)
 	int i;
 
 	DDP_LOCK(toep);
-	toep->flags |= DDP_DEAD;
+	toep->ddp.flags |= DDP_DEAD;
 	for (i = 0; i < nitems(toep->ddp.db); i++) {
 		free_ddp_buffer(toep->td, &toep->ddp.db[i]);
 	}
@@ -263,8 +258,8 @@ complete_ddp_buffer(struct toepcb *toep, struct ddp_buffer *db,
 		} else
 			toep->ddp.active_id ^= 1;
 #ifdef VERBOSE_TRACES
-		CTR2(KTR_CXGBE, "%s: ddp_active_id = %d", __func__,
-		    toep->ddp.active_id);
+		CTR3(KTR_CXGBE, "%s: tid %u, ddp_active_id = %d", __func__,
+		    toep->tid, toep->ddp.active_id);
 #endif
 	} else {
 		KASSERT(toep->ddp.active_count != 0 &&
@@ -303,9 +298,6 @@ insert_ddp_data(struct toepcb *toep, uint32_t n)
 #ifndef USE_DDP_RX_FLOW_CONTROL
 	KASSERT(tp->rcv_wnd >= n, ("%s: negative window size", __func__));
 	tp->rcv_wnd -= n;
-#endif
-#ifndef USE_DDP_RX_FLOW_CONTROL
-	toep->rx_credits += n;
 #endif
 	CTR2(KTR_CXGBE, "%s: placed %u bytes before falling out of DDP",
 	    __func__, n);
@@ -537,8 +529,8 @@ handle_ddp_data(struct toepcb *toep, __be32 ddp_report, __be32 rcv_nxt, int len)
 	tp->rcv_wnd -= len;
 #endif
 #ifdef VERBOSE_TRACES
-	CTR4(KTR_CXGBE, "%s: DDP[%d] placed %d bytes (%#x)", __func__, db_idx,
-	    len, report);
+	CTR5(KTR_CXGBE, "%s: tid %u, DDP[%d] placed %d bytes (%#x)", __func__,
+	    toep->tid, db_idx, len, report);
 #endif
 
 	/* receive buffer autosize */
@@ -549,21 +541,16 @@ handle_ddp_data(struct toepcb *toep, __be32 ddp_report, __be32 rcv_nxt, int len)
 	    V_tcp_do_autorcvbuf &&
 	    sb->sb_hiwat < V_tcp_autorcvbuf_max &&
 	    len > (sbspace(sb) / 8 * 7)) {
+		struct adapter *sc = td_adapter(toep->td);
 		unsigned int hiwat = sb->sb_hiwat;
-		unsigned int newsize = min(hiwat + V_tcp_autorcvbuf_inc,
+		unsigned int newsize = min(hiwat + sc->tt.autorcvbuf_inc,
 		    V_tcp_autorcvbuf_max);
 
 		if (!sbreserve_locked(sb, newsize, so, NULL))
 			sb->sb_flags &= ~SB_AUTOSIZE;
-		else
-			toep->rx_credits += newsize - hiwat;
 	}
 	SOCKBUF_UNLOCK(sb);
 	CURVNET_RESTORE();
-
-#ifndef USE_DDP_RX_FLOW_CONTROL
-	toep->rx_credits += len;
-#endif
 
 	job->msgrcv = 1;
 	if (db->cancel_pending) {
@@ -582,8 +569,9 @@ handle_ddp_data(struct toepcb *toep, __be32 ddp_report, __be32 rcv_nxt, int len)
 	} else {
 		copied = job->aio_received;
 #ifdef VERBOSE_TRACES
-		CTR4(KTR_CXGBE, "%s: completing %p (copied %ld, placed %d)",
-		    __func__, job, copied, len);
+		CTR5(KTR_CXGBE,
+		    "%s: tid %u, completing %p (copied %ld, placed %d)",
+		    __func__, toep->tid, job, copied, len);
 #endif
 		aio_complete(job, copied + len, 0);
 		t4_rcvd(&toep->td->tod, tp);
@@ -626,11 +614,17 @@ enum {
 	DDP_BUF1_INVALIDATED
 };
 
-void
-handle_ddp_tcb_rpl(struct toepcb *toep, const struct cpl_set_tcb_rpl *cpl)
+CTASSERT(DDP_BUF0_INVALIDATED == CPL_COOKIE_DDP0);
+
+static int
+do_ddp_tcb_rpl(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 {
+	struct adapter *sc = iq->adapter;
+	const struct cpl_set_tcb_rpl *cpl = (const void *)(rss + 1);
+	unsigned int tid = GET_TID(cpl);
 	unsigned int db_idx;
-	struct inpcb *inp = toep->inp;
+	struct toepcb *toep;
+	struct inpcb *inp;
 	struct ddp_buffer *db;
 	struct kaiocb *job;
 	long copied;
@@ -638,6 +632,8 @@ handle_ddp_tcb_rpl(struct toepcb *toep, const struct cpl_set_tcb_rpl *cpl)
 	if (cpl->status != CPL_ERR_NONE)
 		panic("XXX: tcp_rpl failed: %d", cpl->status);
 
+	toep = lookup_tid(sc, tid);
+	inp = toep->inp;
 	switch (cpl->cookie) {
 	case V_WORD(W_TCB_RX_DDP_FLAGS) | V_COOKIE(DDP_BUF0_INVALIDATED):
 	case V_WORD(W_TCB_RX_DDP_FLAGS) | V_COOKIE(DDP_BUF1_INVALIDATED):
@@ -645,6 +641,7 @@ handle_ddp_tcb_rpl(struct toepcb *toep, const struct cpl_set_tcb_rpl *cpl)
 		 * XXX: This duplicates a lot of code with handle_ddp_data().
 		 */
 		db_idx = G_COOKIE(cpl->cookie) - DDP_BUF0_INVALIDATED;
+		MPASS(db_idx < nitems(toep->ddp.db));
 		INP_WLOCK(inp);
 		DDP_LOCK(toep);
 		db = &toep->ddp.db[db_idx];
@@ -689,6 +686,8 @@ handle_ddp_tcb_rpl(struct toepcb *toep, const struct cpl_set_tcb_rpl *cpl)
 		panic("XXX: unknown tcb_rpl offset %#x, cookie %#x",
 		    G_WORD(cpl->cookie), G_COOKIE(cpl->cookie));
 	}
+
+	return (0);
 }
 
 void
@@ -702,12 +701,9 @@ handle_ddp_close(struct toepcb *toep, struct tcpcb *tp, __be32 rcv_nxt)
 
 	INP_WLOCK_ASSERT(toep->inp);
 	DDP_ASSERT_LOCKED(toep);
-	len = be32toh(rcv_nxt) - tp->rcv_nxt;
 
+	len = be32toh(rcv_nxt) - tp->rcv_nxt;
 	tp->rcv_nxt += len;
-#ifndef USE_DDP_RX_FLOW_CONTROL
-	toep->rx_credits += len;
-#endif
 
 	while (toep->ddp.active_count > 0) {
 		MPASS(toep->ddp.active_id != -1);
@@ -769,7 +765,7 @@ do_rx_data_ddp(struct sge_iq *iq, const struct rss_header *rss, struct mbuf *m)
 		    __func__, vld, tid, toep);
 	}
 
-	if (toep->ulp_mode == ULP_MODE_ISCSI) {
+	if (ulp_mode(toep) == ULP_MODE_ISCSI) {
 		t4_cpl_handler[CPL_RX_ISCSI_DDP](iq, rss, m);
 		return (0);
 	}
@@ -811,14 +807,13 @@ enable_ddp(struct adapter *sc, struct toepcb *toep)
 
 	DDP_ASSERT_LOCKED(toep);
 	toep->ddp.flags |= DDP_SC_REQ;
-	t4_set_tcb_field(sc, toep->ctrlq, toep->tid, W_TCB_RX_DDP_FLAGS,
+	t4_set_tcb_field(sc, toep->ctrlq, toep, W_TCB_RX_DDP_FLAGS,
 	    V_TF_DDP_OFF(1) | V_TF_DDP_INDICATE_OUT(1) |
 	    V_TF_DDP_BUF0_INDICATE(1) | V_TF_DDP_BUF1_INDICATE(1) |
 	    V_TF_DDP_BUF0_VALID(1) | V_TF_DDP_BUF1_VALID(1),
-	    V_TF_DDP_BUF0_INDICATE(1) | V_TF_DDP_BUF1_INDICATE(1), 0, 0,
-	    toep->ofld_rxq->iq.abs_id);
-	t4_set_tcb_field(sc, toep->ctrlq, toep->tid, W_TCB_T_FLAGS,
-	    V_TF_RCV_COALESCE_ENABLE(1), 0, 0, 0, toep->ofld_rxq->iq.abs_id);
+	    V_TF_DDP_BUF0_INDICATE(1) | V_TF_DDP_BUF1_INDICATE(1), 0, 0);
+	t4_set_tcb_field(sc, toep->ctrlq, toep, W_TCB_T_FLAGS,
+	    V_TF_RCV_COALESCE_ENABLE(1), 0, 0, 0);
 }
 
 static int
@@ -1179,35 +1174,14 @@ t4_write_page_pods_for_buf(struct adapter *sc, struct sge_wrq *wrq, int tid,
 	return (0);
 }
 
-static void
-wire_pageset(struct pageset *ps)
-{
-	vm_page_t p;
-	int i;
-
-	KASSERT(!(ps->flags & PS_WIRED), ("pageset already wired"));
-
-	for (i = 0; i < ps->npages; i++) {
-		p = ps->pages[i];
-		vm_page_lock(p);
-		vm_page_wire(p);
-		vm_page_unhold(p);
-		vm_page_unlock(p);
-	}
-	ps->flags |= PS_WIRED;
-}
-
 /*
- * Prepare a pageset for DDP.  This wires the pageset and sets up page
- * pods.
+ * Prepare a pageset for DDP.  This sets up page pods.
  */
 static int
 prep_pageset(struct adapter *sc, struct toepcb *toep, struct pageset *ps)
 {
 	struct tom_data *td = sc->tom_softc;
 
-	if (!(ps->flags & PS_WIRED))
-		wire_pageset(ps);
 	if (ps->prsv.prsv_nppods == 0 &&
 	    !t4_alloc_page_pods_for_ps(&td->pr, ps)) {
 		return (0);
@@ -1793,8 +1767,9 @@ sbcopy:
 	}
 
 #ifdef VERBOSE_TRACES
-	CTR5(KTR_CXGBE, "%s: scheduling %p for DDP[%d] (flags %#lx/%#lx)",
-	    __func__, job, db_idx, ddp_flags, ddp_flags_mask);
+	CTR6(KTR_CXGBE,
+	    "%s: tid %u, scheduling %p for DDP[%d] (flags %#lx/%#lx)", __func__,
+	    toep->tid, job, db_idx, ddp_flags, ddp_flags_mask);
 #endif
 	/* Give the chip the go-ahead. */
 	t4_wrq_tx(sc, wr);
@@ -1868,10 +1843,9 @@ t4_aio_cancel_active(struct kaiocb *job)
 			 */
 			valid_flag = i == 0 ? V_TF_DDP_BUF0_VALID(1) :
 			    V_TF_DDP_BUF1_VALID(1);
-			t4_set_tcb_field(sc, toep->ctrlq, toep->tid,
+			t4_set_tcb_field(sc, toep->ctrlq, toep,
 			    W_TCB_RX_DDP_FLAGS, valid_flag, 0, 1,
-			    i + DDP_BUF0_INVALIDATED,
-			    toep->ofld_rxq->iq.abs_id);
+			    i + DDP_BUF0_INVALIDATED);
 			toep->ddp.db[i].cancel_pending = 1;
 			CTR2(KTR_CXGBE, "%s: request %p marked pending",
 			    __func__, job);
@@ -1921,7 +1895,7 @@ t4_aio_queue_ddp(struct socket *so, struct kaiocb *job)
 	 */
 
 #ifdef VERBOSE_TRACES
-	CTR2(KTR_CXGBE, "%s: queueing %p", __func__, job);
+	CTR3(KTR_CXGBE, "%s: queueing %p for tid %u", __func__, job, toep->tid);
 #endif
 	if (!aio_set_cancel_function(job, t4_aio_cancel_queued))
 		panic("new job was cancelled");
@@ -1943,6 +1917,10 @@ void
 t4_ddp_mod_load(void)
 {
 
+	t4_register_shared_cpl_handler(CPL_SET_TCB_RPL, do_ddp_tcb_rpl,
+	    CPL_COOKIE_DDP0);
+	t4_register_shared_cpl_handler(CPL_SET_TCB_RPL, do_ddp_tcb_rpl,
+	    CPL_COOKIE_DDP1);
 	t4_register_cpl_handler(CPL_RX_DATA_DDP, do_rx_data_ddp);
 	t4_register_cpl_handler(CPL_RX_DDP_COMPLETE, do_rx_ddp_complete);
 	TAILQ_INIT(&ddp_orphan_pagesets);
@@ -1957,6 +1935,8 @@ t4_ddp_mod_unload(void)
 	taskqueue_drain(taskqueue_thread, &ddp_orphan_task);
 	MPASS(TAILQ_EMPTY(&ddp_orphan_pagesets));
 	mtx_destroy(&ddp_orphan_pagesets_lock);
+	t4_register_shared_cpl_handler(CPL_SET_TCB_RPL, NULL, CPL_COOKIE_DDP0);
+	t4_register_shared_cpl_handler(CPL_SET_TCB_RPL, NULL, CPL_COOKIE_DDP1);
 	t4_register_cpl_handler(CPL_RX_DATA_DDP, NULL);
 	t4_register_cpl_handler(CPL_RX_DDP_COMPLETE, NULL);
 }

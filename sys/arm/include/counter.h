@@ -34,8 +34,6 @@
 #include <sys/pcpu.h>
 #include <machine/atomic.h>
 
-extern struct pcpu __pcpu[];
-
 #define	EARLY_COUNTER	&__pcpu[0].pc_early_dummy_counter
 
 #define	counter_enter()	do {} while (0)
@@ -47,7 +45,7 @@ static inline uint64_t
 counter_u64_read_one(uint64_t *p, int cpu)
 {
 
-	return (atomic_load_64((uint64_t *)((char *)p + sizeof(struct pcpu) *
+	return (atomic_load_64((uint64_t *)((char *)p + UMA_PCPU_ALLOC_SIZE *
 	    cpu)));
 }
 
@@ -68,7 +66,7 @@ static void
 counter_u64_zero_one_cpu(void *arg)
 {
 
-	atomic_store_64((uint64_t *)((char *)arg + sizeof(struct pcpu) *
+	atomic_store_64((uint64_t *)((char *)arg + UMA_PCPU_ALLOC_SIZE *
 	    PCPU_GET(cpuid)), 0);
 }
 

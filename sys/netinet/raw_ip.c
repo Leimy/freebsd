@@ -100,10 +100,9 @@ VNET_DEFINE(ip_fw_chk_ptr_t, ip_fw_chk_ptr) = NULL;
 VNET_DEFINE(ip_fw_ctl_ptr_t, ip_fw_ctl_ptr) = NULL;
 
 int	(*ip_dn_ctl_ptr)(struct sockopt *);
-int	(*ip_dn_io_ptr)(struct mbuf **, int, struct ip_fw_args *);
-void	(*ip_divert_ptr)(struct mbuf *, int);
-int	(*ng_ipfw_input_p)(struct mbuf **, int,
-			struct ip_fw_args *, int);
+int	(*ip_dn_io_ptr)(struct mbuf **, struct ip_fw_args *);
+void	(*ip_divert_ptr)(struct mbuf *, bool);
+int	(*ng_ipfw_input_p)(struct mbuf **, struct ip_fw_args *, bool);
 
 #ifdef INET
 /*
@@ -161,7 +160,7 @@ rip_inshash(struct inpcb *inp)
 
 	INP_INFO_WLOCK_ASSERT(pcbinfo);
 	INP_WLOCK_ASSERT(inp);
-	
+
 	if (inp->inp_ip_p != 0 &&
 	    inp->inp_laddr.s_addr != INADDR_ANY &&
 	    inp->inp_faddr.s_addr != INADDR_ANY) {
@@ -170,7 +169,7 @@ rip_inshash(struct inpcb *inp)
 	} else
 		hash = 0;
 	pcbhash = &pcbinfo->ipi_hashbase[hash];
-	LIST_INSERT_HEAD(pcbhash, inp, inp_hash);
+	CK_LIST_INSERT_HEAD(pcbhash, inp, inp_hash);
 }
 
 static void
@@ -180,7 +179,7 @@ rip_delhash(struct inpcb *inp)
 	INP_INFO_WLOCK_ASSERT(inp->inp_pcbinfo);
 	INP_WLOCK_ASSERT(inp);
 
-	LIST_REMOVE(inp, inp_hash);
+	CK_LIST_REMOVE(inp, inp_hash);
 }
 #endif /* INET */
 
@@ -287,6 +286,8 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 	struct sockaddr_in ripsrc;
 	int hash;
 
+	NET_EPOCH_ASSERT();
+
 	*mp = NULL;
 
 	bzero(&ripsrc, sizeof(ripsrc));
@@ -299,8 +300,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 
 	hash = INP_PCBHASH_RAW(proto, ip->ip_src.s_addr,
 	    ip->ip_dst.s_addr, V_ripcbinfo.ipi_hashmask);
-	INP_INFO_RLOCK(&V_ripcbinfo);
-	LIST_FOREACH(inp, &V_ripcbinfo.ipi_hashbase[hash], inp_hash) {
+	CK_LIST_FOREACH(inp, &V_ripcbinfo.ipi_hashbase[hash], inp_hash) {
 		if (inp->inp_ip_p != proto)
 			continue;
 #ifdef INET6
@@ -312,27 +312,33 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 			continue;
 		if (inp->inp_faddr.s_addr != ip->ip_src.s_addr)
 			continue;
+		if (last != NULL) {
+			struct mbuf *n;
+
+			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
+			if (n != NULL)
+			    (void) rip_append(last, ip, n, &ripsrc);
+			/* XXX count dropped packet */
+			INP_RUNLOCK(last);
+			last = NULL;
+		}
+		INP_RLOCK(inp);
+		if (__predict_false(inp->inp_flags2 & INP_FREED))
+			goto skip_1;
 		if (jailed_without_vnet(inp->inp_cred)) {
 			/*
 			 * XXX: If faddr was bound to multicast group,
 			 * jailed raw socket will drop datagram.
 			 */
 			if (prison_check_ip4(inp->inp_cred, &ip->ip_dst) != 0)
-				continue;
+				goto skip_1;
 		}
-		if (last != NULL) {
-			struct mbuf *n;
-
-			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
-			if (n != NULL)
-		    	    (void) rip_append(last, ip, n, &ripsrc);
-			/* XXX count dropped packet */
-			INP_RUNLOCK(last);
-		}
-		INP_RLOCK(inp);
 		last = inp;
+		continue;
+	skip_1:
+		INP_RUNLOCK(inp);
 	}
-	LIST_FOREACH(inp, &V_ripcbinfo.ipi_hashbase[0], inp_hash) {
+	CK_LIST_FOREACH(inp, &V_ripcbinfo.ipi_hashbase[0], inp_hash) {
 		if (inp->inp_ip_p && inp->inp_ip_p != proto)
 			continue;
 #ifdef INET6
@@ -346,6 +352,19 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 		if (!in_nullhost(inp->inp_faddr) &&
 		    !in_hosteq(inp->inp_faddr, ip->ip_src))
 			continue;
+		if (last != NULL) {
+			struct mbuf *n;
+
+			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
+			if (n != NULL)
+				(void) rip_append(last, ip, n, &ripsrc);
+			/* XXX count dropped packet */
+			INP_RUNLOCK(last);
+			last = NULL;
+		}
+		INP_RLOCK(inp);
+		if (__predict_false(inp->inp_flags2 & INP_FREED))
+			goto skip_2;
 		if (jailed_without_vnet(inp->inp_cred)) {
 			/*
 			 * Allow raw socket in jail to receive multicast;
@@ -354,7 +373,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 			 */
 			if (!IN_MULTICAST(ntohl(ip->ip_dst.s_addr)) &&
 			    prison_check_ip4(inp->inp_cred, &ip->ip_dst) != 0)
-				continue;
+				goto skip_2;
 		}
 		/*
 		 * If this raw socket has multicast state, and we
@@ -395,22 +414,14 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 
 			if (blocked != MCAST_PASS) {
 				IPSTAT_INC(ips_notmember);
-				continue;
+				goto skip_2;
 			}
 		}
-		if (last != NULL) {
-			struct mbuf *n;
-
-			n = m_copym(m, 0, M_COPYALL, M_NOWAIT);
-			if (n != NULL)
-				(void) rip_append(last, ip, n, &ripsrc);
-			/* XXX count dropped packet */
-			INP_RUNLOCK(last);
-		}
-		INP_RLOCK(inp);
 		last = inp;
+		continue;
+	skip_2:
+		INP_RUNLOCK(inp);
 	}
-	INP_INFO_RUNLOCK(&V_ripcbinfo);
 	if (last != NULL) {
 		if (rip_append(last, ip, m, &ripsrc) != 0)
 			IPSTAT_INC(ips_delivered);
@@ -434,6 +445,7 @@ rip_input(struct mbuf **mp, int *offp, int proto)
 int
 rip_output(struct mbuf *m, struct socket *so, ...)
 {
+	struct epoch_tracker et;
 	struct ip *ip;
 	int error;
 	struct inpcb *inp = sotoinpcb(so);
@@ -441,6 +453,8 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 	u_long dst;
 	int flags = ((so->so_options & SO_DONTROUTE) ? IP_ROUTETOIF : 0) |
 	    IP_ALLOWBROADCAST;
+	int cnt, hlen;
+	u_char opttype, optlen, *cp;
 
 	va_start(ap, so);
 	dst = va_arg(ap, u_long);
@@ -477,8 +491,10 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 			 * want to see from jails.
 			 */
 			if (ip->ip_src.s_addr == INADDR_ANY) {
-				error = in_pcbladdr(inp, &ip->ip_dst, &ip->ip_src,
-				    inp->inp_cred);
+				NET_EPOCH_ENTER(et);
+				error = in_pcbladdr(inp, &ip->ip_dst,
+				    &ip->ip_src, inp->inp_cred);
+				NET_EPOCH_EXIT(et);
 			} else {
 				error = prison_local_ip4(inp->inp_cred,
 				    &ip->ip_src);
@@ -495,25 +511,60 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 			m_freem(m);
 			return(EMSGSIZE);
 		}
-		INP_RLOCK(inp);
 		ip = mtod(m, struct ip *);
+		hlen = ip->ip_hl << 2;
+		if (m->m_len < hlen) {
+			m = m_pullup(m, hlen);
+			if (m == NULL)
+				return (EINVAL);
+			ip = mtod(m, struct ip *);
+		}
+
+		INP_RLOCK(inp);
+		/*
+		 * Don't allow both user specified and setsockopt options,
+		 * and don't allow packet length sizes that will crash.
+		 */
+		if ((hlen < sizeof (*ip))
+		    || ((hlen > sizeof (*ip)) && inp->inp_options)
+		    || (ntohs(ip->ip_len) != m->m_pkthdr.len)) {
+			INP_RUNLOCK(inp);
+			m_freem(m);
+			return (EINVAL);
+		}
 		error = prison_check_ip4(inp->inp_cred, &ip->ip_src);
 		if (error != 0) {
 			INP_RUNLOCK(inp);
 			m_freem(m);
 			return (error);
 		}
-
 		/*
-		 * Don't allow both user specified and setsockopt options,
-		 * and don't allow packet length sizes that will crash.
+		 * Don't allow IP options which do not have the required
+		 * structure as specified in section 3.1 of RFC 791 on
+		 * pages 15-23.
 		 */
-		if (((ip->ip_hl != (sizeof (*ip) >> 2)) && inp->inp_options)
-		    || (ntohs(ip->ip_len) != m->m_pkthdr.len)
-		    || (ntohs(ip->ip_len) < (ip->ip_hl << 2))) {
-			INP_RUNLOCK(inp);
-			m_freem(m);
-			return (EINVAL);
+		cp = (u_char *)(ip + 1);
+		cnt = hlen - sizeof (struct ip);
+		for (; cnt > 0; cnt -= optlen, cp += optlen) {
+			opttype = cp[IPOPT_OPTVAL];
+			if (opttype == IPOPT_EOL)
+				break;
+			if (opttype == IPOPT_NOP) {
+				optlen = 1;
+				continue;
+			}
+			if (cnt < IPOPT_OLEN + sizeof(u_char)) {
+				INP_RUNLOCK(inp);
+				m_freem(m);
+				return (EINVAL);
+			}
+			optlen = cp[IPOPT_OLEN];
+			if (optlen < IPOPT_OLEN + sizeof(u_char) ||
+			    optlen > cnt) {
+				INP_RUNLOCK(inp);
+				m_freem(m);
+				return (EINVAL);
+			}
 		}
 		/*
 		 * This doesn't allow application to specify ID of zero,
@@ -536,8 +587,10 @@ rip_output(struct mbuf *m, struct socket *so, ...)
 	mac_inpcb_create_mbuf(inp, m);
 #endif
 
+	NET_EPOCH_ENTER(et);
 	error = ip_output(m, inp->inp_options, NULL, flags,
 	    inp->inp_moptions, inp);
+	NET_EPOCH_EXIT(et);
 	INP_RUNLOCK(inp);
 	return (error);
 }
@@ -743,7 +796,7 @@ rip_ctlinput(int cmd, struct sockaddr *sa, void *vip)
 	switch (cmd) {
 	case PRC_IFDOWN:
 		IN_IFADDR_RLOCK(&in_ifa_tracker);
-		TAILQ_FOREACH(ia, &V_in_ifaddrhead, ia_link) {
+		CK_STAILQ_FOREACH(ia, &V_in_ifaddrhead, ia_link) {
 			if (ia->ia_ifa.ifa_addr == sa
 			    && (ia->ia_flags & IFA_ROUTE)) {
 				ifa_ref(&ia->ia_ifa);
@@ -769,7 +822,7 @@ rip_ctlinput(int cmd, struct sockaddr *sa, void *vip)
 
 	case PRC_IFUP:
 		IN_IFADDR_RLOCK(&in_ifa_tracker);
-		TAILQ_FOREACH(ia, &V_in_ifaddrhead, ia_link) {
+		CK_STAILQ_FOREACH(ia, &V_in_ifaddrhead, ia_link) {
 			if (ia->ia_ifa.ifa_addr == sa)
 				break;
 		}
@@ -839,7 +892,7 @@ rip_detach(struct socket *so)
 
 	inp = sotoinpcb(so);
 	KASSERT(inp != NULL, ("rip_detach: inp == NULL"));
-	KASSERT(inp->inp_faddr.s_addr == INADDR_ANY, 
+	KASSERT(inp->inp_faddr.s_addr == INADDR_ANY,
 	    ("rip_detach: not closed"));
 
 	INP_INFO_WLOCK(&V_ripcbinfo);
@@ -928,7 +981,7 @@ rip_bind(struct socket *so, struct sockaddr *nam, struct thread *td)
 	inp = sotoinpcb(so);
 	KASSERT(inp != NULL, ("rip_bind: inp == NULL"));
 
-	if (TAILQ_EMPTY(&V_ifnet) ||
+	if (CK_STAILQ_EMPTY(&V_ifnet) ||
 	    (addr->sin_family != AF_INET && addr->sin_family != AF_IMPLINK) ||
 	    (addr->sin_addr.s_addr &&
 	     (inp->inp_flags & INP_BINDANY) == 0 &&
@@ -953,7 +1006,7 @@ rip_connect(struct socket *so, struct sockaddr *nam, struct thread *td)
 
 	if (nam->sa_len != sizeof(*addr))
 		return (EINVAL);
-	if (TAILQ_EMPTY(&V_ifnet))
+	if (CK_STAILQ_EMPTY(&V_ifnet))
 		return (EADDRNOTAVAIL);
 	if (addr->sin_family != AF_INET && addr->sin_family != AF_IMPLINK)
 		return (EAFNOSUPPORT);
@@ -1019,80 +1072,53 @@ rip_send(struct socket *so, int flags, struct mbuf *m, struct sockaddr *nam,
 static int
 rip_pcblist(SYSCTL_HANDLER_ARGS)
 {
-	int error, i, n;
-	struct inpcb *inp, **inp_list;
-	inp_gen_t gencnt;
 	struct xinpgen xig;
+	struct epoch_tracker et;
+	struct inpcb *inp;
+	int error;
 
-	/*
-	 * The process of preparing the TCB list is too time-consuming and
-	 * resource-intensive to repeat twice on every request.
-	 */
+	if (req->newptr != 0)
+		return (EPERM);
+
 	if (req->oldptr == 0) {
+		int n;
+
 		n = V_ripcbinfo.ipi_count;
 		n += imax(n / 8, 10);
 		req->oldidx = 2 * (sizeof xig) + n * sizeof(struct xinpcb);
 		return (0);
 	}
 
-	if (req->newptr != 0)
-		return (EPERM);
+	if ((error = sysctl_wire_old_buffer(req, 0)) != 0)
+		return (error);
 
-	/*
-	 * OK, now we're committed to doing something.
-	 */
-	INP_INFO_RLOCK(&V_ripcbinfo);
-	gencnt = V_ripcbinfo.ipi_gencnt;
-	n = V_ripcbinfo.ipi_count;
-	INP_INFO_RUNLOCK(&V_ripcbinfo);
-
+	bzero(&xig, sizeof(xig));
 	xig.xig_len = sizeof xig;
-	xig.xig_count = n;
-	xig.xig_gen = gencnt;
+	xig.xig_count = V_ripcbinfo.ipi_count;
+	xig.xig_gen = V_ripcbinfo.ipi_gencnt;
 	xig.xig_sogen = so_gencnt;
 	error = SYSCTL_OUT(req, &xig, sizeof xig);
 	if (error)
 		return (error);
 
-	inp_list = malloc(n * sizeof *inp_list, M_TEMP, M_WAITOK);
-	if (inp_list == NULL)
-		return (ENOMEM);
-
-	INP_INFO_RLOCK(&V_ripcbinfo);
-	for (inp = LIST_FIRST(V_ripcbinfo.ipi_listhead), i = 0; inp && i < n;
-	     inp = LIST_NEXT(inp, inp_list)) {
-		INP_WLOCK(inp);
-		if (inp->inp_gencnt <= gencnt &&
-		    cr_canseeinpcb(req->td->td_ucred, inp) == 0) {
-			in_pcbref(inp);
-			inp_list[i++] = inp;
-		}
-		INP_WUNLOCK(inp);
-	}
-	INP_INFO_RUNLOCK(&V_ripcbinfo);
-	n = i;
-
-	error = 0;
-	for (i = 0; i < n; i++) {
-		inp = inp_list[i];
+	NET_EPOCH_ENTER(et);
+	for (inp = CK_LIST_FIRST(V_ripcbinfo.ipi_listhead);
+	    inp != NULL;
+	    inp = CK_LIST_NEXT(inp, inp_list)) {
 		INP_RLOCK(inp);
-		if (inp->inp_gencnt <= gencnt) {
+		if (inp->inp_gencnt <= xig.xig_gen &&
+		    cr_canseeinpcb(req->td->td_ucred, inp) == 0) {
 			struct xinpcb xi;
 
 			in_pcbtoxinpcb(inp, &xi);
 			INP_RUNLOCK(inp);
 			error = SYSCTL_OUT(req, &xi, sizeof xi);
+			if (error)
+				break;
 		} else
 			INP_RUNLOCK(inp);
 	}
-	INP_INFO_WLOCK(&V_ripcbinfo);
-	for (i = 0; i < n; i++) {
-		inp = inp_list[i];
-		INP_RLOCK(inp);
-		if (!in_pcbrele_rlocked(inp))
-			INP_RUNLOCK(inp);
-	}
-	INP_INFO_WUNLOCK(&V_ripcbinfo);
+	NET_EPOCH_EXIT(et);
 
 	if (!error) {
 		/*
@@ -1101,20 +1127,19 @@ rip_pcblist(SYSCTL_HANDLER_ARGS)
 		 * that something happened while we were processing this
 		 * request, and it might be necessary to retry.
 		 */
-		INP_INFO_RLOCK(&V_ripcbinfo);
 		xig.xig_gen = V_ripcbinfo.ipi_gencnt;
 		xig.xig_sogen = so_gencnt;
 		xig.xig_count = V_ripcbinfo.ipi_count;
-		INP_INFO_RUNLOCK(&V_ripcbinfo);
 		error = SYSCTL_OUT(req, &xig, sizeof xig);
 	}
-	free(inp_list, M_TEMP);
+
 	return (error);
 }
 
 SYSCTL_PROC(_net_inet_raw, OID_AUTO/*XXX*/, pcblist,
-    CTLTYPE_OPAQUE | CTLFLAG_RD, NULL, 0,
-    rip_pcblist, "S,xinpcb", "List of active raw IP sockets");
+    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    rip_pcblist, "S,xinpcb",
+    "List of active raw IP sockets");
 
 #ifdef INET
 struct pr_usrreqs rip_usrreqs = {

@@ -32,20 +32,38 @@ static inline int
 mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
     struct mlx5e_rx_wqe *wqe, u16 ix)
 {
-	bus_dma_segment_t segs[1];
+	bus_dma_segment_t segs[MLX5E_MAX_BUSDMA_RX_SEGS];
 	struct mbuf *mb;
 	int nsegs;
 	int err;
+	struct mbuf *mb_head;
+	int i;
 
 	if (rq->mbuf[ix].mbuf != NULL)
 		return (0);
 
-	mb = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, rq->wqe_sz);
-	if (unlikely(!mb))
+	mb_head = mb = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR,
+	    MLX5E_MAX_RX_BYTES);
+	if (unlikely(mb == NULL))
 		return (-ENOMEM);
 
-	/* set initial mbuf length */
-	mb->m_pkthdr.len = mb->m_len = rq->wqe_sz;
+	mb->m_len = MLX5E_MAX_RX_BYTES;
+	mb->m_pkthdr.len = MLX5E_MAX_RX_BYTES;
+
+	for (i = 1; i < rq->nsegs; i++) {
+		if (mb_head->m_pkthdr.len >= rq->wqe_sz)
+			break;
+		mb = mb->m_next = m_getjcl(M_NOWAIT, MT_DATA, 0,
+		    MLX5E_MAX_RX_BYTES);
+		if (unlikely(mb == NULL)) {
+			m_freem(mb_head);
+			return (-ENOMEM);
+		}
+		mb->m_len = MLX5E_MAX_RX_BYTES;
+		mb_head->m_pkthdr.len += MLX5E_MAX_RX_BYTES;
+	}
+	/* rewind to first mbuf in chain */
+	mb = mb_head;
 
 	/* get IP header aligned */
 	m_adj(mb, MLX5E_NET_IP_ALIGN);
@@ -54,12 +72,22 @@ mlx5e_alloc_rx_wqe(struct mlx5e_rq *rq,
 	    mb, segs, &nsegs, BUS_DMA_NOWAIT);
 	if (err != 0)
 		goto err_free_mbuf;
-	if (unlikely(nsegs != 1)) {
+	if (unlikely(nsegs == 0)) {
 		bus_dmamap_unload(rq->dma_tag, rq->mbuf[ix].dma_map);
 		err = -ENOMEM;
 		goto err_free_mbuf;
 	}
-	wqe->data.addr = cpu_to_be64(segs[0].ds_addr);
+	wqe->data[0].addr = cpu_to_be64(segs[0].ds_addr);
+	wqe->data[0].byte_count = cpu_to_be32(segs[0].ds_len |
+	    MLX5_HW_START_PADDING);
+	for (i = 1; i != nsegs; i++) {
+		wqe->data[i].addr = cpu_to_be64(segs[i].ds_addr);
+		wqe->data[i].byte_count = cpu_to_be32(segs[i].ds_len);
+	}
+	for (; i < rq->nsegs; i++) {
+		wqe->data[i].addr = 0;
+		wqe->data[i].byte_count = 0;
+	}
 
 	rq->mbuf[ix].mbuf = mb;
 	rq->mbuf[ix].data = mb->m_data;
@@ -182,28 +210,31 @@ mlx5e_lro_update_hdr(struct mbuf *mb, struct mlx5_cqe64 *cqe)
 static uint64_t
 mlx5e_mbuf_tstmp(struct mlx5e_priv *priv, uint64_t hw_tstmp)
 {
-	struct mlx5e_clbr_point *cp;
+	struct mlx5e_clbr_point *cp, dcp;
 	uint64_t a1, a2, res;
 	u_int gen;
 
 	do {
 		cp = &priv->clbr_points[priv->clbr_curr];
 		gen = atomic_load_acq_int(&cp->clbr_gen);
-		a1 = (hw_tstmp - cp->clbr_hw_prev) >> MLX5E_TSTMP_PREC;
-		a2 = (cp->base_curr - cp->base_prev) >> MLX5E_TSTMP_PREC;
-		res = (a1 * a2) << MLX5E_TSTMP_PREC;
-
-		/*
-		 * Divisor cannot be zero because calibration callback
-		 * checks for the condition and disables timestamping
-		 * if clock halted.
-		 */
-		res /= (cp->clbr_hw_curr - cp->clbr_hw_prev) >>
-		    MLX5E_TSTMP_PREC;
-
-		res += cp->base_prev;
+		if (gen == 0)
+			return (0);
+		dcp = *cp;
 		atomic_thread_fence_acq();
-	} while (gen == 0 || gen != cp->clbr_gen);
+	} while (gen != cp->clbr_gen);
+
+	a1 = (hw_tstmp - dcp.clbr_hw_prev) >> MLX5E_TSTMP_PREC;
+	a2 = (dcp.base_curr - dcp.base_prev) >> MLX5E_TSTMP_PREC;
+	res = (a1 * a2) << MLX5E_TSTMP_PREC;
+
+	/*
+	 * Divisor cannot be zero because calibration callback
+	 * checks for the condition and disables timestamping
+	 * if clock halted.
+	 */
+	res /= (dcp.clbr_hw_curr - dcp.clbr_hw_prev) >> MLX5E_TSTMP_PREC;
+
+	res += dcp.base_prev;
 	return (res);
 }
 
@@ -214,6 +245,7 @@ mlx5e_build_rx_mbuf(struct mlx5_cqe64 *cqe,
 {
 	struct ifnet *ifp = rq->ifp;
 	struct mlx5e_channel *c;
+	struct mbuf *mb_head;
 	int lro_num_seg;	/* HW LRO session aggregated packets counter */
 	uint64_t tstmp;
 
@@ -224,7 +256,23 @@ mlx5e_build_rx_mbuf(struct mlx5_cqe64 *cqe,
 		rq->stats.lro_bytes += cqe_bcnt;
 	}
 
-	mb->m_pkthdr.len = mb->m_len = cqe_bcnt;
+	mb->m_pkthdr.len = cqe_bcnt;
+	for (mb_head = mb; mb != NULL; mb = mb->m_next) {
+		if (mb->m_len > cqe_bcnt)
+			mb->m_len = cqe_bcnt;
+		cqe_bcnt -= mb->m_len;
+		if (likely(cqe_bcnt == 0)) {
+			if (likely(mb->m_next != NULL)) {
+				/* trim off empty mbufs */
+				m_freem(mb->m_next);
+				mb->m_next = NULL;
+			}
+			break;
+		}
+	}
+	/* rewind to first mbuf in chain */
+	mb = mb_head;
+
 	/* check if a Toeplitz hash was computed */
 	if (cqe->rss_hash_type != 0) {
 		mb->m_pkthdr.flowid = be32_to_cpu(cqe->rss_hash_result);
@@ -323,7 +371,12 @@ mlx5e_decompress_cqe(struct mlx5e_cq *cq, struct mlx5_cqe64 *title,
 	 */
 	title->byte_cnt = mini->byte_cnt;
 	title->wqe_counter = cpu_to_be16((wqe_counter + i) & cq->wq.sz_m1);
-	title->check_sum = mini->checksum;
+	title->rss_hash_result = mini->rx_hash_result;
+	/*
+	 * Since we use MLX5_CQE_FORMAT_HASH when creating the RX CQ,
+	 * the value of the checksum should be ignored.
+	 */
+	title->check_sum = 0;
 	title->op_own = (title->op_own & 0xf0) |
 	    (((cq->wq.cc + i) >> cq->wq.log_sz) & 1);
 }
@@ -368,15 +421,18 @@ mlx5e_decompress_cqes(struct mlx5e_cq *cq)
 static int
 mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 {
-	int i;
+	struct pfil_head *pfil;
+	int i, rv;
 
+	CURVNET_SET_QUIET(rq->ifp->if_vnet);
+	pfil = rq->channel->priv->pfil;
 	for (i = 0; i < budget; i++) {
 		struct mlx5e_rx_wqe *wqe;
 		struct mlx5_cqe64 *cqe;
 		struct mbuf *mb;
 		__be16 wqe_counter_be;
 		u16 wqe_counter;
-		u32 byte_cnt;
+		u32 byte_cnt, seglen;
 
 		cqe = mlx5e_get_cqe(&rq->cq);
 		if (!cqe)
@@ -400,8 +456,43 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 			rq->stats.wqe_err++;
 			goto wq_ll_pop;
 		}
+		if (pfil != NULL && PFIL_HOOKED_IN(pfil)) {
+			seglen = MIN(byte_cnt, MLX5E_MAX_RX_BYTES);
+			rv = pfil_run_hooks(rq->channel->priv->pfil,
+			    rq->mbuf[wqe_counter].data, rq->ifp,
+			    seglen | PFIL_MEMPTR | PFIL_IN, NULL);
+
+			switch (rv) {
+			case PFIL_DROPPED:
+			case PFIL_CONSUMED:
+				/*
+				 * Filter dropped or consumed it. In
+				 * either case, we can just recycle
+				 * buffer; there is no more work to do.
+				 */
+				rq->stats.packets++;
+				goto wq_ll_pop;
+			case PFIL_REALLOCED:
+				/*
+				 * Filter copied it; recycle buffer
+				 * and receive the new mbuf allocated
+				 * by the Filter
+				 */
+				mb = pfil_mem2mbuf(rq->mbuf[wqe_counter].data);
+				goto rx_common;
+			default:
+				/*
+				 * The Filter said it was OK, so
+				 * receive like normal.
+				 */
+				KASSERT(rv == PFIL_PASS,
+					("Filter returned %d!\n", rv));
+			}
+		}
 		if ((MHLEN - MLX5E_NET_IP_ALIGN) >= byte_cnt &&
 		    (mb = m_gethdr(M_NOWAIT, MT_DATA)) != NULL) {
+			/* set maximum mbuf length */
+			mb->m_len = MHLEN - MLX5E_NET_IP_ALIGN;
 			/* get IP header aligned */
 			mb->m_data += MLX5E_NET_IP_ALIGN;
 
@@ -414,9 +505,13 @@ mlx5e_poll_rx_cq(struct mlx5e_rq *rq, int budget)
 			bus_dmamap_unload(rq->dma_tag,
 			    rq->mbuf[wqe_counter].dma_map);
 		}
-
+rx_common:
 		mlx5e_build_rx_mbuf(cqe, rq, mb, byte_cnt);
+		rq->stats.bytes += byte_cnt;
 		rq->stats.packets++;
+#ifdef NUMA
+		mb->m_pkthdr.numa_domain = rq->ifp->if_numa_domain;
+#endif
 
 #if !defined(HAVE_TCP_LRO_RX)
 		tcp_lro_queue_mbuf(&rq->lro, mb);
@@ -432,6 +527,7 @@ wq_ll_pop:
 		mlx5_wq_ll_pop(&rq->wq, wqe_counter_be,
 		    &wqe->next.next_wqe_index);
 	}
+	CURVNET_RESTORE();
 
 	mlx5_cqwq_update_db_record(&rq->cq.wq);
 
@@ -447,7 +543,10 @@ mlx5e_rx_cq_comp(struct mlx5_core_cq *mcq)
 	int i = 0;
 
 #ifdef HAVE_PER_CQ_EVENT_PACKET
-	struct mbuf *mb = m_getjcl(M_NOWAIT, MT_DATA, M_PKTHDR, rq->wqe_sz);
+#if (MHLEN < 15)
+#error "MHLEN is too small"
+#endif
+	struct mbuf *mb = m_gethdr(M_NOWAIT, MT_DATA);
 
 	if (mb != NULL) {
 		/* this code is used for debugging purpose only */
@@ -475,6 +574,9 @@ mlx5e_rx_cq_comp(struct mlx5_core_cq *mcq)
 		mlx5e_post_rx_wqes(rq);
 	}
 	mlx5e_post_rx_wqes(rq);
+	/* check for dynamic interrupt moderation callback */
+	if (rq->dim.mode != NET_DIM_CQ_PERIOD_MODE_DISABLED)
+		net_dim(&rq->dim, rq->stats.packets, rq->stats.bytes);
 	mlx5e_cq_arm(&rq->cq, MLX5_GET_DOORBELL_LOCK(&rq->channel->priv->doorbell_lock));
 	tcp_lro_flush_all(&rq->lro);
 	mtx_unlock(&rq->mtx);

@@ -55,7 +55,6 @@ __FBSDID("$FreeBSD$");
 #include <netinet/udp.h>
 #endif
 
-
 void
 sctp_audit_retranmission_queue(struct sctp_association *asoc)
 {
@@ -350,7 +349,7 @@ sctp_find_alternate_net(struct sctp_tcb *stcb,
 				return (NULL);
 			}
 		}
-		if (alt->ro.ro_rt == NULL) {
+		if (alt->ro.ro_nh == NULL) {
 			if (alt->ro._s_addr) {
 				sctp_free_ifa(alt->ro._s_addr);
 				alt->ro._s_addr = NULL;
@@ -358,7 +357,7 @@ sctp_find_alternate_net(struct sctp_tcb *stcb,
 			alt->src_addr_selected = 0;
 		}
 		if (((alt->dest_state & SCTP_ADDR_REACHABLE) == SCTP_ADDR_REACHABLE) &&
-		    (alt->ro.ro_rt != NULL) &&
+		    (alt->ro.ro_nh != NULL) &&
 		    (!(alt->dest_state & SCTP_ADDR_UNCONFIRMED))) {
 			/* Found a reachable address */
 			break;
@@ -649,6 +648,7 @@ start_again:
 					sctp_log_fr(chk->rec.data.tsn, chk->snd_count,
 					    0, SCTP_FR_T3_MARKED);
 				}
+
 				if (chk->rec.data.chunk_was_revoked) {
 					/* deflate the cwnd */
 					chk->whoTo->cwnd -= chk->book_size;
@@ -715,6 +715,7 @@ start_again:
 		/* we did not subtract the same things? */
 		audit_tf = 1;
 	}
+
 	if (SCTP_BASE_SYSCTL(sctp_logging_level) & SCTP_FR_LOGGING_ENABLE) {
 		sctp_log_fr(tsnfirst, tsnlast, num_mk, SCTP_FR_T3_TIMEOUT);
 	}
@@ -789,6 +790,7 @@ start_again:
 					    (uint32_t)(uintptr_t)chk->whoTo,
 					    chk->rec.data.tsn);
 				}
+
 				sctp_flight_size_increase(chk);
 				sctp_total_flight_increase(stcb, chk);
 			}
@@ -909,6 +911,7 @@ sctp_t3rxt_timer(struct sctp_inpcb *inp,
 	    (net->flight_size == 0)) {
 		(*stcb->asoc.cc_functions.sctp_cwnd_new_transmission_begins) (stcb, net);
 	}
+
 	/*
 	 * setup the sat loss recovery that prevents satellite cwnd advance.
 	 */
@@ -933,10 +936,8 @@ sctp_t3rxt_timer(struct sctp_inpcb *inp,
 		net->src_addr_selected = 0;
 
 		/* Force a route allocation too */
-		if (net->ro.ro_rt) {
-			RTFREE(net->ro.ro_rt);
-			net->ro.ro_rt = NULL;
-		}
+		RO_NHFREE(&net->ro);
+
 		/* Was it our primary? */
 		if ((stcb->asoc.primary_destination == net) && (alt != net)) {
 			/*
@@ -957,7 +958,7 @@ sctp_t3rxt_timer(struct sctp_inpcb *inp,
 	 * Special case for cookie-echo'ed case, we don't do output but must
 	 * await the COOKIE-ACK before retransmission
 	 */
-	if (SCTP_GET_STATE(&stcb->asoc) == SCTP_STATE_COOKIE_ECHOED) {
+	if (SCTP_GET_STATE(stcb) == SCTP_STATE_COOKIE_ECHOED) {
 		/*
 		 * Here we just reset the timer and start again since we
 		 * have not established the asoc
@@ -972,7 +973,12 @@ sctp_t3rxt_timer(struct sctp_inpcb *inp,
 		/* C3. See if we need to send a Fwd-TSN */
 		if (SCTP_TSN_GT(stcb->asoc.advanced_peer_ack_point, stcb->asoc.last_acked_seq)) {
 			send_forward_tsn(stcb, &stcb->asoc);
-			if (lchk) {
+			for (; lchk != NULL; lchk = TAILQ_NEXT(lchk, sctp_next)) {
+				if (lchk->whoTo != NULL) {
+					break;
+				}
+			}
+			if (lchk != NULL) {
 				/* Assure a timer is up */
 				sctp_timer_start(SCTP_TIMER_TYPE_SEND, stcb->sctp_ep, stcb, lchk->whoTo);
 			}
@@ -999,7 +1005,7 @@ sctp_t1init_timer(struct sctp_inpcb *inp,
 		sctp_send_initiate(inp, stcb, SCTP_SO_NOT_LOCKED);
 		return (0);
 	}
-	if (SCTP_GET_STATE((&stcb->asoc)) != SCTP_STATE_COOKIE_WAIT) {
+	if (SCTP_GET_STATE(stcb) != SCTP_STATE_COOKIE_WAIT) {
 		return (0);
 	}
 	if (sctp_threshold_management(inp, stcb, net,
@@ -1047,7 +1053,7 @@ sctp_cookie_timer(struct sctp_inpcb *inp,
 		}
 	}
 	if (cookie == NULL) {
-		if (SCTP_GET_STATE(&stcb->asoc) == SCTP_STATE_COOKIE_ECHOED) {
+		if (SCTP_GET_STATE(stcb) == SCTP_STATE_COOKIE_ECHOED) {
 			/* FOOBAR! */
 			struct mbuf *op_err;
 
@@ -1059,7 +1065,7 @@ sctp_cookie_timer(struct sctp_inpcb *inp,
 #ifdef INVARIANTS
 			panic("Cookie timer expires in wrong state?");
 #else
-			SCTP_PRINTF("Strange in state %d not cookie-echoed yet c-e timer expires?\n", SCTP_GET_STATE(&stcb->asoc));
+			SCTP_PRINTF("Strange in state %d not cookie-echoed yet c-e timer expires?\n", SCTP_GET_STATE(stcb));
 			return (0);
 #endif
 		}
@@ -1098,10 +1104,9 @@ sctp_cookie_timer(struct sctp_inpcb *inp,
 }
 
 int
-sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
-    struct sctp_nets *net)
+sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb)
 {
-	struct sctp_nets *alt;
+	struct sctp_nets *alt, *net;
 	struct sctp_tmit_chunk *strrst = NULL, *chk = NULL;
 
 	if (stcb->asoc.stream_reset_outstanding == 0) {
@@ -1112,9 +1117,9 @@ sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 	if (strrst == NULL) {
 		return (0);
 	}
+	net = strrst->whoTo;
 	/* do threshold management */
-	if (sctp_threshold_management(inp, stcb, strrst->whoTo,
-	    stcb->asoc.max_send_times)) {
+	if (sctp_threshold_management(inp, stcb, net, stcb->asoc.max_send_times)) {
 		/* Assoc is over */
 		return (1);
 	}
@@ -1122,9 +1127,8 @@ sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 	 * Cleared threshold management, now lets backoff the address and
 	 * select an alternate
 	 */
-	sctp_backoff_on_timeout(stcb, strrst->whoTo, 1, 0, 0);
-	alt = sctp_find_alternate_net(stcb, strrst->whoTo, 0);
-	sctp_free_remote_addr(strrst->whoTo);
+	sctp_backoff_on_timeout(stcb, net, 1, 0, 0);
+	alt = sctp_find_alternate_net(stcb, net, 0);
 	strrst->whoTo = alt;
 	atomic_add_int(&alt->ref_count, 1);
 
@@ -1149,6 +1153,8 @@ sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 		 */
 		sctp_move_chunks_from_net(stcb, net);
 	}
+	sctp_free_remote_addr(net);
+
 	/* mark the retran info */
 	if (strrst->sent != SCTP_DATAGRAM_RESEND)
 		sctp_ucount_incr(stcb->asoc.sent_queue_retran_cnt);
@@ -1156,7 +1162,7 @@ sctp_strreset_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 	strrst->flags |= CHUNK_FLAGS_FRAGMENT_OK;
 
 	/* restart the timer */
-	sctp_timer_start(SCTP_TIMER_TYPE_STRRESET, inp, stcb, strrst->whoTo);
+	sctp_timer_start(SCTP_TIMER_TYPE_STRRESET, inp, stcb, alt);
 	return (0);
 }
 
@@ -1181,8 +1187,9 @@ sctp_asconf_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 		if (asconf == NULL) {
 			return (0);
 		}
+		net = asconf->whoTo;
 		/* do threshold management */
-		if (sctp_threshold_management(inp, stcb, asconf->whoTo,
+		if (sctp_threshold_management(inp, stcb, net,
 		    stcb->asoc.max_send_times)) {
 			/* Assoc is over */
 			return (1);
@@ -1196,20 +1203,20 @@ sctp_asconf_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 			 * and cleanup.
 			 */
 			SCTPDBG(SCTP_DEBUG_TIMER1, "asconf_timer: Peer has not responded to our repeated ASCONFs\n");
-			sctp_asconf_cleanup(stcb, net);
+			sctp_asconf_cleanup(stcb);
 			return (0);
 		}
 		/*
 		 * cleared threshold management, so now backoff the net and
 		 * select an alternate
 		 */
-		sctp_backoff_on_timeout(stcb, asconf->whoTo, 1, 0, 0);
-		alt = sctp_find_alternate_net(stcb, asconf->whoTo, 0);
+		sctp_backoff_on_timeout(stcb, net, 1, 0, 0);
+		alt = sctp_find_alternate_net(stcb, net, 0);
 		if (asconf->whoTo != alt) {
-			sctp_free_remote_addr(asconf->whoTo);
 			asconf->whoTo = alt;
 			atomic_add_int(&alt->ref_count, 1);
 		}
+
 		/* See if an ECN Echo is also stranded */
 		TAILQ_FOREACH(chk, &stcb->asoc.control_send_queue, sctp_next) {
 			if ((chk->whoTo == net) &&
@@ -1242,6 +1249,8 @@ sctp_asconf_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 			 */
 			sctp_move_chunks_from_net(stcb, net);
 		}
+		sctp_free_remote_addr(net);
+
 		/* mark the retran info */
 		if (asconf->sent != SCTP_DATAGRAM_RESEND)
 			sctp_ucount_incr(stcb->asoc.sent_queue_retran_cnt);
@@ -1256,8 +1265,7 @@ sctp_asconf_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
 
 /* Mobility adaptation */
 void
-sctp_delete_prim_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb,
-    struct sctp_nets *net SCTP_UNUSED)
+sctp_delete_prim_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb)
 {
 	if (stcb->asoc.deleted_primary == NULL) {
 		SCTPDBG(SCTP_DEBUG_ASCONF1, "delete_prim_timer: deleted_primary is not stored...\n");
@@ -1495,7 +1503,7 @@ sctp_pathmtu_timer(struct sctp_inpcb *inp,
 				net->src_addr_selected = 1;
 		}
 		if (net->ro._s_addr) {
-			mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._s_addr.sa, net->ro.ro_rt);
+			mtu = SCTP_GATHER_MTU_FROM_ROUTE(net->ro._s_addr, &net->ro._s_addr.sa, net->ro.ro_nh);
 #if defined(INET) || defined(INET6)
 			if (net->port) {
 				mtu -= sizeof(struct udphdr);
@@ -1513,16 +1521,14 @@ sctp_pathmtu_timer(struct sctp_inpcb *inp,
 }
 
 void
-sctp_autoclose_timer(struct sctp_inpcb *inp,
-    struct sctp_tcb *stcb,
-    struct sctp_nets *net)
+sctp_autoclose_timer(struct sctp_inpcb *inp, struct sctp_tcb *stcb)
 {
 	struct timeval tn, *tim_touse;
 	struct sctp_association *asoc;
-	int ticks_gone_by;
+	uint32_t ticks_gone_by;
 
 	(void)SCTP_GETTIME_TIMEVAL(&tn);
-	if (stcb->asoc.sctp_autoclose_ticks &&
+	if (stcb->asoc.sctp_autoclose_ticks > 0 &&
 	    sctp_is_feature_on(inp, SCTP_PCB_FLAGS_AUTOCLOSE)) {
 		/* Auto close is on */
 		asoc = &stcb->asoc;
@@ -1534,9 +1540,8 @@ sctp_autoclose_timer(struct sctp_inpcb *inp,
 			tim_touse = &asoc->time_last_sent;
 		}
 		/* Now has long enough transpired to autoclose? */
-		ticks_gone_by = SEC_TO_TICKS(tn.tv_sec - tim_touse->tv_sec);
-		if ((ticks_gone_by > 0) &&
-		    (ticks_gone_by >= (int)asoc->sctp_autoclose_ticks)) {
+		ticks_gone_by = sctp_secs_to_ticks((uint32_t)(tn.tv_sec - tim_touse->tv_sec));
+		if (ticks_gone_by >= asoc->sctp_autoclose_ticks) {
 			/*
 			 * autoclose time has hit, call the output routine,
 			 * which should do nothing just to be SURE we don't
@@ -1552,29 +1557,26 @@ sctp_autoclose_timer(struct sctp_inpcb *inp,
 				 * there is nothing queued to send, so I'm
 				 * done...
 				 */
-				if (SCTP_GET_STATE(asoc) != SCTP_STATE_SHUTDOWN_SENT) {
+				if (SCTP_GET_STATE(stcb) != SCTP_STATE_SHUTDOWN_SENT) {
 					/* only send SHUTDOWN 1st time thru */
-					struct sctp_nets *netp;
+					struct sctp_nets *net;
 
-					if ((SCTP_GET_STATE(asoc) == SCTP_STATE_OPEN) ||
-					    (SCTP_GET_STATE(asoc) == SCTP_STATE_SHUTDOWN_RECEIVED)) {
+					if ((SCTP_GET_STATE(stcb) == SCTP_STATE_OPEN) ||
+					    (SCTP_GET_STATE(stcb) == SCTP_STATE_SHUTDOWN_RECEIVED)) {
 						SCTP_STAT_DECR_GAUGE32(sctps_currestab);
 					}
-					SCTP_SET_STATE(asoc, SCTP_STATE_SHUTDOWN_SENT);
-					SCTP_CLEAR_SUBSTATE(asoc, SCTP_STATE_SHUTDOWN_PENDING);
+					SCTP_SET_STATE(stcb, SCTP_STATE_SHUTDOWN_SENT);
 					sctp_stop_timers_for_shutdown(stcb);
 					if (stcb->asoc.alternate) {
-						netp = stcb->asoc.alternate;
+						net = stcb->asoc.alternate;
 					} else {
-						netp = stcb->asoc.primary_destination;
+						net = stcb->asoc.primary_destination;
 					}
-					sctp_send_shutdown(stcb, netp);
+					sctp_send_shutdown(stcb, net);
 					sctp_timer_start(SCTP_TIMER_TYPE_SHUTDOWN,
-					    stcb->sctp_ep, stcb,
-					    netp);
+					    stcb->sctp_ep, stcb, net);
 					sctp_timer_start(SCTP_TIMER_TYPE_SHUTDOWNGUARD,
-					    stcb->sctp_ep, stcb,
-					    netp);
+					    stcb->sctp_ep, stcb, NULL);
 				}
 			}
 		} else {
@@ -1582,13 +1584,12 @@ sctp_autoclose_timer(struct sctp_inpcb *inp,
 			 * No auto close at this time, reset t-o to check
 			 * later
 			 */
-			int tmp;
+			uint32_t tmp;
 
 			/* fool the timer startup to use the time left */
 			tmp = asoc->sctp_autoclose_ticks;
 			asoc->sctp_autoclose_ticks -= ticks_gone_by;
-			sctp_timer_start(SCTP_TIMER_TYPE_AUTOCLOSE, inp, stcb,
-			    net);
+			sctp_timer_start(SCTP_TIMER_TYPE_AUTOCLOSE, inp, stcb, NULL);
 			/* restore the real tick value */
 			asoc->sctp_autoclose_ticks = tmp;
 		}

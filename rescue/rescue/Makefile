@@ -6,6 +6,7 @@
 PACKAGE=rescue
 MAN=
 MK_SSP=	no
+NO_SHARED=	yes
 
 PROG=	rescue
 BINDIR?=/rescue
@@ -54,7 +55,7 @@ CRUNCH_PROGS_bin= cat chflags chio chmod cp date dd df echo 	\
 	 ed expr getfacl hostname kenv kill ln ls mkdir mv	\
 	 pkill ps pwd realpath rm rmdir setfacl sh sleep stty	\
 	 sync test
-CRUNCH_LIBS+= -lcrypt -ledit -ljail -lkvm -lelf -ll -ltermcapw -lutil -lxo
+CRUNCH_LIBS+= -lcrypt -ledit -ljail -lkvm -lelf -ltermcapw -lutil -lxo
 CRUNCH_BUILDTOOLS+= bin/sh
 
 # Additional options for specific programs
@@ -116,6 +117,7 @@ CRUNCH_PROGS_sbin+= routed rtquery
 .endif
 
 .if ${MK_ZFS} != "no"
+CRUNCH_PROGS_sbin+= bectl
 CRUNCH_PROGS_sbin+= zfs
 CRUNCH_PROGS_sbin+= zpool
 CRUNCH_PROGS_usr.sbin+= zdb
@@ -127,6 +129,7 @@ CRUNCH_PROGS_usr.sbin+= zdb
 CRUNCH_LIBS+= -l80211 -lalias -lcam -lncursesw -ldevstat -lipsec -llzma
 .if ${MK_ZFS} != "no"
 CRUNCH_LIBS+= -lavl -lzpool -lzfs_core -lzfs -lnvpair -lpthread -luutil -lumem
+CRUNCH_LIBS+= -lbe
 .else
 # liblzma needs pthread
 CRUNCH_LIBS+= -lpthread
@@ -142,10 +145,6 @@ CRUNCH_PROGS_sbin+= bsdlabel sconfig fdisk
 CRUNCH_ALIAS_bsdlabel= disklabel
 #CRUNCH_PROGS+= mount_smbfs
 #CRUNCH_LIBS+= -lsmb
-.endif
-
-.if ${MACHINE_CPUARCH} == "sparc64"
-CRUNCH_PROGS_sbin+= bsdlabel sunlabel
 .endif
 
 .if ${MACHINE_CPUARCH} == "amd64"
@@ -169,7 +168,6 @@ CRUNCH_ALIAS_shutdown= poweroff
 
 # dhclient has historically been troublesome...
 CRUNCH_PROGS_sbin+= dhclient
-CRUNCH_BUILDOPTS_dhclient= -DRELEASE_CRUNCH -Dlint
 
 ##################################################################
 # Programs from stock /usr/bin
@@ -225,6 +223,9 @@ CRUNCH_PROGS_usr.sbin+= chown
 CRUNCH_ALIAS_chown= chgrp
 ##################################################################
 CRUNCH_LIBS+= -lm
+
+CRUNCH_LIBS+=		${OBJTOP}/lib/libifconfig/libifconfig.a
+CRUNCH_BUILDOPTS+=	CRUNCH_CFLAGS+=-I${OBJTOP}/lib/libifconfig
 
 .if ${MK_ISCSI} != "no"
 CRUNCH_PROGS_usr.bin+=	iscsictl

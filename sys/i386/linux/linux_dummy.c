@@ -29,8 +29,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
-
 #include <sys/param.h>
 #include <sys/kernel.h>
 #include <sys/sdt.h>
@@ -66,7 +64,6 @@ UNIMPLEMENTED(vserver);
 DUMMY(stime);
 DUMMY(fstat);
 DUMMY(olduname);
-DUMMY(syslog);
 DUMMY(uname);
 DUMMY(vhangup);
 DUMMY(vm86old);
@@ -78,7 +75,6 @@ DUMMY(quotactl);
 DUMMY(bdflush);
 DUMMY(sysfs);
 DUMMY(vm86);
-DUMMY(sendfile);		/* different semantics */
 DUMMY(setfsuid);
 DUMMY(setfsgid);
 DUMMY(pivot_root);
@@ -102,14 +98,10 @@ DUMMY(inotify_rm_watch);
 DUMMY(migrate_pages);
 DUMMY(unshare);
 /* Linux 2.6.17: */
-DUMMY(splice);
-DUMMY(sync_file_range);
 DUMMY(tee);
 DUMMY(vmsplice);
 /* Linux 2.6.18: */
 DUMMY(move_pages);
-/* Linux 2.6.19: */
-DUMMY(getcpu);
 /* Linux 2.6.22: */
 DUMMY(signalfd);
 /* Linux 2.6.27: */
@@ -117,7 +109,7 @@ DUMMY(signalfd4);
 DUMMY(inotify_init1);
 /* Linux 2.6.31: */
 DUMMY(perf_event_open);
-/* Linux 2.6.33: */
+/* Linux 2.6.36: */
 DUMMY(fanotify_init);
 DUMMY(fanotify_mark);
 /* Linux 2.6.39: */
@@ -135,11 +127,8 @@ DUMMY(kcmp);
 DUMMY(finit_module);
 DUMMY(sched_setattr);
 DUMMY(sched_getattr);
-/* Linux 3.14: */
-DUMMY(renameat2);
-/* Linux 3.15: */
+/* Linux 3.17: */
 DUMMY(seccomp);
-DUMMY(memfd_create);
 /* Linux 3.18: */
 DUMMY(bpf);
 /* Linux 3.19: */
@@ -150,8 +139,6 @@ DUMMY(userfaultfd);
 DUMMY(membarrier);
 /* Linux 4.4: */
 DUMMY(mlock2);
-/* Linux 4.5: */
-DUMMY(copy_file_range);
 /* Linux 4.6: */
 DUMMY(preadv2);
 DUMMY(pwritev2);
@@ -159,6 +146,37 @@ DUMMY(pwritev2);
 DUMMY(pkey_mprotect);
 DUMMY(pkey_alloc);
 DUMMY(pkey_free);
+/* Linux 4.11: */
+DUMMY(statx);
+DUMMY(arch_prctl);
+/* Linux 4.18: */
+DUMMY(io_pgetevents);
+DUMMY(rseq);
+/* Linux 5.0: */
+DUMMY(clock_gettime64);
+DUMMY(clock_settime64);
+DUMMY(clock_adjtime64);
+DUMMY(clock_getres_time64);
+DUMMY(clock_nanosleep_time64);
+DUMMY(timer_gettime64);
+DUMMY(timer_settime64);
+DUMMY(timerfd_gettime64);
+DUMMY(timerfd_settime64);
+DUMMY(utimensat_time64);
+DUMMY(pselect6_time64);
+DUMMY(ppoll_time64);
+DUMMY(io_pgetevents_time64);
+DUMMY(recvmmsg_time64);
+DUMMY(mq_timedsend_time64);
+DUMMY(mq_timedreceive_time64);
+DUMMY(semtimedop_time64);
+DUMMY(rt_sigtimedwait_time64);
+DUMMY(futex_time64);
+DUMMY(sched_rr_get_interval_time64);
+DUMMY(pidfd_send_signal);
+DUMMY(io_uring_setup);
+DUMMY(io_uring_enter);
+DUMMY(io_uring_register);
 
 #define DUMMY_XATTR(s)						\
 int								\
@@ -166,7 +184,7 @@ linux_ ## s ## xattr(						\
     struct thread *td, struct linux_ ## s ## xattr_args *arg)	\
 {								\
 								\
-	return (ENOATTR);					\
+	return (EOPNOTSUPP);					\
 }
 DUMMY_XATTR(set);
 DUMMY_XATTR(lset);

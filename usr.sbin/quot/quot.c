@@ -550,7 +550,7 @@ quot(char *name, char *mp)
 		close(fd);
 		return;
 	}
-	switch (sbget(fd, &fs, -1)) {
+	switch (sbget(fd, &fs, STDSB)) {
 	case 0:
 		break;
 	case ENOENT:
@@ -567,6 +567,9 @@ quot(char *name, char *mp)
 		printf(" (%s)",mp);
 	putchar('\n');
 	(*func)(fd, fs, name);
+	free(fs->fs_csp);
+	free(fs->fs_si);
+	free(fs);
 	close(fd);
 }
 

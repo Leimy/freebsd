@@ -314,7 +314,8 @@ ng_ether_attach(struct ifnet *ifp)
 	 * eiface nodes, which may be problematic due to naming
 	 * clashes.
 	 */
-	if ((node = ng_name2noderef(NULL, ifp->if_xname)) != NULL) {
+	ng_ether_sanitize_ifname(ifp->if_xname, name);
+	if ((node = ng_name2noderef(NULL, name)) != NULL) {
 		NG_NODE_UNREF(node);
 		return;
 	}
@@ -341,7 +342,6 @@ ng_ether_attach(struct ifnet *ifp)
 	priv->hwassist = ifp->if_hwassist;
 
 	/* Try to give the node the same name as the interface */
-	ng_ether_sanitize_ifname(ifp->if_xname, name);
 	if (ng_name_node(node, name) != 0)
 		log(LOG_WARNING, "%s: can't name node %s\n", __func__, name);
 }
@@ -578,6 +578,7 @@ ng_ether_rcvmsg(node_p node, item_p item, hook_p lasthook)
 		case NGM_ETHER_ADD_MULTI:
 		    {
 			struct sockaddr_dl sa_dl;
+			struct epoch_tracker et;
 			struct ifmultiaddr *ifma;
 
 			if (msg->header.arglen != ETHER_ADDR_LEN) {
@@ -597,10 +598,10 @@ ng_ether_rcvmsg(node_p node, item_p item, hook_p lasthook)
 			 * lose a race while we check if the membership
 			 * already exists.
 			 */
-			if_maddr_rlock(priv->ifp);
+			NET_EPOCH_ENTER(et);
 			ifma = if_findmulti(priv->ifp,
 			    (struct sockaddr *)&sa_dl);
-			if_maddr_runlock(priv->ifp);
+			NET_EPOCH_EXIT(et);
 			if (ifma != NULL) {
 				error = EADDRINUSE;
 			} else {
@@ -711,6 +712,7 @@ ng_ether_rcv_lower(hook_p hook, item_p item)
 static int
 ng_ether_rcv_upper(hook_p hook, item_p item)
 {
+	struct epoch_tracker et;
 	struct mbuf *m;
 	const node_p node = NG_HOOK_NODE(hook);
 	const priv_p priv = NG_NODE_PRIVATE(node);
@@ -738,7 +740,9 @@ ng_ether_rcv_upper(hook_p hook, item_p item)
 	}
 
 	/* Route packet back in */
+	NET_EPOCH_ENTER(et);
 	ether_demux(ifp, m);
+	NET_EPOCH_EXIT(et);
 	return (0);
 }
 
@@ -868,7 +872,7 @@ vnet_ng_ether_init(const void *unused)
 
 	/* Create nodes for any already-existing Ethernet interfaces. */
 	IFNET_RLOCK();
-	TAILQ_FOREACH(ifp, &V_ifnet, if_link) {
+	CK_STAILQ_FOREACH(ifp, &V_ifnet, if_link) {
 		if (ifp->if_type == IFT_ETHER
 		    || ifp->if_type == IFT_L2VLAN)
 			ng_ether_attach(ifp);

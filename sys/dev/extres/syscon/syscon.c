@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2017 Kyle Evans <kevans@FreeBSD.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -236,10 +235,10 @@ syscon_get_by_ofw_property(device_t cdev, phandle_t cnode, char *name,
 		    "%s called on not ofw based device\n", __func__);
 		return (ENXIO);
 	}
-	ncells = OF_getencprop_alloc(cnode, name, sizeof(pcell_t),
+	ncells = OF_getencprop_alloc_multi(cnode, name, sizeof(pcell_t),
 	    (void **)&cells);
 	if (ncells < 1)
-		return (ENXIO);
+		return (ENOENT);
 
 	/* Translate to syscon node. */
 	SYSCON_TOPO_SLOCK();
@@ -255,3 +254,14 @@ syscon_get_by_ofw_property(device_t cdev, phandle_t cnode, char *name,
 	return (0);
 }
 #endif
+
+int
+syscon_get_handle_default(device_t dev, struct syscon **syscon)
+{
+	device_t parent;
+
+	parent = device_get_parent(dev);
+	if (parent == NULL)
+		return (ENODEV);
+	return (SYSCON_GET_HANDLE(parent, syscon));
+}

@@ -38,6 +38,9 @@
 
 #include "input-event-codes.h"
 
+#define	input_event_sec		time.tv_sec
+#define	input_event_usec	time.tv_usec
+
 struct input_event {
 	struct timeval	time;
 	uint16_t	type;
@@ -138,14 +141,18 @@ struct input_keymap_entry {
 #define	BUS_GSC			0x1A
 #define	BUS_ATARI		0x1B
 #define	BUS_SPI			0x1C
+#define	BUS_RMI			0x1D
+#define	BUS_CEC			0x1E
+#define	BUS_INTEL_ISHTP		0x1F
 
 /*
  * MT_TOOL types
  */
-#define	MT_TOOL_FINGER		0
-#define	MT_TOOL_PEN		1
-#define	MT_TOOL_PALM		2
-#define	MT_TOOL_MAX		2
+#define	MT_TOOL_FINGER		0x00
+#define	MT_TOOL_PEN		0x01
+#define	MT_TOOL_PALM		0x02
+#define	MT_TOOL_DIAL		0x0a
+#define	MT_TOOL_MAX		0x0f
 
 /*
  * Values describing the status of a force-feedback effect

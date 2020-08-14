@@ -133,7 +133,7 @@ uboot_loadaddr(u_int type, void *data, uint64_t addr)
 			}
 		}
 		if (biggest_size == 0)
-			panic("Not enough DRAM to load kernel\n");
+			panic("Not enough DRAM to load kernel");
 #if 0
 		printf("Loading kernel into region 0x%08jx-0x%08jx (%ju MiB)\n",
 		    (uintmax_t)biggest_block, 
@@ -160,7 +160,7 @@ uboot_copyout(const vm_offset_t src, void *dest, const size_t len)
 }
 
 ssize_t
-uboot_readin(const int fd, vm_offset_t dest, const size_t len)
+uboot_readin(readin_handle_t fd, vm_offset_t dest, const size_t len)
 {
-	return (read(fd, (void *)dest, len));
+	return (VECTX_READ(fd, (void *)dest, len));
 }

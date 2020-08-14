@@ -112,10 +112,10 @@ __FBSDID("$FreeBSD$");
 #define TCP_HOSTCACHE_EXPIRE		60*60	/* one hour */
 #define TCP_HOSTCACHE_PRUNE		5*60	/* every 5 minutes */
 
-static VNET_DEFINE(struct tcp_hostcache, tcp_hostcache);
+VNET_DEFINE_STATIC(struct tcp_hostcache, tcp_hostcache);
 #define	V_tcp_hostcache		VNET(tcp_hostcache)
 
-static VNET_DEFINE(struct callout, tcp_hc_callout);
+VNET_DEFINE_STATIC(struct callout, tcp_hc_callout);
 #define	V_tcp_hc_callout	VNET(tcp_hc_callout)
 
 static struct hc_metrics *tcp_hc_lookup(struct in_conninfo *);
@@ -125,7 +125,8 @@ static int sysctl_tcp_hc_purgenow(SYSCTL_HANDLER_ARGS);
 static void tcp_hc_purge_internal(int);
 static void tcp_hc_purge(void *);
 
-static SYSCTL_NODE(_net_inet_tcp, OID_AUTO, hostcache, CTLFLAG_RW, 0,
+static SYSCTL_NODE(_net_inet_tcp, OID_AUTO, hostcache,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "TCP Host cache");
 
 VNET_DEFINE(int, tcp_use_hostcache) = 1;
@@ -163,12 +164,14 @@ SYSCTL_INT(_net_inet_tcp_hostcache, OID_AUTO, purge, CTLFLAG_VNET | CTLFLAG_RW,
     "Expire all entires on next purge run");
 
 SYSCTL_PROC(_net_inet_tcp_hostcache, OID_AUTO, list,
-    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_SKIP, 0, 0,
-    sysctl_tcp_hc_list, "A", "List of all hostcache entries");
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_SKIP | CTLFLAG_MPSAFE,
+    0, 0, sysctl_tcp_hc_list, "A",
+    "List of all hostcache entries");
 
 SYSCTL_PROC(_net_inet_tcp_hostcache, OID_AUTO, purgenow,
-    CTLTYPE_INT | CTLFLAG_RW, NULL, 0,
-    sysctl_tcp_hc_purgenow, "I", "Immediately purge all entries");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+    NULL, 0, sysctl_tcp_hc_purgenow, "I",
+    "Immediately purge all entries");
 
 static MALLOC_DEFINE(M_HOSTCACHE, "hostcache", "TCP hostcache");
 
@@ -437,8 +440,10 @@ tcp_hc_get(struct in_conninfo *inc, struct hc_metrics_lite *hc_metrics_lite)
 {
 	struct hc_metrics *hc_entry;
 
-	if (!V_tcp_use_hostcache)
+	if (!V_tcp_use_hostcache) {
+		bzero(hc_metrics_lite, sizeof(*hc_metrics_lite));
 		return;
+	}
 
 	/*
 	 * Find the right bucket.

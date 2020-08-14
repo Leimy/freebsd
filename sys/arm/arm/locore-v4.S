@@ -33,7 +33,7 @@
  *
  */
 
-#include "assym.s"
+#include "assym.inc"
 #include <sys/syscall.h>
 #include <machine/asm.h>
 #include <machine/armreg.h>
@@ -62,9 +62,11 @@ __FBSDID("$FreeBSD$");
  */
 	.text
 	.align	2
+
+	.globl kernbase
+	.set kernbase,KERNVIRTADDR
+
 #ifdef PHYSADDR
-.globl kernbase
-.set kernbase,KERNBASE
 .globl physaddr
 .set physaddr,PHYSADDR
 #endif

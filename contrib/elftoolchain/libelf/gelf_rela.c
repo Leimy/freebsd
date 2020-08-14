@@ -31,7 +31,7 @@
 
 #include "_libelf.h"
 
-ELFTC_VCSID("$Id: gelf_rela.c 3177 2015-03-30 18:19:41Z emaste $");
+ELFTC_VCSID("$Id: gelf_rela.c 3739 2019-05-06 05:18:15Z jkoshy $");
 
 GElf_Rela *
 gelf_getrela(Elf_Data *ed, int ndx, GElf_Rela *dst)
@@ -67,9 +67,9 @@ gelf_getrela(Elf_Data *ed, int ndx, GElf_Rela *dst)
 		return (NULL);
 	}
 
-	msz = _libelf_msize(ELF_T_RELA, ec, e->e_version);
+	if ((msz = _libelf_msize(ELF_T_RELA, ec, e->e_version)) == 0)
+		return (NULL);
 
-	assert(msz > 0);
 	assert(ndx >= 0);
 
 	if (msz * (size_t) ndx >= d->d_data.d_size) {
@@ -91,6 +91,10 @@ gelf_getrela(Elf_Data *ed, int ndx, GElf_Rela *dst)
 		rela64 = (Elf64_Rela *) d->d_data.d_buf + ndx;
 
 		*dst = *rela64;
+
+		if (_libelf_is_mips64el(e))
+			dst->r_info =
+			    _libelf_mips64el_r_info_tom(rela64->r_info);
 	}
 
 	return (dst);
@@ -130,9 +134,9 @@ gelf_update_rela(Elf_Data *ed, int ndx, GElf_Rela *dr)
 		return (0);
 	}
 
-	msz = _libelf_msize(ELF_T_RELA, ec, e->e_version);
+	if ((msz = _libelf_msize(ELF_T_RELA, ec, e->e_version)) == 0)
+		return (0);
 
-	assert(msz > 0);
 	assert(ndx >= 0);
 
 	if (msz * (size_t) ndx >= d->d_data.d_size) {
@@ -145,7 +149,7 @@ gelf_update_rela(Elf_Data *ed, int ndx, GElf_Rela *dr)
 
 		LIBELF_COPY_U32(rela32, dr, r_offset);
 
-		if (ELF64_R_SYM(dr->r_info) > ELF32_R_SYM(~0UL) ||
+		if (ELF64_R_SYM(dr->r_info) > ELF32_R_SYM(~0U) ||
 		    ELF64_R_TYPE(dr->r_info) > ELF32_R_TYPE(~0U)) {
 			LIBELF_SET_ERROR(RANGE, 0);
 			return (0);
@@ -159,6 +163,9 @@ gelf_update_rela(Elf_Data *ed, int ndx, GElf_Rela *dr)
 		rela64 = (Elf64_Rela *) d->d_data.d_buf + ndx;
 
 		*rela64 = *dr;
+
+		if (_libelf_is_mips64el(e))
+			rela64->r_info = _libelf_mips64el_r_info_tof(dr->r_info);
 	}
 
 	return (1);

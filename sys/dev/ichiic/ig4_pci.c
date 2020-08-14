@@ -66,6 +66,13 @@ __FBSDID("$FreeBSD$");
 
 static int ig4iic_pci_detach(device_t dev);
 
+#define PCI_CHIP_BAYTRAIL_I2C_1 	0x0f418086
+#define PCI_CHIP_BAYTRAIL_I2C_2 	0x0f428086
+#define PCI_CHIP_BAYTRAIL_I2C_3 	0x0f438086
+#define PCI_CHIP_BAYTRAIL_I2C_4 	0x0f448086
+#define PCI_CHIP_BAYTRAIL_I2C_5 	0x0f458086
+#define PCI_CHIP_BAYTRAIL_I2C_6 	0x0f468086
+#define PCI_CHIP_BAYTRAIL_I2C_7 	0x0f478086
 #define PCI_CHIP_LYNXPT_LP_I2C_1	0x9c618086
 #define PCI_CHIP_LYNXPT_LP_I2C_2	0x9c628086
 #define PCI_CHIP_BRASWELL_I2C_1 	0x22c18086
@@ -80,73 +87,93 @@ static int ig4iic_pci_detach(device_t dev);
 #define PCI_CHIP_SKYLAKE_I2C_3		0x9d638086
 #define PCI_CHIP_SKYLAKE_I2C_4		0x9d648086
 #define PCI_CHIP_SKYLAKE_I2C_5		0x9d658086
+#define PCI_CHIP_KABYLAKE_I2C_0		0xa1608086
+#define PCI_CHIP_KABYLAKE_I2C_1		0xa1618086
+#define PCI_CHIP_APL_I2C_0		0x5aac8086
+#define PCI_CHIP_APL_I2C_1		0x5aae8086
+#define PCI_CHIP_APL_I2C_2		0x5ab08086
+#define PCI_CHIP_APL_I2C_3		0x5ab28086
+#define PCI_CHIP_APL_I2C_4		0x5ab48086
+#define PCI_CHIP_APL_I2C_5		0x5ab68086
+#define PCI_CHIP_APL_I2C_6		0x5ab88086
+#define PCI_CHIP_APL_I2C_7		0x5aba8086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_0	0x9dc58086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_1	0x9dc68086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_2	0x9de88086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_3	0x9de98086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_4	0x9dea8086
+#define PCI_CHIP_CANNONLAKE_LP_I2C_5	0x9deb8086
+#define PCI_CHIP_CANNONLAKE_H_I2C_0	0xa3688086
+#define PCI_CHIP_CANNONLAKE_H_I2C_1	0xa3698086
+#define PCI_CHIP_CANNONLAKE_H_I2C_2	0xa36a8086
+#define PCI_CHIP_CANNONLAKE_H_I2C_3	0xa36b8086
+
+struct ig4iic_pci_device {
+	uint32_t	devid;
+	const char	*desc;
+	enum ig4_vers	version;
+};
+
+static struct ig4iic_pci_device ig4iic_pci_devices[] = {
+	{ PCI_CHIP_BAYTRAIL_I2C_1, "Intel BayTrail Serial I/O I2C Port 1", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_2, "Intel BayTrail Serial I/O I2C Port 2", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_3, "Intel BayTrail Serial I/O I2C Port 3", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_4, "Intel BayTrail Serial I/O I2C Port 4", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_5, "Intel BayTrail Serial I/O I2C Port 5", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_6, "Intel BayTrail Serial I/O I2C Port 6", IG4_ATOM},
+	{ PCI_CHIP_BAYTRAIL_I2C_7, "Intel BayTrail Serial I/O I2C Port 7", IG4_ATOM},
+	{ PCI_CHIP_LYNXPT_LP_I2C_1, "Intel Lynx Point-LP I2C Controller-1", IG4_HASWELL},
+	{ PCI_CHIP_LYNXPT_LP_I2C_2, "Intel Lynx Point-LP I2C Controller-2", IG4_HASWELL},
+	{ PCI_CHIP_BRASWELL_I2C_1, "Intel Braswell Serial I/O I2C Port 1", IG4_ATOM},
+	{ PCI_CHIP_BRASWELL_I2C_2, "Intel Braswell Serial I/O I2C Port 2", IG4_ATOM},
+	{ PCI_CHIP_BRASWELL_I2C_3, "Intel Braswell Serial I/O I2C Port 3", IG4_ATOM},
+	{ PCI_CHIP_BRASWELL_I2C_5, "Intel Braswell Serial I/O I2C Port 5", IG4_ATOM},
+	{ PCI_CHIP_BRASWELL_I2C_6, "Intel Braswell Serial I/O I2C Port 6", IG4_ATOM},
+	{ PCI_CHIP_BRASWELL_I2C_7, "Intel Braswell Serial I/O I2C Port 7", IG4_ATOM},
+	{ PCI_CHIP_SKYLAKE_I2C_0, "Intel Sunrise Point-LP I2C Controller-0", IG4_SKYLAKE},
+	{ PCI_CHIP_SKYLAKE_I2C_1, "Intel Sunrise Point-LP I2C Controller-1", IG4_SKYLAKE},
+	{ PCI_CHIP_SKYLAKE_I2C_2, "Intel Sunrise Point-LP I2C Controller-2", IG4_SKYLAKE},
+	{ PCI_CHIP_SKYLAKE_I2C_3, "Intel Sunrise Point-LP I2C Controller-3", IG4_SKYLAKE},
+	{ PCI_CHIP_SKYLAKE_I2C_4, "Intel Sunrise Point-LP I2C Controller-4", IG4_SKYLAKE},
+	{ PCI_CHIP_SKYLAKE_I2C_5, "Intel Sunrise Point-LP I2C Controller-5", IG4_SKYLAKE},
+	{ PCI_CHIP_KABYLAKE_I2C_0, "Intel Sunrise Point-H I2C Controller-0", IG4_SKYLAKE},
+	{ PCI_CHIP_KABYLAKE_I2C_1, "Intel Sunrise Point-H I2C Controller-1", IG4_SKYLAKE},
+	{ PCI_CHIP_APL_I2C_0, "Intel Apollo Lake I2C Controller-0", IG4_APL},
+	{ PCI_CHIP_APL_I2C_1, "Intel Apollo Lake I2C Controller-1", IG4_APL},
+	{ PCI_CHIP_APL_I2C_2, "Intel Apollo Lake I2C Controller-2", IG4_APL},
+	{ PCI_CHIP_APL_I2C_3, "Intel Apollo Lake I2C Controller-3", IG4_APL},
+	{ PCI_CHIP_APL_I2C_4, "Intel Apollo Lake I2C Controller-4", IG4_APL},
+	{ PCI_CHIP_APL_I2C_5, "Intel Apollo Lake I2C Controller-5", IG4_APL},
+	{ PCI_CHIP_APL_I2C_6, "Intel Apollo Lake I2C Controller-6", IG4_APL},
+	{ PCI_CHIP_APL_I2C_7, "Intel Apollo Lake I2C Controller-7", IG4_APL},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_0, "Intel Cannon Lake-LP I2C Controller-0", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_1, "Intel Cannon Lake-LP I2C Controller-1", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_2, "Intel Cannon Lake-LP I2C Controller-2", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_3, "Intel Cannon Lake-LP I2C Controller-3", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_4, "Intel Cannon Lake-LP I2C Controller-4", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_LP_I2C_5, "Intel Cannon Lake-LP I2C Controller-5", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_H_I2C_0, "Intel Cannon Lake-H I2C Controller-0", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_H_I2C_1, "Intel Cannon Lake-H I2C Controller-1", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_H_I2C_2, "Intel Cannon Lake-H I2C Controller-2", IG4_CANNONLAKE},
+	{ PCI_CHIP_CANNONLAKE_H_I2C_3, "Intel Cannon Lake-H I2C Controller-3", IG4_CANNONLAKE},
+};
 
 static int
 ig4iic_pci_probe(device_t dev)
 {
 	ig4iic_softc_t *sc = device_get_softc(dev);
+	uint32_t devid;
+	int i;
 
-	switch(pci_get_devid(dev)) {
-	case PCI_CHIP_LYNXPT_LP_I2C_1:
-		device_set_desc(dev, "Intel Lynx Point-LP I2C Controller-1");
-		sc->version = IG4_HASWELL;
-		break;
-	case PCI_CHIP_LYNXPT_LP_I2C_2:
-		device_set_desc(dev, "Intel Lynx Point-LP I2C Controller-2");
-		sc->version = IG4_HASWELL;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_1:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 1");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_2:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 2");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_3:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 3");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_5:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 5");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_6:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 6");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_BRASWELL_I2C_7:
-		device_set_desc(dev, "Intel Braswell Serial I/O I2C Port 7");
-		sc->version = IG4_ATOM;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_0:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-0");
-		sc->version = IG4_SKYLAKE;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_1:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-1");
-		sc->version = IG4_SKYLAKE;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_2:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-2");
-		sc->version = IG4_SKYLAKE;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_3:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-3");
-		sc->version = IG4_SKYLAKE;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_4:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-4");
-		sc->version = IG4_SKYLAKE;
-		break;
-	case PCI_CHIP_SKYLAKE_I2C_5:
-		device_set_desc(dev, "Intel Sunrise Point-LP I2C Controller-5");
-		sc->version = IG4_SKYLAKE;
-		break;
-	default:
-		return (ENXIO);
+	devid = pci_get_devid(dev);
+	for (i = 0; i < nitems(ig4iic_pci_devices); i++) {
+		if (ig4iic_pci_devices[i].devid == devid) {
+			device_set_desc(dev, ig4iic_pci_devices[i].desc);
+			sc->version = ig4iic_pci_devices[i].version;
+			return (BUS_PROBE_DEFAULT);
+		}
 	}
-	return (BUS_PROBE_DEFAULT);
+	return (ENXIO);
 }
 
 static int
@@ -213,29 +240,55 @@ ig4iic_pci_detach(device_t dev)
 	return (0);
 }
 
+static int
+ig4iic_pci_suspend(device_t dev)
+{
+	ig4iic_softc_t *sc = device_get_softc(dev);
+
+	return (ig4iic_suspend(sc));
+}
+
+static int
+ig4iic_pci_resume(device_t dev)
+{
+	ig4iic_softc_t *sc  = device_get_softc(dev);
+
+	return (ig4iic_resume(sc));
+}
+
 static device_method_t ig4iic_pci_methods[] = {
 	/* Device interface */
 	DEVMETHOD(device_probe, ig4iic_pci_probe),
 	DEVMETHOD(device_attach, ig4iic_pci_attach),
 	DEVMETHOD(device_detach, ig4iic_pci_detach),
+	DEVMETHOD(device_suspend, ig4iic_pci_suspend),
+	DEVMETHOD(device_resume, ig4iic_pci_resume),
 
+	/* Bus interface */
+	DEVMETHOD(bus_setup_intr, bus_generic_setup_intr),
+	DEVMETHOD(bus_teardown_intr, bus_generic_teardown_intr),
+	DEVMETHOD(bus_alloc_resource, bus_generic_alloc_resource),
+	DEVMETHOD(bus_release_resource, bus_generic_release_resource),
+	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
+	DEVMETHOD(bus_adjust_resource, bus_generic_adjust_resource),
+
+	/* iicbus interface */
 	DEVMETHOD(iicbus_transfer, ig4iic_transfer),
 	DEVMETHOD(iicbus_reset, ig4iic_reset),
-	DEVMETHOD(iicbus_callback, iicbus_null_callback),
+	DEVMETHOD(iicbus_callback, ig4iic_callback),
 
 	DEVMETHOD_END
 };
 
 static driver_t ig4iic_pci_driver = {
-	"ig4iic_pci",
+	"ig4iic",
 	ig4iic_pci_methods,
 	sizeof(struct ig4iic_softc)
 };
 
-static devclass_t ig4iic_pci_devclass;
-
-DRIVER_MODULE_ORDERED(ig4iic_pci, pci, ig4iic_pci_driver, ig4iic_pci_devclass, 0, 0,
+DRIVER_MODULE_ORDERED(ig4iic, pci, ig4iic_pci_driver, ig4iic_devclass, 0, 0,
     SI_ORDER_ANY);
-MODULE_DEPEND(ig4iic_pci, pci, 1, 1, 1);
-MODULE_DEPEND(ig4iic_pci, iicbus, IICBUS_MINVER, IICBUS_PREFVER, IICBUS_MAXVER);
-MODULE_VERSION(ig4iic_pci, 1);
+MODULE_DEPEND(ig4iic, pci, 1, 1, 1);
+MODULE_PNP_INFO("W32:vendor/device", pci, ig4iic, ig4iic_pci_devices,
+    nitems(ig4iic_pci_devices));

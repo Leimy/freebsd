@@ -30,7 +30,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_kbd.h"
 #include "opt_atkbd.h"
 #include "opt_evdev.h"
@@ -75,7 +74,6 @@ typedef struct atkbd_state {
 } atkbd_state_t;
 
 static void		atkbd_timeout(void *arg);
-static void		atkbd_shutdown_final(void *v);
 static int		atkbd_reset(KBDC kbdc, int flags, int c);
 
 #define HAS_QUIRK(p, q)		(((atkbdc_softc_t *)(p))->quirks & q)
@@ -151,9 +149,6 @@ atkbd_attach_unit(device_t dev, keyboard_t **kbd, int irq, int flags)
 
 	if (bootverbose)
 		(*sw->diag)(*kbd, bootverbose);
-
-	EVENTHANDLER_REGISTER(shutdown_final, atkbd_shutdown_final, *kbd,
-	    SHUTDOWN_PRI_DEFAULT);
 
 	return 0;
 }
@@ -232,25 +227,23 @@ static kbd_set_state_t	atkbd_set_state;
 static kbd_poll_mode_t	atkbd_poll;
 
 static keyboard_switch_t atkbdsw = {
-	atkbd_probe,
-	atkbd_init,
-	atkbd_term,
-	atkbd_intr,
-	atkbd_test_if,
-	atkbd_enable,
-	atkbd_disable,
-	atkbd_read,
-	atkbd_check,
-	atkbd_read_char,
-	atkbd_check_char,
-	atkbd_ioctl,
-	atkbd_lock,
-	atkbd_clear_state,
-	atkbd_get_state,
-	atkbd_set_state,
-	genkbd_get_fkeystr,
-	atkbd_poll,
-	genkbd_diag,
+	.probe =	atkbd_probe,
+	.init =		atkbd_init,
+	.term =		atkbd_term,
+	.intr =		atkbd_intr,
+	.test_if =	atkbd_test_if,
+	.enable =	atkbd_enable,
+	.disable =	atkbd_disable,
+	.read =		atkbd_read,
+	.check =	atkbd_check,
+	.read_char =	atkbd_read_char,
+	.check_char =	atkbd_check_char,
+	.ioctl =	atkbd_ioctl,
+	.lock =		atkbd_lock,
+	.clear_state =	atkbd_clear_state,
+	.get_state =	atkbd_get_state,
+	.set_state =	atkbd_set_state,
+	.poll =		atkbd_poll,
 };
 
 KEYBOARD_DRIVER(atkbd, atkbdsw, atkbd_configure);
@@ -268,8 +261,10 @@ static int		typematic_delay(int delay);
 static int		typematic_rate(int rate);
 
 #ifdef EVDEV_SUPPORT
+static evdev_event_t atkbd_ev_event;
+
 static const struct evdev_methods atkbd_evdev_methods = {
-	.ev_event = evdev_ev_kbd_event,
+	.ev_event = atkbd_ev_event,
 };
 #endif
 
@@ -483,7 +478,7 @@ atkbd_init(int unit, keyboard_t **kbdp, void *arg, int flags)
 			evdev_support_led(evdev, LED_CAPSL);
 			evdev_support_led(evdev, LED_SCROLLL);
 
-			if (evdev_register(evdev))
+			if (evdev_register_mtx(evdev, &Giant))
 				evdev_free(evdev);
 			else
 				state->ks_evdev = evdev;
@@ -1149,30 +1144,6 @@ atkbd_poll(keyboard_t *kbd, int on)
 	return 0;
 }
 
-static void
-atkbd_shutdown_final(void *v)
-{
-#ifdef __sparc64__
-	keyboard_t *kbd = v;
-	KBDC kbdc = ((atkbd_state_t *)kbd->kb_data)->kbdc;
-
-	/*
-	 * Turn off the translation in preparation for handing the keyboard
-	 * over to the OFW as the OBP driver doesn't use translation and
-	 * also doesn't disable it itself resulting in a broken keymap at
-	 * the boot prompt. Also disable the aux port and the interrupts as
-	 * the OBP driver doesn't use them, i.e. polls the keyboard. Not
-	 * disabling the interrupts doesn't cause real problems but the
-	 * responsiveness is a bit better when they are turned off.
-	 */
-	send_kbd_command(kbdc, KBDC_DISABLE_KBD);
-	set_controller_command_byte(kbdc,
-	    KBD_AUX_CONTROL_BITS | KBD_KBD_CONTROL_BITS | KBD_TRANSLATION,
-	    KBD_DISABLE_AUX_PORT | KBD_DISABLE_KBD_INT | KBD_ENABLE_KBD_PORT);
-	send_kbd_command(kbdc, KBDC_ENABLE_KBD);
-#endif
-}
-
 static int
 atkbd_reset(KBDC kbdc, int flags, int c)
 {
@@ -1205,6 +1176,22 @@ atkbd_reset(KBDC kbdc, int flags, int c)
 	}
 	return (0);
 }
+
+#ifdef EVDEV_SUPPORT
+static void
+atkbd_ev_event(struct evdev_dev *evdev, uint16_t type, uint16_t code,
+    int32_t value)
+{
+	keyboard_t *kbd = evdev_get_softc(evdev);
+
+	if (evdev_rcpt_mask & EVDEV_RCPT_HW_KBD &&
+	    (type == EV_LED || type == EV_REP)) {
+		mtx_lock(&Giant);
+		kbd_ev_event(kbd, type, code, value);
+		mtx_unlock(&Giant);
+	}
+}
+#endif
 
 /* local functions */
 
@@ -1452,14 +1439,6 @@ init_keyboard(KBDC kbdc, int *type, int flags)
 			return EIO;
 		}
 	}
-
-#if defined(__sparc64__)
-	if (send_kbd_command_and_data(
-		kbdc, KBDC_SET_SCANCODE_SET, 2) != KBD_ACK) {
-		printf("atkbd: can't set translation.\n");
-	}
-	c |= KBD_TRANSLATION;
-#endif
 
 	/*
 	 * Some keyboards require a SETLEDS command to be sent after

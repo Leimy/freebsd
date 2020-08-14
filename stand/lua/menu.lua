@@ -2,7 +2,7 @@
 -- SPDX-License-Identifier: BSD-2-Clause-FreeBSD
 --
 -- Copyright (c) 2015 Pedro Souza <pedrosouza@freebsd.org>
--- Copyright (C) 2018 Kyle Evans <kevans@FreeBSD.org>
+-- Copyright (c) 2018 Kyle Evans <kevans@FreeBSD.org>
 -- All rights reserved.
 --
 -- Redistribution and use in source and binary forms, with or without
@@ -29,7 +29,7 @@
 -- $FreeBSD$
 --
 
-
+local cli = require("cli")
 local core = require("core")
 local color = require("color")
 local config = require("config")
@@ -46,11 +46,11 @@ local return_menu_entry = {
 
 local function OnOff(str, value)
 	if value then
-		return str .. color.escapef(color.GREEN) .. "On" ..
-		    color.escapef(color.WHITE)
+		return str .. color.escapefg(color.GREEN) .. "On" ..
+		    color.resetfg()
 	else
-		return str .. color.escapef(color.RED) .. "off" ..
-		    color.escapef(color.WHITE)
+		return str .. color.escapefg(color.RED) .. "off" ..
+		    color.resetfg()
 	end
 end
 
@@ -115,12 +115,12 @@ menu.boot_environments = {
 				local bootenv_name = ""
 				local name_color
 				if is_default then
-					name_color = color.escapef(color.GREEN)
+					name_color = color.escapefg(color.GREEN)
 				else
-					name_color = color.escapef(color.BLUE)
+					name_color = color.escapefg(color.BLUE)
 				end
 				bootenv_name = bootenv_name .. name_color ..
-				    choice .. color.default()
+				    choice .. color.resetfg()
 				return color.highlight("A").."ctive: " ..
 				    bootenv_name .. " (" .. idx .. " of " ..
 				    #all_choices .. ")"
@@ -212,30 +212,50 @@ menu.boot_options = {
 menu.welcome = {
 	entries = function()
 		local menu_entries = menu.welcome.all_entries
-		-- Swap the first two menu items on single user boot
+		local multi_user = menu_entries.multi_user
+		local single_user = menu_entries.single_user
+		local boot_entry_1, boot_entry_2
 		if core.isSingleUserBoot() then
-			-- We'll cache the swapped menu, for performance
-			if menu.welcome.swapped_menu ~= nil then
-				return menu.welcome.swapped_menu
+			-- Swap the first two menu items on single user boot.
+			-- We'll cache the alternate entries for performance.
+			local alts = menu_entries.alts
+			if alts == nil then
+				single_user = core.deepCopyTable(single_user)
+				multi_user = core.deepCopyTable(multi_user)
+				single_user.name = single_user.alternate_name
+				multi_user.name = multi_user.alternate_name
+				menu_entries.alts = {
+					single_user = single_user,
+					multi_user = multi_user,
+				}
+			else
+				single_user = alts.single_user 
+				multi_user = alts.multi_user
 			end
-			-- Shallow copy the table
-			menu_entries = core.deepCopyTable(menu_entries)
-
-			-- Swap the first two menu entries
-			menu_entries[1], menu_entries[2] =
-			    menu_entries[2], menu_entries[1]
-
-			-- Then set their names to their alternate names
-			menu_entries[1].name, menu_entries[2].name =
-			    menu_entries[1].alternate_name,
-			    menu_entries[2].alternate_name
-			menu.welcome.swapped_menu = menu_entries
+			boot_entry_1, boot_entry_2 = single_user, multi_user
+		else
+			boot_entry_1, boot_entry_2 = multi_user, single_user
 		end
-		return menu_entries
+		return {
+			boot_entry_1,
+			boot_entry_2,
+			menu_entries.prompt,
+			menu_entries.reboot,
+			{
+				entry_type = core.MENU_SEPARATOR,
+			},
+			{
+				entry_type = core.MENU_SEPARATOR,
+				name = "Options:",
+			},
+			menu_entries.kernel_options,
+			menu_entries.boot_options,
+			menu_entries.boot_envs,
+			menu_entries.chainload,
+		}
 	end,
 	all_entries = {
-		-- boot multi user
-		{
+		multi_user = {
 			entry_type = core.MENU_ENTRY,
 			name = color.highlight("B") .. "oot Multi user " ..
 			    color.highlight("[Enter]"),
@@ -248,8 +268,7 @@ menu.welcome = {
 			end,
 			alias = {"b", "B"},
 		},
-		-- boot single user
-		{
+		single_user = {
 			entry_type = core.MENU_ENTRY,
 			name = "Boot " .. color.highlight("S") .. "ingle user",
 			-- Not a standard menu entry function!
@@ -261,8 +280,7 @@ menu.welcome = {
 			end,
 			alias = {"s", "S"},
 		},
-		-- escape to interpreter
-		{
+		prompt = {
 			entry_type = core.MENU_RETURN,
 			name = color.highlight("Esc") .. "ape to loader prompt",
 			func = function()
@@ -270,8 +288,7 @@ menu.welcome = {
 			end,
 			alias = {core.KEYSTR_ESCAPE},
 		},
-		-- reboot
-		{
+		reboot = {
 			entry_type = core.MENU_ENTRY,
 			name = color.highlight("R") .. "eboot",
 			func = function()
@@ -279,15 +296,7 @@ menu.welcome = {
 			end,
 			alias = {"r", "R"},
 		},
-		{
-			entry_type = core.MENU_SEPARATOR,
-		},
-		{
-			entry_type = core.MENU_SEPARATOR,
-			name = "Options:",
-		},
-		-- kernel options
-		{
+		kernel_options = {
 			entry_type = core.MENU_CAROUSEL_ENTRY,
 			carousel_id = "kernel",
 			items = core.kernelList,
@@ -300,31 +309,32 @@ menu.welcome = {
 				local kernel_name = ""
 				local name_color
 				if is_default then
-					name_color = color.escapef(color.GREEN)
+					name_color = color.escapefg(color.GREEN)
 					kernel_name = "default/"
 				else
-					name_color = color.escapef(color.BLUE)
+					name_color = color.escapefg(color.BLUE)
 				end
 				kernel_name = kernel_name .. name_color ..
-				    choice .. color.default()
+				    choice .. color.resetfg()
 				return color.highlight("K") .. "ernel: " ..
 				    kernel_name .. " (" .. idx .. " of " ..
 				    #all_choices .. ")"
 			end,
 			func = function(_, choice, _)
+				if loader.getenv("kernelname") ~= nil then
+					loader.perform("unload")
+				end
 				config.selectKernel(choice)
 			end,
 			alias = {"k", "K"},
 		},
-		-- boot options
-		{
+		boot_options = {
 			entry_type = core.MENU_SUBMENU,
 			name = "Boot " .. color.highlight("O") .. "ptions",
 			submenu = menu.boot_options,
 			alias = {"o", "O"},
 		},
-		-- boot environments
-		{
+		boot_envs = {
 			entry_type = core.MENU_SUBMENU,
 			visible = function()
 				return core.isZFSBoot() and
@@ -333,6 +343,21 @@ menu.welcome = {
 			name = "Boot " .. color.highlight("E") .. "nvironments",
 			submenu = menu.boot_environments,
 			alias = {"e", "E"},
+		},
+		chainload = {
+			entry_type = core.MENU_ENTRY,
+			name = function()
+				return 'Chain' .. color.highlight("L") ..
+				    "oad " .. loader.getenv('chain_disk')
+			end,
+			func = function()
+				loader.perform("chain " ..
+				    loader.getenv('chain_disk'))
+			end,
+			visible = function()
+				return loader.getenv('chain_disk') ~= nil
+			end,
+			alias = {"l", "L"},
 		},
 	},
 }
@@ -370,7 +395,9 @@ function menu.process(menudef, keypress)
 			break
 		elseif key == core.KEY_ENTER then
 			core.boot()
-			-- Should not return
+			-- Should not return.  If it does, escape menu handling
+			-- and drop to loader prompt.
+			return false
 		end
 
 		key = string.char(key)
@@ -401,8 +428,32 @@ function menu.process(menudef, keypress)
 end
 
 function menu.run()
+	local autoboot_key
+	local delay = loader.getenv("autoboot_delay")
+
+	if delay ~= nil and delay:lower() == "no" then
+		delay = nil
+	else
+		delay = tonumber(delay) or 10
+	end
+
+	if delay == -1 then
+		core.boot()
+		return
+	end
+
 	menu.draw(menu.default)
-	local autoboot_key = menu.autoboot()
+
+	if delay ~= nil then
+		autoboot_key = menu.autoboot(delay)
+
+		-- autoboot_key should return the key pressed.  It will only
+		-- return nil if we hit the timeout and executed the timeout
+		-- command.  Bail out.
+		if autoboot_key == nil then
+			return
+		end
+	end
 
 	menu.process(menu.default, autoboot_key)
 	drawn_menu = nil
@@ -411,19 +462,10 @@ function menu.run()
 	print("Exiting menu!")
 end
 
-function menu.autoboot()
-	local ab = loader.getenv("autoboot_delay")
-	if ab ~= nil and ab:lower() == "no" then
-		return nil
-	elseif tonumber(ab) == -1 then
-		core.boot()
-	end
-	ab = tonumber(ab) or 10
-
+function menu.autoboot(delay)
 	local x = loader.getenv("loader_menu_timeout_x") or 4
 	local y = loader.getenv("loader_menu_timeout_y") or 23
-
-	local endtime = loader.time() + ab
+	local endtime = loader.time() + delay
 	local time
 	local last
 	repeat
@@ -454,6 +496,12 @@ function menu.autoboot()
 
 	local cmd = loader.getenv("menu_timeout_command") or "boot"
 	cli_execute_unparsed(cmd)
+	return nil
+end
+
+-- CLI commands
+function cli.menu()
+	menu.run()
 end
 
 return menu

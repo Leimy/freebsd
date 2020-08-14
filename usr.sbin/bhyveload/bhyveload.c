@@ -75,6 +75,7 @@ __FBSDID("$FreeBSD$");
 #include <getopt.h>
 #include <libgen.h>
 #include <limits.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -97,6 +98,13 @@ static struct termios term, oldterm;
 static int disk_fd[NDISKS];
 static int ndisks;
 static int consin_fd, consout_fd;
+
+static int need_reinit;
+
+static void *loader_hdl;
+static char *loader;
+static int explicit_loader;
+static jmp_buf jb;
 
 static char *vmname, *progname;
 static struct vmctx *ctx;
@@ -270,14 +278,19 @@ cb_seek(void *arg, void *h, uint64_t offset, int whence)
 }
 
 static int
-cb_stat(void *arg, void *h, int *mode, int *uid, int *gid, uint64_t *size)
+cb_stat(void *arg, void *h, struct stat *sbp)
 {
 	struct cb_file *cf = h;
 
-	*mode = cf->cf_stat.st_mode;
-	*uid = cf->cf_stat.st_uid;
-	*gid = cf->cf_stat.st_gid;
-	*size = cf->cf_stat.st_size;
+	memset(sbp, 0, sizeof(struct stat));
+	sbp->st_mode = cf->cf_stat.st_mode;
+	sbp->st_uid = cf->cf_stat.st_uid;
+	sbp->st_gid = cf->cf_stat.st_gid;
+	sbp->st_size = cf->cf_stat.st_size;
+	sbp->st_mtime = cf->cf_stat.st_mtime;
+	sbp->st_dev = cf->cf_stat.st_dev;
+	sbp->st_ino = cf->cf_stat.st_ino;
+	
 	return (0);
 }
 
@@ -365,7 +378,7 @@ cb_setreg(void *arg, int r, uint64_t v)
 {
 	int error;
 	enum vm_reg_name vmreg;
-	
+
 	vmreg = VM_REG_LAST;
 
 	switch (r) {
@@ -560,6 +573,30 @@ cb_vm_set_desc(void *arg, int vcpu, int reg, uint64_t base, u_int limit,
 	return (vm_set_desc(ctx, vcpu, reg, base, limit, access));
 }
 
+static void
+cb_swap_interpreter(void *arg, const char *interp_req)
+{
+
+	/*
+	 * If the user specified a loader but we detected a mismatch, we should
+	 * not try to pivot to a different loader on them.
+	 */
+	free(loader);
+	if (explicit_loader == 1) {
+		perror("requested loader interpreter does not match guest userboot");
+		cb_exit(NULL, 1);
+	}
+	if (interp_req == NULL || *interp_req == '\0') {
+		perror("guest failed to request an interpreter");
+		cb_exit(NULL, 1);
+	}
+
+	if (asprintf(&loader, "/boot/userboot_%s.so", interp_req) == -1)
+		err(EX_OSERR, "malloc");
+	need_reinit = 1;
+	longjmp(jb, 1);
+}
+
 static struct loader_callbacks cb = {
 	.getc = cb_getc,
 	.putc = cb_putc,
@@ -593,6 +630,9 @@ static struct loader_callbacks cb = {
 	/* Version 4 additions */
 	.vm_set_register = cb_vm_set_register,
 	.vm_set_desc = cb_vm_set_desc,
+
+	/* Version 5 additions */
+	.swap_interpreter = cb_swap_interpreter,
 };
 
 static int
@@ -629,21 +669,19 @@ altcons_open(char *path)
 static int
 disk_open(char *path)
 {
-	int err, fd;
+	int fd;
 
 	if (ndisks >= NDISKS)
 		return (ERANGE);
 
-	err = 0;
 	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return (errno);
 
-	if (fd > 0) {
-		disk_fd[ndisks] = fd;
-		ndisks++;
-	} else 
-		err = errno;
+	disk_fd[ndisks] = fd;
+	ndisks++;
 
-	return (err);
+	return (0);
 }
 
 static void
@@ -661,15 +699,11 @@ usage(void)
 int
 main(int argc, char** argv)
 {
-	char *loader;
-	void *h;
 	void (*func)(struct loader_callbacks *, void *, int, int);
 	uint64_t mem_size;
-	int opt, error, need_reinit, memflags;
+	int opt, error, memflags;
 
 	progname = basename(argv[0]);
-
-	loader = NULL;
 
 	memflags = 0;
 	mem_size = 256 * MB;
@@ -705,6 +739,7 @@ main(int argc, char** argv)
 			loader = strdup(optarg);
 			if (loader == NULL)
 				err(EX_OSERR, "malloc");
+			explicit_loader = 1;
 			break;
 
 		case 'm':
@@ -747,6 +782,13 @@ main(int argc, char** argv)
 		exit(1);
 	}
 
+	/*
+	 * setjmp in the case the guest wants to swap out interpreter,
+	 * cb_swap_interpreter will swap out loader as appropriate and set
+	 * need_reinit so that we end up in a clean state once again.
+	 */
+	setjmp(jb);
+
 	if (need_reinit) {
 		error = vm_reinit(ctx);
 		if (error) {
@@ -767,13 +809,15 @@ main(int argc, char** argv)
 		if (loader == NULL)
 			err(EX_OSERR, "malloc");
 	}
-	h = dlopen(loader, RTLD_LOCAL);
-	if (!h) {
+	if (loader_hdl != NULL)
+		dlclose(loader_hdl);
+	loader_hdl = dlopen(loader, RTLD_LOCAL);
+	if (!loader_hdl) {
 		printf("%s\n", dlerror());
 		free(loader);
 		return (1);
 	}
-	func = dlsym(h, "loader_main");
+	func = dlsym(loader_hdl, "loader_main");
 	if (!func) {
 		printf("%s\n", dlerror());
 		free(loader);
@@ -790,7 +834,7 @@ main(int argc, char** argv)
 	addenv("smbios.bios.vendor=BHYVE");
 	addenv("boot_serial=1");
 
-	func(&cb, NULL, USERBOOT_VERSION_4, ndisks);
+	func(&cb, NULL, USERBOOT_VERSION_5, ndisks);
 
 	free(loader);
 	return (0);

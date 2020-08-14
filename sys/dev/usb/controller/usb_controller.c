@@ -86,7 +86,8 @@ static void	usb_attach_sub(device_t, struct usb_bus *);
 #ifdef USB_DEBUG
 static int usb_ctrl_debug = 0;
 
-static SYSCTL_NODE(_hw_usb, OID_AUTO, ctrl, CTLFLAG_RW, 0, "USB controller");
+static SYSCTL_NODE(_hw_usb, OID_AUTO, ctrl, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "USB controller");
 SYSCTL_INT(_hw_usb_ctrl, OID_AUTO, debug, CTLFLAG_RWTUN, &usb_ctrl_debug, 0,
     "Debug level");
 #endif
@@ -131,7 +132,6 @@ DRIVER_MODULE(usbus, ehci, usb_driver, usb_devclass, 0, 0);
 DRIVER_MODULE(usbus, xhci, usb_driver, usb_devclass, 0, 0);
 
 /* Device Only Drivers */
-DRIVER_MODULE(usbus, at91_udp, usb_driver, usb_devclass, 0, 0);
 DRIVER_MODULE(usbus, musbotg, usb_driver, usb_devclass, 0, 0);
 DRIVER_MODULE(usbus, uss820dci, usb_driver, usb_devclass, 0, 0);
 DRIVER_MODULE(usbus, octusb, usb_driver, usb_devclass, 0, 0);

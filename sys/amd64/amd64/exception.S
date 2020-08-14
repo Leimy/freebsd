@@ -39,15 +39,15 @@
  */
 
 #include "opt_atpic.h"
-#include "opt_compat.h"
 #include "opt_hwpmc_hooks.h"
 
-#include "assym.s"
+#include "assym.inc"
 
-#include <machine/asmacros.h>
 #include <machine/psl.h>
+#include <machine/asmacros.h>
 #include <machine/trap.h>
 #include <machine/specialreg.h>
+#include <machine/pmap.h>
 
 #ifdef KDTRACE_HOOKS
 	.bss
@@ -106,17 +106,34 @@ MCOUNT_LABEL(btrap)
 
 /* Traps that we leave interrupts disabled for. */
 	.macro	TRAP_NOEN	l, trapno
-	PTI_ENTRY	\l,X\l
+	PTI_ENTRY	\l,\l\()_pti_k,\l\()_pti_u
+\l\()_pti_k:
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	jmp	alltraps_noen_k
+\l\()_pti_u:
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	jmp	alltraps_noen_u
+	
 	.globl	X\l
 	.type	X\l,@function
-X\l:	subq $TF_RIP,%rsp
-	movl $\trapno,TF_TRAPNO(%rsp)
-	movq $0,TF_ADDR(%rsp)
-	movq $0,TF_ERR(%rsp)
-	jmp alltraps_noen
+X\l:
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	testb	$SEL_RPL_MASK,TF_CS(%rsp)
+	jz	alltraps_noen_k
+	swapgs
+	lfence
+	jmp	alltraps_noen_u
 	.endm
 
-	TRAP_NOEN	dbg, T_TRCTRAP
 	TRAP_NOEN	bpt, T_BPTFLT
 #ifdef KDTRACE_HOOKS
 	TRAP_NOEN	dtrace_ret, T_DTRACE_RET
@@ -124,15 +141,32 @@ X\l:	subq $TF_RIP,%rsp
 
 /* Regular traps; The cpu does not supply tf_err for these. */
 	.macro	TRAP	l, trapno
-	PTI_ENTRY	\l,X\l
+	PTI_ENTRY	\l,\l\()_pti_k,\l\()_pti_u
+\l\()_pti_k:
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	jmp	alltraps_k
+\l\()_pti_u:
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	jmp	alltraps_u
+
 	.globl	X\l
 	.type	X\l,@function
 X\l:
-	subq $TF_RIP,%rsp
-	movl $\trapno,TF_TRAPNO(%rsp)
-	movq $0,TF_ADDR(%rsp)
-	movq $0,TF_ERR(%rsp)
-	jmp alltraps
+	subq	$TF_RIP,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	testb	$SEL_RPL_MASK,TF_CS(%rsp)
+	jz	alltraps_k
+	swapgs
+	lfence
+	jmp	alltraps_u
 	.endm
 
 	TRAP	div, T_DIVIDE
@@ -147,42 +181,64 @@ X\l:
 
 /* This group of traps have tf_err already pushed by the cpu. */
 	.macro	TRAP_ERR	l, trapno
-	PTI_ENTRY	\l,X\l,has_err=1
+	PTI_ENTRY	\l,\l\()_pti_k,\l\()_pti_u,has_err=1
+\l\()_pti_k:
+	subq	$TF_ERR,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	jmp	alltraps_k
+\l\()_pti_u:
+	subq	$TF_ERR,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	jmp	alltraps_u
 	.globl	X\l
 	.type	X\l,@function
 X\l:
-	subq $TF_ERR,%rsp
-	movl $\trapno,TF_TRAPNO(%rsp)
-	movq $0,TF_ADDR(%rsp)
-	jmp alltraps
+	subq	$TF_ERR,%rsp
+	movl	$\trapno,TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	testb	$SEL_RPL_MASK,TF_CS(%rsp)
+	jz	alltraps_k
+	swapgs
+	lfence
+	jmp	alltraps_u
 	.endm
 
 	TRAP_ERR	tss, T_TSSFLT
 	TRAP_ERR	align, T_ALIGNFLT
 
 	/*
-	 * alltraps entry point.  Use swapgs if this is the first time in the
-	 * kernel from userland.  Reenable interrupts if they were enabled
-	 * before the trap.  This approximates SDT_SYS386TGT on the i386 port.
+	 * alltraps_u/k entry points.
+	 * SWAPGS must be already performed by prologue,
+	 * if this is the first time in the kernel from userland.
+	 * Reenable interrupts if they were enabled before the trap.
+	 * This approximates SDT_SYS386TGT on the i386 port.
 	 */
 	SUPERALIGN_TEXT
-	.globl	alltraps
-	.type	alltraps,@function
-alltraps:
+	.globl	alltraps_u
+	.type	alltraps_u,@function
+alltraps_u:
 	movq	%rdi,TF_RDI(%rsp)
-	testb	$SEL_RPL_MASK,TF_CS(%rsp) /* Did we come from kernel? */
-	jz	1f		/* already running with kernel GS.base */
-	swapgs
-	movq	PCPU(CURPCB),%rdi
-	andl	$~PCB_FULL_IRET,PCB_FLAGS(%rdi)
-1:	SAVE_SEGS
 	movq	%rdx,TF_RDX(%rsp)
 	movq	%rax,TF_RAX(%rsp)
 	movq	%rcx,TF_RCX(%rsp)
-	testb	$SEL_RPL_MASK,TF_CS(%rsp)
-	jz	2f
+	movq	PCPU(CURPCB),%rdi
+	andl	$~PCB_FULL_IRET,PCB_FLAGS(%rdi)
 	call	handle_ibrs_entry
-2:	testl	$PSL_I,TF_RFLAGS(%rsp)
+	jmp	alltraps_save_segs
+	SUPERALIGN_TEXT
+	.globl	alltraps_k
+	.type	alltraps_k,@function
+alltraps_k:
+	lfence
+	movq	%rdi,TF_RDI(%rsp)
+	movq	%rdx,TF_RDX(%rsp)
+	movq	%rax,TF_RAX(%rsp)
+	movq	%rcx,TF_RCX(%rsp)
+alltraps_save_segs:
+	SAVE_SEGS
+	testl	$PSL_I,TF_RFLAGS(%rsp)
 	jz	alltraps_pushregs_no_rax
 	sti
 alltraps_pushregs_no_rax:
@@ -198,7 +254,9 @@ alltraps_pushregs_no_rax:
 	movq	%r14,TF_R14(%rsp)
 	movq	%r15,TF_R15(%rsp)
 	movl	$TF_HASSEGS,TF_FLAGS(%rsp)
-	cld
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
 	FAKE_MCOUNT(TF_RIP(%rsp))
 #ifdef KDTRACE_HOOKS
 	/*
@@ -234,21 +292,27 @@ calltrap:
 	jmp	doreti			/* Handle any pending ASTs */
 
 	/*
-	 * alltraps_noen entry point.  Unlike alltraps above, we want to
-	 * leave the interrupts disabled.  This corresponds to
-	 * SDT_SYS386IGT on the i386 port.
+	 * alltraps_noen_u/k entry points.
+	 * Again, SWAPGS must be already performed by prologue, if needed.
+	 * Unlike alltraps above, we want to leave the interrupts disabled.
+	 * This corresponds to SDT_SYS386IGT on the i386 port.
 	 */
 	SUPERALIGN_TEXT
-	.globl	alltraps_noen
-	.type	alltraps_noen,@function
-alltraps_noen:
+	.globl	alltraps_noen_u
+	.type	alltraps_noen_u,@function
+alltraps_noen_u:
 	movq	%rdi,TF_RDI(%rsp)
-	testb	$SEL_RPL_MASK,TF_CS(%rsp) /* Did we come from kernel? */
-	jz	1f /* already running with kernel GS.base */
-	swapgs
 	movq	PCPU(CURPCB),%rdi
 	andl	$~PCB_FULL_IRET,PCB_FLAGS(%rdi)
-1:	SAVE_SEGS
+	jmp	alltraps_noen_save_segs
+	SUPERALIGN_TEXT
+	.globl	alltraps_noen_k
+	.type	alltraps_noen_k,@function
+alltraps_noen_k:
+	lfence
+	movq	%rdi,TF_RDI(%rsp)
+alltraps_noen_save_segs:
+	SAVE_SEGS
 	movq	%rdx,TF_RDX(%rsp)
 	movq	%rax,TF_RAX(%rsp)
 	movq	%rcx,TF_RCX(%rsp)
@@ -279,11 +343,16 @@ IDTVEC(dblfault)
 	movq	%r15,TF_R15(%rsp)
 	SAVE_SEGS
 	movl	$TF_HASSEGS,TF_FLAGS(%rsp)
-	cld
-	testb	$SEL_RPL_MASK,TF_CS(%rsp) /* Did we come from kernel? */
-	jz	1f			/* already running with kernel GS.base */
-	swapgs
-1:
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
+	movq	TF_SIZE(%rsp),%rdx
+	movl	%edx,%eax
+	shrq	$32,%rdx
+	movl	$MSR_GSBASE,%ecx
+	wrmsr
+	movq	%cr3,%rax
+	movq	%rax,PCPU(SAVED_UCR3)
 	movq	PCPU(KCR3),%rax
 	cmpq	$~0,%rax
 	je	2f
@@ -295,30 +364,43 @@ IDTVEC(dblfault)
 
 	ALIGN_TEXT
 IDTVEC(page_pti)
-	testb	$SEL_RPL_MASK,PTI_CS-2*8(%rsp)
-	jz	Xpage
+	testb	$SEL_RPL_MASK,PTI_CS-PTI_ERR(%rsp)
+	jz	page_k
 	swapgs
+	lfence
 	pushq	%rax
-	pushq	%rdx
 	movq	%cr3,%rax
 	movq	%rax,PCPU(SAVED_UCR3)
-	PTI_UUENTRY has_err=1
-	subq	$TF_ERR,%rsp
-	movq	%rdi,TF_RDI(%rsp)
-	movq	%rax,TF_RAX(%rsp)
-	movq	%rdx,TF_RDX(%rsp)
-	movq	%rcx,TF_RCX(%rsp)
+	cmpq	$~0,PCPU(UCR3)
+	jne	1f
+	popq	%rax
 	jmp	page_u
+1:	pushq	%rdx
+	PTI_UUENTRY has_err=1
+	jmp	page_u
+	ALIGN_TEXT
 IDTVEC(page)
+	testb	$SEL_RPL_MASK,TF_CS-TF_ERR(%rsp) /* Did we come from kernel? */
+	jnz	page_u_swapgs		/* already running with kernel GS.base */
+page_k:
+	lfence
 	subq	$TF_ERR,%rsp
 	movq	%rdi,TF_RDI(%rsp)	/* free up GP registers */
 	movq	%rax,TF_RAX(%rsp)
 	movq	%rdx,TF_RDX(%rsp)
 	movq	%rcx,TF_RCX(%rsp)
-	testb	$SEL_RPL_MASK,TF_CS(%rsp) /* Did we come from kernel? */
-	jz	page_cr2		/* already running with kernel GS.base */
+	jmp	page_cr2
+	ALIGN_TEXT
+page_u_swapgs:
 	swapgs
-page_u:	movq	PCPU(CURPCB),%rdi
+	lfence
+page_u:
+	subq	$TF_ERR,%rsp
+	movq	%rdi,TF_RDI(%rsp)
+	movq	%rax,TF_RAX(%rsp)
+	movq	%rdx,TF_RDX(%rsp)
+	movq	%rcx,TF_RCX(%rsp)
+	movq	PCPU(CURPCB),%rdi
 	andl	$~PCB_FULL_IRET,PCB_FLAGS(%rdi)
 	movq	PCPU(SAVED_UCR3),%rax
 	movq	%rax,PCB_SAVED_UCR3(%rdi)
@@ -342,29 +424,39 @@ page_cr2:
 	 * On the stack, we have the hardware interrupt frame to return
 	 * to usermode (faulted) and another frame with error code, for
 	 * fault.  For PTI, copy both frames to the main thread stack.
+	 * Handle the potential 16-byte alignment adjustment incurred
+	 * during the second fault by copying both frames independently
+	 * while unwinding the stack in between.
 	 */
 	.macro PROTF_ENTRY name,trapno
 \name\()_pti_doreti:
+	swapgs
+	lfence
+	cmpq	$~0,PCPU(UCR3)
+	je	1f
 	pushq	%rax
 	pushq	%rdx
-	swapgs
 	movq	PCPU(KCR3),%rax
 	movq	%rax,%cr3
 	movq	PCPU(RSP0),%rax
 	subq	$2*PTI_SIZE-3*8,%rax /* no err, %rax, %rdx in faulted frame */
-	MOVE_STACKS	(PTI_SIZE / 4 - 3)
+	MOVE_STACKS	(PTI_SIZE / 8)
+	addq	$PTI_SIZE,%rax
+	movq	PTI_RSP(%rsp),%rsp
+	MOVE_STACKS	(PTI_SIZE / 8 - 3)
+	subq	$PTI_SIZE,%rax
 	movq	%rax,%rsp
 	popq	%rdx
 	popq	%rax
-	swapgs
+1:	swapgs
 	jmp	X\name
 IDTVEC(\name\()_pti)
 	cmpq	$doreti_iret,PTI_RIP-2*8(%rsp)
 	je	\name\()_pti_doreti
 	testb	$SEL_RPL_MASK,PTI_CS-2*8(%rsp) /* %rax, %rdx not yet pushed */
-	jz	X\name
+	jz	X\name		/* lfence is not needed until %gs: use */
 	PTI_UENTRY has_err=1
-	swapgs
+	swapgs	/* fence provided by PTI_UENTRY */
 IDTVEC(\name)
 	subq	$TF_ERR,%rsp
 	movl	$\trapno,TF_TRAPNO(%rsp)
@@ -397,6 +489,7 @@ prot_addrf:
 	jne	2f
 	rdgsbase %rdx
 2:	swapgs
+	lfence
 	movq	PCPU(CURPCB),%rdi
 	testb	$CPUID_STDEXT_FSGSBASE,cpu_stdext_feature(%rip)
 	jz	4f
@@ -406,8 +499,8 @@ prot_addrf:
 3:	cmpw	$KUG32SEL,TF_GS(%rsp)
 	jne	4f
 	movq	%rdx,PCB_GSBASE(%rdi)
+	orl	$PCB_FULL_IRET,PCB_FLAGS(%rdi)	/* full iret from user #gp */
 4:	call	handle_ibrs_entry
-	orl	$PCB_FULL_IRET,PCB_FLAGS(%rdi)	/* always full iret from GPF */
 	movw	%es,TF_ES(%rsp)
 	movw	%ds,TF_DS(%rsp)
 	testl	$PSL_I,TF_RFLAGS(%rsp)
@@ -416,7 +509,8 @@ prot_addrf:
 	jmp	alltraps_pushregs_no_rax
 
 5:	swapgs
-6:	movq	PCPU(CURPCB),%rdi
+6:	lfence
+	movq	PCPU(CURPCB),%rdi
 	jmp	4b
 
 /*
@@ -431,14 +525,18 @@ prot_addrf:
 	SUPERALIGN_TEXT
 IDTVEC(fast_syscall_pti)
 	swapgs
+	lfence
+	cmpq	$~0,PCPU(UCR3)
+	je	fast_syscall_common
 	movq	%rax,PCPU(SCRATCH_RAX)
 	movq	PCPU(KCR3),%rax
 	movq	%rax,%cr3
+	movq	PCPU(SCRATCH_RAX),%rax
 	jmp	fast_syscall_common
 	SUPERALIGN_TEXT
 IDTVEC(fast_syscall)
 	swapgs
-	movq	%rax,PCPU(SCRATCH_RAX)
+	lfence
 fast_syscall_common:
 	movq	%rsp,PCPU(SCRATCH_RSP)
 	movq	PCPU(RSP0),%rsp
@@ -449,9 +547,16 @@ fast_syscall_common:
 	movq	%rcx,TF_RIP(%rsp)	/* %rcx original value is in %r10 */
 	movq	PCPU(SCRATCH_RSP),%r11	/* %r11 already saved */
 	movq	%r11,TF_RSP(%rsp)	/* user stack pointer */
-	movq	PCPU(SCRATCH_RAX),%rax
+	/*
+	 * Save a few arg registers early to free them for use in
+	 * handle_ibrs_entry().  %r10 is especially tricky.  It is not an
+	 * arg register, but it holds the arg register %rcx.  Profiling
+	 * preserves %rcx, but may clobber %r10.  Profiling may also
+	 * clobber %r11, but %r11 (original %eflags) has been saved.
+	 */
 	movq	%rax,TF_RAX(%rsp)	/* syscall number */
 	movq	%rdx,TF_RDX(%rsp)	/* arg 3 */
+	movq	%r10,TF_RCX(%rsp)	/* arg 4 */
 	SAVE_SEGS
 	call	handle_ibrs_entry
 	movq	PCPU(CURPCB),%r11
@@ -462,7 +567,6 @@ fast_syscall_common:
 	movq	$2,TF_ERR(%rsp)
 	movq	%rdi,TF_RDI(%rsp)	/* arg 1 */
 	movq	%rsi,TF_RSI(%rsp)	/* arg 2 */
-	movq	%r10,TF_RCX(%rsp)	/* arg 4 */
 	movq	%r8,TF_R8(%rsp)		/* arg 5 */
 	movq	%r9,TF_R9(%rsp)		/* arg 6 */
 	movq	%rbx,TF_RBX(%rsp)	/* C preserved */
@@ -488,6 +592,7 @@ fast_syscall_common:
 	testl	$TDF_ASTPENDING | TDF_NEEDRESCHED,TD_FLAGS(%rax)
 	jne	3f
 	call	handle_ibrs_exit
+	callq	*mds_handler
 	/* Restore preserved registers. */
 	MEXITCOUNT
 	movq	TF_RDI(%rsp),%rdi	/* bonus; preserve arg 1 */
@@ -497,12 +602,16 @@ fast_syscall_common:
 	movq	TF_RFLAGS(%rsp),%r11	/* original %rflags */
 	movq	TF_RIP(%rsp),%rcx	/* original %rip */
 	movq	TF_RSP(%rsp),%rsp	/* user stack pointer */
-	cmpb	$0,pti
+	xorl	%r8d,%r8d		/* zero the rest of GPRs */
+	xorl	%r10d,%r10d
+	cmpq	$~0,PCPU(UCR3)
 	je	2f
 	movq	PCPU(UCR3),%r9
+	andq	PCPU(UCR3_LOAD_MASK),%r9
 	movq	%r9,%cr3
-	xorl	%r9d,%r9d
-2:	swapgs
+2:	xorl	%r9d,%r9d
+	movq	$PMAP_UCR3_NOMASK,PCPU(UCR3_LOAD_MASK)
+	swapgs
 	sysretq
 
 3:	/* AST scheduled. */
@@ -522,6 +631,125 @@ fast_syscall_common:
  */
 IDTVEC(fast_syscall32)
 	sysret
+
+/*
+ * DB# handler is very similar to NM#, because 'mov/pop %ss' delay
+ * generation of exception until the next instruction is executed,
+ * which might be a kernel entry.  So we must execute the handler
+ * on IST stack and be ready for non-kernel GSBASE.
+ */
+IDTVEC(dbg)
+	subq	$TF_RIP,%rsp
+	movl	$(T_TRCTRAP),TF_TRAPNO(%rsp)
+	movq	$0,TF_ADDR(%rsp)
+	movq	$0,TF_ERR(%rsp)
+	movq	%rdi,TF_RDI(%rsp)
+	movq	%rsi,TF_RSI(%rsp)
+	movq	%rdx,TF_RDX(%rsp)
+	movq	%rcx,TF_RCX(%rsp)
+	movq	%r8,TF_R8(%rsp)
+	movq	%r9,TF_R9(%rsp)
+	movq	%rax,TF_RAX(%rsp)
+	movq	%rbx,TF_RBX(%rsp)
+	movq	%rbp,TF_RBP(%rsp)
+	movq	%r10,TF_R10(%rsp)
+	movq	%r11,TF_R11(%rsp)
+	movq	%r12,TF_R12(%rsp)
+	movq	%r13,TF_R13(%rsp)
+	movq	%r14,TF_R14(%rsp)
+	movq	%r15,TF_R15(%rsp)
+	SAVE_SEGS
+	movl	$TF_HASSEGS,TF_FLAGS(%rsp)
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
+	testb	$SEL_RPL_MASK,TF_CS(%rsp)
+	jnz	dbg_fromuserspace
+	lfence
+	/*
+	 * We've interrupted the kernel.  Preserve GS.base in %r12,
+	 * %cr3 in %r13, and possibly lower half of MSR_IA32_SPEC_CTL in %r14d.
+	 */
+	movl	$MSR_GSBASE,%ecx
+	rdmsr
+	movq	%rax,%r12
+	shlq	$32,%rdx
+	orq	%rdx,%r12
+	/* Retrieve and load the canonical value for GS.base. */
+	movq	TF_SIZE(%rsp),%rdx
+	movl	%edx,%eax
+	shrq	$32,%rdx
+	wrmsr
+	movq	%cr3,%r13
+	movq	PCPU(KCR3),%rax
+	cmpq	$~0,%rax
+	je	1f
+	movq	%rax,%cr3
+1:	testl	$CPUID_STDEXT3_IBPB,cpu_stdext_feature3(%rip)
+	je	2f
+	movl	$MSR_IA32_SPEC_CTRL,%ecx
+	rdmsr
+	movl	%eax,%r14d
+	call	handle_ibrs_entry
+2:	FAKE_MCOUNT(TF_RIP(%rsp))
+	movq	%rsp,%rdi
+	call	trap
+	MEXITCOUNT
+	testl	$CPUID_STDEXT3_IBPB,cpu_stdext_feature3(%rip)
+	je	3f
+	movl	%r14d,%eax
+	xorl	%edx,%edx
+	movl	$MSR_IA32_SPEC_CTRL,%ecx
+	wrmsr
+	/*
+	 * Put back the preserved MSR_GSBASE value.
+	 */
+3:	movl	$MSR_GSBASE,%ecx
+	movq	%r12,%rdx
+	movl	%edx,%eax
+	shrq	$32,%rdx
+	wrmsr
+	movq	%r13,%cr3
+	RESTORE_REGS
+	addq	$TF_RIP,%rsp
+	jmp	doreti_iret
+dbg_fromuserspace:
+	/*
+	 * Switch to kernel GSBASE and kernel page table, and copy frame
+	 * from the IST stack to the normal kernel stack, since trap()
+	 * re-enables interrupts, and since we might trap on DB# while
+	 * in trap().
+	 */
+	swapgs
+	lfence
+	movq	PCPU(KCR3),%rax
+	cmpq	$~0,%rax
+	je	1f
+	movq	%rax,%cr3
+1:	movq	PCPU(RSP0),%rax
+	movl	$TF_SIZE,%ecx
+	subq	%rcx,%rax
+	movq	%rax,%rdi
+	movq	%rsp,%rsi
+	rep;movsb
+	movq	%rax,%rsp
+	call	handle_ibrs_entry
+	movq	PCPU(CURPCB),%rdi
+	orl	$PCB_FULL_IRET,PCB_FLAGS(%rdi)
+	testb	$CPUID_STDEXT_FSGSBASE,cpu_stdext_feature(%rip)
+	jz	3f
+	cmpw	$KUF32SEL,TF_FS(%rsp)
+	jne	2f
+	rdfsbase %rax
+	movq	%rax,PCB_FSBASE(%rdi)
+2:	cmpw	$KUG32SEL,TF_GS(%rsp)
+	jne	3f
+	movl	$MSR_KGSBASE,%ecx
+	rdmsr
+	shlq	$32,%rdx
+	orq	%rdx,%rax
+	movq	%rax,PCB_GSBASE(%rdi)
+3:	jmp	calltrap
 
 /*
  * NMI handling is special.
@@ -569,7 +797,9 @@ IDTVEC(nmi)
 	movq	%r15,TF_R15(%rsp)
 	SAVE_SEGS
 	movl	$TF_HASSEGS,TF_FLAGS(%rsp)
-	cld
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
 	xorl	%ebx,%ebx
 	testb	$SEL_RPL_MASK,TF_CS(%rsp)
 	jnz	nmi_fromuserspace
@@ -577,6 +807,7 @@ IDTVEC(nmi)
 	 * We've interrupted the kernel.  Preserve GS.base in %r12,
 	 * %cr3 in %r13, and possibly lower half of MSR_IA32_SPEC_CTL in %r14d.
 	 */
+	lfence
 	movl	$MSR_GSBASE,%ecx
 	rdmsr
 	movq	%rax,%r12
@@ -602,6 +833,7 @@ IDTVEC(nmi)
 nmi_fromuserspace:
 	incl	%ebx
 	swapgs
+	lfence
 	movq	%cr3,%r13
 	movq	PCPU(KCR3),%rax
 	cmpq	$~0,%rax
@@ -658,7 +890,9 @@ nmi_calltrap:
 	subq	%rcx,%rdx
 	movq	%rdx,%rdi	/* destination stack pointer */
 	shrq	$3,%rcx		/* trap frame size in long words */
-	cld
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
 	rep
 	movsq			/* copy trapframe */
 	movq	%rdx,%rsp	/* we are on the regular kstack */
@@ -719,7 +953,10 @@ nocallchain:
 	movl	%edx,%eax
 	shrq	$32,%rdx
 	wrmsr
-	movq	%r13,%cr3
+	cmpb	$0, nmi_flush_l1d_sw(%rip)
+	je	2f
+	call	flush_l1d_sw		/* bhyve L1TF assist */
+2:	movq	%r13,%cr3
 	RESTORE_REGS
 	addq	$TF_RIP,%rsp
 	jmp	doreti_iret
@@ -767,7 +1004,9 @@ IDTVEC(mchk)
 	movq	%r15,TF_R15(%rsp)
 	SAVE_SEGS
 	movl	$TF_HASSEGS,TF_FLAGS(%rsp)
-	cld
+	pushfq
+	andq	$~(PSL_D | PSL_AC),(%rsp)
+	popfq
 	xorl	%ebx,%ebx
 	testb	$SEL_RPL_MASK,TF_CS(%rsp)
 	jnz	mchk_fromuserspace
@@ -1005,11 +1244,12 @@ ld_regs:
 	jz	2f			/* keep running with kernel GS.base */
 	cli
 	call	handle_ibrs_exit_rs
-	cmpb	$0,pti
+	callq	*mds_handler
+	cmpq	$~0,PCPU(UCR3)
 	je	1f
 	pushq	%rdx
-	movq	PCPU(PRVSPACE),%rdx
-	addq	$PC_PTI_STACK+PC_PTI_STACK_SZ*8-PTI_SIZE,%rdx
+	movq	PCPU(PTI_RSP0),%rdx
+	subq	$PTI_SIZE,%rdx
 	movq	%rax,PTI_RAX(%rdx)
 	popq	%rax
 	movq	%rax,PTI_RDX(%rdx)
@@ -1024,6 +1264,8 @@ ld_regs:
 	movq	TF_SS(%rsp),%rax
 	movq	%rax,PTI_SS(%rdx)
 	movq	PCPU(UCR3),%rax
+	andq	PCPU(UCR3_LOAD_MASK),%rax
+	movq	$PMAP_UCR3_NOMASK,PCPU(UCR3_LOAD_MASK)
 	swapgs
 	movq	%rdx,%rsp
 	movq	%rax,%cr3

@@ -39,8 +39,7 @@ __FBSDID("$FreeBSD$");
 
 ENTRY(_setjmp)
 	/* Store the magic value and stack pointer */
-	la	t0, .Lmagic
-	ld	t0, 0(t0)
+	ld	t0, .Lmagic
 	sd	t0, (0 * 8)(a0)
 	sd	sp, (1 * 8)(a0)
 	addi	a0, a0, (2 * 8)
@@ -61,21 +60,21 @@ ENTRY(_setjmp)
 	sd	ra, (12 * 8)(a0)
 	addi	a0, a0, (13 * 8)
 
-#if !defined(_STANDALONE) && !defined(SOFTFLOAT)
+#if !defined(_STANDALONE) && defined(__riscv_float_abi_double)
 	/* Store the fpe registers */
-	fsd	fs0, (0 * 16)(a0)
-	fsd	fs1, (1 * 16)(a0)
-	fsd	fs2, (2 * 16)(a0)
-	fsd	fs3, (3 * 16)(a0)
-	fsd	fs4, (4 * 16)(a0)
-	fsd	fs5, (5 * 16)(a0)
-	fsd	fs6, (6 * 16)(a0)
-	fsd	fs7, (7 * 16)(a0)
-	fsd	fs8, (8 * 16)(a0)
-	fsd	fs9, (9 * 16)(a0)
-	fsd	fs10, (10 * 16)(a0)
-	fsd	fs11, (11 * 16)(a0)
-	addi	a0, a0, (12 * 16)
+	fsd	fs0, (0 * 8)(a0)
+	fsd	fs1, (1 * 8)(a0)
+	fsd	fs2, (2 * 8)(a0)
+	fsd	fs3, (3 * 8)(a0)
+	fsd	fs4, (4 * 8)(a0)
+	fsd	fs5, (5 * 8)(a0)
+	fsd	fs6, (6 * 8)(a0)
+	fsd	fs7, (7 * 8)(a0)
+	fsd	fs8, (8 * 8)(a0)
+	fsd	fs9, (9 * 8)(a0)
+	fsd	fs10, (10 * 8)(a0)
+	fsd	fs11, (11 * 8)(a0)
+	addi	a0, a0, (12 * 8)
 #endif
 
 	/* Return value */
@@ -89,8 +88,7 @@ END(_setjmp)
 ENTRY(_longjmp)
 	/* Check the magic value */
 	ld	t0, 0(a0)
-	la	t1, .Lmagic
-	ld	t1, 0(t1)
+	ld	t1, .Lmagic
 	bne	t0, t1, botch
 
 	/* Restore the stack pointer */
@@ -114,21 +112,21 @@ ENTRY(_longjmp)
 	ld	ra, (12 * 8)(a0)
 	addi	a0, a0, (13 * 8)
 
-#if !defined(_STANDALONE) && !defined(SOFTFLOAT)
+#if !defined(_STANDALONE) && defined(__riscv_float_abi_double)
 	/* Restore the fpe registers */
-	fld	fs0, (0 * 16)(a0)
-	fld	fs1, (1 * 16)(a0)
-	fld	fs2, (2 * 16)(a0)
-	fld	fs3, (3 * 16)(a0)
-	fld	fs4, (4 * 16)(a0)
-	fld	fs5, (5 * 16)(a0)
-	fld	fs6, (6 * 16)(a0)
-	fld	fs7, (7 * 16)(a0)
-	fld	fs8, (8 * 16)(a0)
-	fld	fs9, (9 * 16)(a0)
-	fld	fs10, (10 * 16)(a0)
-	fld	fs11, (11 * 16)(a0)
-	addi	a0, a0, (12 * 16)
+	fld	fs0, (0 * 8)(a0)
+	fld	fs1, (1 * 8)(a0)
+	fld	fs2, (2 * 8)(a0)
+	fld	fs3, (3 * 8)(a0)
+	fld	fs4, (4 * 8)(a0)
+	fld	fs5, (5 * 8)(a0)
+	fld	fs6, (6 * 8)(a0)
+	fld	fs7, (7 * 8)(a0)
+	fld	fs8, (8 * 8)(a0)
+	fld	fs9, (9 * 8)(a0)
+	fld	fs10, (10 * 8)(a0)
+	fld	fs11, (11 * 8)(a0)
+	addi	a0, a0, (12 * 8)
 #endif
 
 	/* Load the return value */

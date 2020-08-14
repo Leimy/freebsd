@@ -5,7 +5,7 @@
     pretty fast once you're done with this checklist.
 
 01) Download the latest OpenSSH-portable tarball and signature from
-    OpenBSD (ftp://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/).
+    OpenBSD (https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/).
 
 02) Verify the signature:
 
@@ -17,7 +17,7 @@
 
 04) Copy to the vendor directory:
 
-    $ svn co svn+ssh://svn.freebsd.org/base/vendor-crypto/openssh/dist
+    $ svn co svn+ssh://repo.freebsd.org/base/vendor-crypto/openssh/dist
     $ rsync --archive --delete openssh-X.YpZ/ dist/
 
 05) Take care of added / deleted files:
@@ -32,19 +32,24 @@
 07) Tag:
 
     $ svn copy -m "Tag OpenSSH X.YpZ." \
-	svn+ssh://svn.freebsd.org/base/vendor-crypto/openssh/dist \
-	svn+ssh://svn.freebsd.org/base/vendor-crypto/openssh/X.YpZ
+	svn+ssh://repo.freebsd.org/base/vendor-crypto/openssh/dist \
+	svn+ssh://repo.freebsd.org/base/vendor-crypto/openssh/X.YpZ
 
 08) Check out head and run the pre-merge script, which strips our RCS
     tags from files that have them:
 
-    $ svn co svn+ssh://svn.freebsd.org/base/head
+    $ svn co svn+ssh://repo.freebsd.org/base/head
     $ cd head/crypto/openssh
     $ sh freebsd-pre-merge.sh
 
 09) Merge from the vendor branch:
 
     $ svn merge -cNNNNNN \^/vendor-crypto/openssh/dist .
+
+    A number of files have been deleted from FreeBSD's copy of ssh,
+    including rendered man pages (which have a .0 extension).  When
+    svn prompts for these deleted files during the merge, choose 'r'
+    (leaving them deleted).
 
 0A) Resolve conflicts.  Remember to bump the version addendum in
     version.h, and update the default value in ssh{,d}_config and
@@ -71,22 +76,22 @@
 
 0E) Review changes to config.h very carefully.
 
+    Note that libwrap should not be defined in config.h; as of
+    r311585 it is conditional on MK_TCP_WRAPPERS.
+
 0F) If source files have been added or removed, update the appropriate
     makefiles to reflect changes in the vendor's Makefile.in.
 
-10) Build libssh:
+10) Update ssh_namespace.h:
 
-    $ cd ../../secure/lib/libssh && make obj && make depend && make
+    $ sh freebsd-namespace.sh
 
-11) Follow the instructions in ssh_namespace.h to get a list of new
-    symbols, and them to ssh_namespace.h.  Keep it sorted!
-
-12) Build and install world, reboot, test.  Pay particular attention
+11) Build and install world, reboot, test.  Pay particular attention
     to pam_ssh(8), which gropes inside libssh and will break if
     something significant changes or if ssh_namespace.h is out of
     whack.
 
-13) Commit, and hunker down for the inevitable storm of complaints.
+12) Commit, and hunker down for the inevitable storm of complaints.
 
 
 
@@ -142,6 +147,9 @@
    Support for TCP wrappers was removed in upstream 6.7p1.  We've
    added it back by porting the 6.6p1 code forward.
 
+   TCP wrappers support in sshd will be disabled in HEAD and will
+   be removed from FreeBSD in the future.
+
 6) Agent client reference counting
 
    We've added code to ssh-agent.c to implement client reference
@@ -159,13 +167,6 @@
    increased throughput on high-BxD links), but we recognize and
    ignore HPN-related configuration options to avoid breaking existing
    configurations.
-
-9) AES-CBC
-
-   The AES-CBC ciphers were removed from the server-side proposal list
-   in 6.7p1 due to theoretical weaknesses and the availability of
-   superior ciphers (including AES-CTR and AES-GCM).  We have re-added
-   them for compatibility with third-party clients.
 
 
 

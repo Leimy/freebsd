@@ -1,6 +1,9 @@
 # $FreeBSD$
 
-ATF_TESTS_SH=	pfctl_test
+PACKAGE=	tests
+
+ATF_TESTS_SH=	pfctl_test \
+		macro
 
 SUBDIR+=	files
 

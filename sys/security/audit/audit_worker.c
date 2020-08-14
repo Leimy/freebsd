@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * Copyright (c) 1999-2008 Apple Inc.
- * Copyright (c) 2006-2008, 2016 Robert N. M. Watson
+ * Copyright (c) 2006-2008, 2016, 2018 Robert N. M. Watson
  * All rights reserved.
  *
  * Portions of this software were developed by BAE Systems, the University of
@@ -119,7 +119,7 @@ audit_worker_sync_vp(struct vnode *vp, struct mount *mp, const char *fmt, ...)
 	if (error == 0) {
 		VOP_LOCK(vp, LK_EXCLUSIVE | LK_RETRY);
 		(void)VOP_FSYNC(vp, MNT_WAIT, curthread);
-		VOP_UNLOCK(vp, 0);
+		VOP_UNLOCK(vp);
 		vn_finished_write(mp1);
 	}
 	vfs_unbusy(mp);
@@ -305,7 +305,8 @@ fail_enospc:
 		    "Audit log space exhausted and fail-stop set.");
 	}
 	(void)audit_send_trigger(AUDIT_TRIGGER_NO_SPACE);
-	audit_suspended = 1;
+	audit_trail_suspended = 1;
+	audit_syscalls_enabled_update();
 
 	/* FALLTHROUGH */
 fail:
@@ -502,7 +503,7 @@ audit_rotate_vnode(struct ucred *cred, struct vnode *vp)
 		vn_lock(vp, LK_SHARED | LK_RETRY);
 		if (VOP_GETATTR(vp, &vattr, cred) != 0)
 			vattr.va_size = 0;
-		VOP_UNLOCK(vp, 0);
+		VOP_UNLOCK(vp);
 	} else {
 		vattr.va_size = 0;
 	}
@@ -518,7 +519,8 @@ audit_rotate_vnode(struct ucred *cred, struct vnode *vp)
 	audit_vp = vp;
 	audit_size = vattr.va_size;
 	audit_file_rotate_wait = 0;
-	audit_enabled = (audit_vp != NULL);
+	audit_trail_enabled = (audit_vp != NULL);
+	audit_syscalls_enabled_update();
 	AUDIT_WORKER_UNLOCK();
 
 	/*

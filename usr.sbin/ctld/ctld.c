@@ -69,6 +69,7 @@ usage(void)
 {
 
 	fprintf(stderr, "usage: ctld [-d][-u][-f config-file]\n");
+	fprintf(stderr, "       ctld -t [-u][-f config-file]\n");
 	exit(1);
 }
 
@@ -1234,11 +1235,57 @@ port_new(struct conf *conf, struct target *target, struct portal_group *pg)
 		log_err(1, "calloc");
 	port->p_conf = conf;
 	port->p_name = name;
+	port->p_ioctl_port = 0;
 	TAILQ_INSERT_TAIL(&conf->conf_ports, port, p_next);
 	TAILQ_INSERT_TAIL(&target->t_ports, port, p_ts);
 	port->p_target = target;
 	TAILQ_INSERT_TAIL(&pg->pg_ports, port, p_pgs);
 	port->p_portal_group = pg;
+	return (port);
+}
+
+struct port *
+port_new_ioctl(struct conf *conf, struct target *target, int pp, int vp)
+{
+	struct pport *pport;
+	struct port *port;
+	char *pname;
+	char *name;
+	int ret;
+
+	ret = asprintf(&pname, "ioctl/%d/%d", pp, vp);
+	if (ret <= 0) {
+		log_err(1, "asprintf");
+		return (NULL);
+	}
+
+	pport = pport_find(conf, pname);
+	if (pport != NULL) {
+		free(pname);
+		return (port_new_pp(conf, target, pport));
+	}
+
+	ret = asprintf(&name, "%s-%s", pname, target->t_name);
+	free(pname);
+
+	if (ret <= 0)
+		log_err(1, "asprintf");
+	if (port_find(conf, name) != NULL) {
+		log_warnx("duplicate port \"%s\"", name);
+		free(name);
+		return (NULL);
+	}
+	port = calloc(1, sizeof(*port));
+	if (port == NULL)
+		log_err(1, "calloc");
+	port->p_conf = conf;
+	port->p_name = name;
+	port->p_ioctl_port = 1;
+	port->p_ioctl_pp = pp;
+	port->p_ioctl_vp = vp;
+	TAILQ_INSERT_TAIL(&conf->conf_ports, port, p_next);
+	TAILQ_INSERT_TAIL(&target->t_ports, port, p_ts);
+	port->p_target = target;
 	return (port);
 }
 
@@ -1627,9 +1674,9 @@ conf_print(struct conf *conf)
 		TAILQ_FOREACH(auth_name, &ag->ag_names, an_next)
 			fprintf(stderr, "\t initiator-name %s\n",
 			    auth_name->an_initator_name);
-		TAILQ_FOREACH(auth_portal, &ag->ag_portals, an_next)
+		TAILQ_FOREACH(auth_portal, &ag->ag_portals, ap_next)
 			fprintf(stderr, "\t initiator-portal %s\n",
-			    auth_portal->an_initator_portal);
+			    auth_portal->ap_initator_portal);
 		fprintf(stderr, "}\n");
 	}
 	TAILQ_FOREACH(pg, &conf->conf_portal_groups, pg_next) {
@@ -1643,7 +1690,7 @@ conf_print(struct conf *conf)
 		fprintf(stderr, "\t\tpath %s\n", lun->l_path);
 		TAILQ_FOREACH(o, &lun->l_options, o_next)
 			fprintf(stderr, "\t\toption %s %s\n",
-			    lo->o_name, lo->o_value);
+			    o->o_name, o->o_value);
 		fprintf(stderr, "\t}\n");
 	}
 	TAILQ_FOREACH(targ, &conf->conf_targets, t_next) {
@@ -2617,13 +2664,17 @@ main(int argc, char **argv)
 	const char *config_path = DEFAULT_CONFIG_PATH;
 	int debug = 0, ch, error;
 	bool dont_daemonize = false;
+	bool test_config = false;
 	bool use_ucl = false;
 
-	while ((ch = getopt(argc, argv, "duf:R")) != -1) {
+	while ((ch = getopt(argc, argv, "dtuf:R")) != -1) {
 		switch (ch) {
 		case 'd':
 			dont_daemonize = true;
 			debug++;
+			break;
+		case 't':
+			test_config = true;
 			break;
 		case 'u':
 			use_ucl = true;
@@ -2655,6 +2706,10 @@ main(int argc, char **argv)
 
 	if (newconf == NULL)
 		log_errx(1, "configuration error; exiting");
+
+	if (test_config)
+		return (0);
+
 	if (debug > 0) {
 		oldconf->conf_debug = debug;
 		newconf->conf_debug = debug;

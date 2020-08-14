@@ -66,7 +66,7 @@ SET_DECLARE(compressors, struct compressor_methods);
 
 #ifdef GZIO
 
-#include <sys/zutil.h>
+#include <contrib/zlib/zutil.h>
 
 struct gz_stream {
 	uint8_t		*gz_buffer;	/* output buffer */
@@ -117,6 +117,13 @@ gz_init(size_t maxiosize, int level)
 	s->gz_stream.next_in = Z_NULL;
 	s->gz_stream.avail_in = 0;
 
+	if (level != Z_DEFAULT_COMPRESSION) {
+		if (level < Z_BEST_SPEED)
+			level = Z_BEST_SPEED;
+		else if (level > Z_BEST_COMPRESSION)
+			level = Z_BEST_COMPRESSION;
+	}
+
 	error = deflateInit2(&s->gz_stream, level, Z_DEFLATED, -MAX_WBITS,
 	    DEF_MEM_LEVEL, Z_DEFAULT_STRATEGY);
 	if (error != 0)
@@ -140,7 +147,7 @@ gz_reset(void *stream)
 
 	s = stream;
 	s->gz_off = 0;
-	s->gz_crc = ~0U;
+	s->gz_crc = crc32(0L, Z_NULL, 0);
 
 	(void)deflateReset(&s->gz_stream);
 	s->gz_stream.avail_out = s->gz_bufsz;
@@ -172,9 +179,8 @@ gz_write(void *stream, void *data, size_t len, compressor_cb_t cb,
 	if (len > 0) {
 		s->gz_stream.avail_in = len;
 		s->gz_stream.next_in = data;
-		s->gz_crc = crc32_raw(data, len, s->gz_crc);
-	} else
-		s->gz_crc ^= ~0U;
+		s->gz_crc = crc32(s->gz_crc, data, len);
+	}
 
 	error = 0;
 	do {
@@ -275,8 +281,9 @@ zstdio_init(size_t maxiosize, int level)
 	ZSTD_CCtx *dump_compressor;
 	struct zstdio_stream *s;
 	void *wkspc, *owkspc, *buffer;
-	size_t wkspc_size, buf_size;
+	size_t wkspc_size, buf_size, rc;
 
+	s = NULL;
 	wkspc_size = ZSTD_estimateCStreamSize(level);
 	owkspc = wkspc = malloc(wkspc_size + 8, M_COMPRESS,
 	    M_WAITOK | M_NODUMP);
@@ -286,12 +293,23 @@ zstdio_init(size_t maxiosize, int level)
 
 	dump_compressor = ZSTD_initStaticCCtx(wkspc, wkspc_size);
 	if (dump_compressor == NULL) {
-		free(owkspc, M_COMPRESS);
 		printf("%s: workspace too small.\n", __func__);
-		return (NULL);
+		goto out;
 	}
 
-	(void)ZSTD_CCtx_setParameter(dump_compressor, ZSTD_p_checksumFlag, 1);
+	rc = ZSTD_CCtx_setParameter(dump_compressor, ZSTD_c_checksumFlag, 1);
+	if (ZSTD_isError(rc)) {
+		printf("%s: error setting checksumFlag: %s\n", __func__,
+		    ZSTD_getErrorName(rc));
+		goto out;
+	}
+	rc = ZSTD_CCtx_setParameter(dump_compressor, ZSTD_c_compressionLevel,
+	    level);
+	if (ZSTD_isError(rc)) {
+		printf("%s: error setting compressLevel: %s\n", __func__,
+		    ZSTD_getErrorName(rc));
+		goto out;
+	}
 
 	buf_size = ZSTD_CStreamOutSize() * 2;
 	buffer = malloc(buf_size, M_COMPRESS, M_WAITOK | M_NODUMP);
@@ -306,6 +324,9 @@ zstdio_init(size_t maxiosize, int level)
 
 	zstdio_reset(s);
 
+out:
+	if (s == NULL)
+		free(owkspc, M_COMPRESS);
 	return (s);
 }
 

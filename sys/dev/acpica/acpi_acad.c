@@ -142,13 +142,14 @@ static int
 acpi_acad_probe(device_t dev)
 {
     static char *acad_ids[] = { "ACPI0003", NULL };
+    int rv;
 
-    if (acpi_disabled("acad") ||
-	ACPI_ID_PROBE(device_get_parent(dev), dev, acad_ids) == NULL)
+    if (acpi_disabled("acad"))
 	return (ENXIO);
-
-    device_set_desc(dev, "AC Adapter");
-    return (0);
+    rv = ACPI_ID_PROBE(device_get_parent(dev), dev, acad_ids, NULL);
+    if (rv <= 0)
+	device_set_desc(dev, "AC Adapter");
+    return (rv);
 }
 
 static int
@@ -169,9 +170,9 @@ acpi_acad_attach(device_t dev)
     if (device_get_unit(dev) == 0) {
 	acpi_sc = acpi_device_get_parent_softc(dev);
 	SYSCTL_ADD_PROC(&acpi_sc->acpi_sysctl_ctx,
-			SYSCTL_CHILDREN(acpi_sc->acpi_sysctl_tree),
-			OID_AUTO, "acline", CTLTYPE_INT | CTLFLAG_RD,
-			&sc->status, 0, acpi_acad_sysctl, "I", "");
+	    SYSCTL_CHILDREN(acpi_sc->acpi_sysctl_tree), OID_AUTO, "acline",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_NEEDGIANT, &sc->status, 0,
+	    acpi_acad_sysctl, "I", "");
     }
 
     /* Get initial status after whole system is up. */

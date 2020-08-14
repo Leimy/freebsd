@@ -7,23 +7,20 @@
 #
 MAN=	termcap.5
 
+PACKAGE=	runtime
 FILES=		termcap termcap.db
 FILESDIR=	${BINDIR}/misc
 CLEANFILES+=	termcap.db
+CONFS=		termcap.small
 
 .include <bsd.endian.mk>
-.if ${TARGET_ENDIANNESS} == "1234"
-CAP_MKDB_ENDIAN= -l
-.elif ${TARGET_ENDIANNESS} == "4321"
-CAP_MKDB_ENDIAN= -b
-.else
-CAP_MKDB_ENDIAN=
-.endif
+.include <src.tools.mk>
 
 termcap.db: termcap
-	cap_mkdb ${CAP_MKDB_ENDIAN} -f ${.TARGET:R} ${.ALLSRC}
+	${CAP_MKDB_CMD} ${CAP_MKDB_ENDIAN} -f ${.TARGET:R} ${.ALLSRC}
 
 etc-termcap:
-	${INSTALL_SYMLINK} ${BINDIR}/misc/termcap ${DESTDIR}/etc/termcap
+	${INSTALL_SYMLINK} -T "package=runtime" \
+	    ${BINDIR}/misc/termcap ${DESTDIR}/etc/termcap
 
 .include <bsd.prog.mk>

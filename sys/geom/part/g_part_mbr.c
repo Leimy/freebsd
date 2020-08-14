@@ -52,7 +52,8 @@ __FBSDID("$FreeBSD$");
 FEATURE(geom_part_mbr, "GEOM partitioning class for MBR support");
 
 SYSCTL_DECL(_kern_geom_part);
-static SYSCTL_NODE(_kern_geom_part, OID_AUTO, mbr, CTLFLAG_RW, 0,
+static SYSCTL_NODE(_kern_geom_part, OID_AUTO, mbr,
+    CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "GEOM_PART_MBR Master Boot Record");
 
 static u_int enforce_chs = 0;
@@ -121,28 +122,31 @@ static struct g_part_scheme g_part_mbr_scheme = {
 	.gps_bootcodesz = MBRSIZE,
 };
 G_PART_SCHEME_DECLARE(g_part_mbr);
+MODULE_VERSION(geom_part_mbr, 0);
 
 static struct g_part_mbr_alias {
 	u_char		typ;
 	int		alias;
 } mbr_alias_match[] = {
 	{ DOSPTYP_386BSD,	G_PART_ALIAS_FREEBSD },
+	{ DOSPTYP_APPLE_BOOT,	G_PART_ALIAS_APPLE_BOOT },
+	{ DOSPTYP_APPLE_UFS,	G_PART_ALIAS_APPLE_UFS },
+	{ DOSPTYP_EFI,		G_PART_ALIAS_EFI },
 	{ DOSPTYP_EXT,		G_PART_ALIAS_EBR },
-	{ DOSPTYP_NTFS,		G_PART_ALIAS_MS_NTFS },
+	{ DOSPTYP_EXTLBA,	G_PART_ALIAS_EBR },
 	{ DOSPTYP_FAT16,	G_PART_ALIAS_MS_FAT16 },
 	{ DOSPTYP_FAT32,	G_PART_ALIAS_MS_FAT32 },
-	{ DOSPTYP_EXTLBA,	G_PART_ALIAS_EBR },
+	{ DOSPTYP_FAT32LBA,	G_PART_ALIAS_MS_FAT32LBA },
+	{ DOSPTYP_HFS,		G_PART_ALIAS_APPLE_HFS },
 	{ DOSPTYP_LDM,		G_PART_ALIAS_MS_LDM_DATA },
-	{ DOSPTYP_LINSWP,	G_PART_ALIAS_LINUX_SWAP },
-	{ DOSPTYP_LINUX,	G_PART_ALIAS_LINUX_DATA },
 	{ DOSPTYP_LINLVM,	G_PART_ALIAS_LINUX_LVM },
 	{ DOSPTYP_LINRAID,	G_PART_ALIAS_LINUX_RAID },
+	{ DOSPTYP_LINSWP,	G_PART_ALIAS_LINUX_SWAP },
+	{ DOSPTYP_LINUX,	G_PART_ALIAS_LINUX_DATA },
+	{ DOSPTYP_NTFS,		G_PART_ALIAS_MS_NTFS },
 	{ DOSPTYP_PPCBOOT,	G_PART_ALIAS_PREP_BOOT },
 	{ DOSPTYP_VMFS,		G_PART_ALIAS_VMFS },
 	{ DOSPTYP_VMKDIAG,	G_PART_ALIAS_VMKDIAG },
-	{ DOSPTYP_APPLE_UFS,	G_PART_ALIAS_APPLE_UFS },
-	{ DOSPTYP_APPLE_BOOT,	G_PART_ALIAS_APPLE_BOOT },
-	{ DOSPTYP_HFS,		G_PART_ALIAS_APPLE_HFS },
 };
 
 static int
@@ -271,7 +275,7 @@ g_part_mbr_bootcode(struct g_part_table *basetable, struct g_part_parms *gpp)
 	table = (struct g_part_mbr_table *)basetable;
 	dsn = *(uint32_t *)(table->mbr + DOSDSNOFF);
 	bcopy(gpp->gpp_codeptr, table->mbr, DOSPARTOFF);
-	if (dsn != 0)
+	if (dsn != 0 && !gpp->gpp_skip_dsn)
 		*(uint32_t *)(table->mbr + DOSDSNOFF) = dsn;
 	return (0);
 }
@@ -327,7 +331,7 @@ g_part_mbr_dumpconf(struct g_part_table *basetable, struct g_part_entry *baseent
 		sbuf_printf(sb, "%s<efimedia>HD(%d,MBR,%#08x,%#jx,%#jx)", indent,
 		    entry->base.gpe_index, dsn, (intmax_t)entry->base.gpe_start,
 		    (intmax_t)(entry->base.gpe_end - entry->base.gpe_start + 1));
-		sbuf_printf(sb, "</efimedia>\n");
+		sbuf_cat(sb, "</efimedia>\n");
 	} else {
 		/* confxml: scheme information */
 	}
@@ -378,7 +382,7 @@ g_part_mbr_resize(struct g_part_table *basetable,
 		return (EINVAL);
 	/* XXX: prevent unexpected shrinking. */
 	pp = baseentry->gpe_pp;
-	if ((g_debugflags & 0x10) == 0 && size < gpp->gpp_size &&
+	if ((g_debugflags & G_F_FOOTSHOOTING) == 0 && size < gpp->gpp_size &&
 	    pp->mediasize / pp->sectorsize > size)
 		return (EBUSY);
 	entry = (struct g_part_mbr_entry *)baseentry;

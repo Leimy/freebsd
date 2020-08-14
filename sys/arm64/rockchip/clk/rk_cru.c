@@ -2,7 +2,6 @@
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
  * Copyright (c) 2018 Emmanuel Vadot <manu@freebsd.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -40,7 +39,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/bus.h>
 #include <sys/rman.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <machine/bus.h>
 
 #include <dev/fdt/simplebus.h>
@@ -50,6 +51,8 @@ __FBSDID("$FreeBSD$");
 
 #include <dev/extres/clk/clk.h>
 #include <dev/extres/clk/clk_gate.h>
+#include <dev/extres/clk/clk_fixed.h>
+#include <dev/extres/clk/clk_link.h>
 #include <dev/extres/hwreset/hwreset.h>
 
 #include <arm64/rockchip/clk/rk_clk_composite.h>
@@ -112,20 +115,23 @@ static int
 rk_cru_reset_assert(device_t dev, intptr_t id, bool reset)
 {
 	struct rk_cru_softc *sc;
+	uint32_t reg;
+	int bit;
 	uint32_t val;
 
 	sc = device_get_softc(dev);
 
-	if (id >= sc->nresets || sc->resets[id].offset == 0)
-		return (0);
+	if (id > sc->reset_num)
+		return (ENXIO);
+
+	reg = sc->reset_offset + id / 16 * 4;
+	bit = id % 16;
 
 	mtx_lock(&sc->mtx);
-	val = CCU_READ4(sc, sc->resets[id].offset);
+	val = 0;
 	if (reset)
-		val &= ~(1 << sc->resets[id].shift);
-	else
-		val |= 1 << sc->resets[id].shift;
-	CCU_WRITE4(sc, sc->resets[id].offset, val);
+		val = (1 << bit);
+	CCU_WRITE4(sc, reg, val | ((1 << bit) << 16));
 	mtx_unlock(&sc->mtx);
 
 	return (0);
@@ -135,17 +141,24 @@ static int
 rk_cru_reset_is_asserted(device_t dev, intptr_t id, bool *reset)
 {
 	struct rk_cru_softc *sc;
+	uint32_t reg;
+	int bit;
 	uint32_t val;
 
 	sc = device_get_softc(dev);
 
-	if (id >= sc->nresets || sc->resets[id].offset == 0)
-		return (0);
+	if (id > sc->reset_num)
+		return (ENXIO);
+	reg = sc->reset_offset + id / 16 * 4;
+	bit = id % 16;
 
 	mtx_lock(&sc->mtx);
-	val = CCU_READ4(sc, sc->resets[id].offset);
-	*reset = (val & (1 << sc->resets[id].shift)) != 0 ? false : true;
+	val = CCU_READ4(sc, reg);
 	mtx_unlock(&sc->mtx);
+
+	*reset = false;
+	if (val & (1 << bit))
+		*reset = true;
 
 	return (0);
 }
@@ -197,10 +210,13 @@ int
 rk_cru_attach(device_t dev)
 {
 	struct rk_cru_softc *sc;
+	phandle_t node;
 	int	i;
 
 	sc = device_get_softc(dev);
 	sc->dev = dev;
+
+	node = ofw_bus_get_node(dev);
 
 	if (bus_alloc_resources(dev, rk_cru_spec, &sc->res) != 0) {
 		device_printf(dev, "cannot allocate resources for device\n");
@@ -217,8 +233,13 @@ rk_cru_attach(device_t dev)
 		switch (sc->clks[i].type) {
 		case RK_CLK_UNDEFINED:
 			break;
-		case RK_CLK_PLL:
-			rk_clk_pll_register(sc->clkdom, sc->clks[i].clk.pll);
+		case RK3328_CLK_PLL:
+			rk3328_clk_pll_register(sc->clkdom,
+			    sc->clks[i].clk.pll);
+			break;
+		case RK3399_CLK_PLL:
+			rk3399_clk_pll_register(sc->clkdom,
+			    sc->clks[i].clk.pll);
 			break;
 		case RK_CLK_COMPOSITE:
 			rk_clk_composite_register(sc->clkdom,
@@ -227,12 +248,28 @@ rk_cru_attach(device_t dev)
 		case RK_CLK_MUX:
 			rk_clk_mux_register(sc->clkdom, sc->clks[i].clk.mux);
 			break;
+		case RK_CLK_ARMCLK:
+			rk_clk_armclk_register(sc->clkdom,
+			    sc->clks[i].clk.armclk);
+			break;
+		case RK_CLK_FIXED:
+			clknode_fixed_register(sc->clkdom,
+			    sc->clks[i].clk.fixed);
+			break;
+		case RK_CLK_FRACT:
+			rk_clk_fract_register(sc->clkdom,
+			    sc->clks[i].clk.fract);
+			break;
+		case RK_CLK_LINK:
+			clknode_link_register(sc->clkdom,
+			    sc->clks[i].clk.link);
+			break;
 		default:
 			device_printf(dev, "Unknown clock type\n");
 			return (ENXIO);
-			break;
 		}
 	}
+
 	if (sc->gates)
 		rk_cru_register_gates(sc);
 
@@ -242,9 +279,10 @@ rk_cru_attach(device_t dev)
 	if (bootverbose)
 		clkdom_dump(sc->clkdom);
 
-	/* If we have resets, register our self as a reset provider */
-	if (sc->resets)
-		hwreset_register_ofw_provider(dev);
+	clk_set_assigned(dev, node);
+
+	/* register our self as a reset provider */
+	hwreset_register_ofw_provider(dev);
 
 	return (0);
 }

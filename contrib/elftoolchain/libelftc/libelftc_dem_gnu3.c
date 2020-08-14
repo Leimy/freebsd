@@ -37,7 +37,7 @@
 
 #include "_libelftc.h"
 
-ELFTC_VCSID("$Id: libelftc_dem_gnu3.c 3560 2017-06-25 00:28:23Z kaiwang27 $");
+ELFTC_VCSID("$Id: libelftc_dem_gnu3.c 3583 2017-10-15 15:38:47Z emaste $");
 
 /**
  * @file cpp_demangle.c
@@ -574,8 +574,7 @@ cpp_demangle_push_type_qualifier(struct cpp_demangle_data *ddata,
 			if (!DEM_PUSH_STR(ddata, " imaginary"))
 				goto clean;
 			if (type_str != NULL) {
-				if (!vector_str_push(&subst_v, " imaginary",
-				    10))
+				if (!VEC_PUSH_STR(&subst_v, " imaginary"))
 					goto clean;
 				if (!cpp_demangle_push_subst_v(ddata,
 				    &subst_v))
@@ -1616,8 +1615,7 @@ cpp_demangle_read_encoding(struct cpp_demangle_data *ddata)
 
 	case SIMPLE_HASH('T', 'v'):
 		/* virtual function virtual override thunk */
-		if (!DEM_PUSH_STR(ddata,
-		    "virtual function virtual override "))
+		if (!DEM_PUSH_STR(ddata, "virtual function virtual override "))
 			return (0);
 		ddata->cur += 2;
 		if (*ddata->cur == '\0')
@@ -1661,7 +1659,8 @@ cpp_demangle_read_local_name(struct cpp_demangle_data *ddata)
 	if (*(++ddata->cur) == '\0')
 		return (0);
 
-	vector_str_init(&local_name);
+	if (!vector_str_init(&local_name))
+		return (0);
 	ddata->cur_output = &local_name;
 
 	if (!cpp_demangle_read_encoding(ddata)) {
@@ -2913,7 +2912,7 @@ again:
 		if (len <= 0)
 			goto clean;
 		if (!vector_str_push(&v.ext_name, ddata->cur, len))
-			return (0);
+			goto clean;
 		ddata->cur += len;
 		if (!vector_type_qualifier_push(&v, TYPE_EXT))
 			goto clean;
@@ -3955,7 +3954,7 @@ vector_type_qualifier_init(struct vector_type_qualifier *v)
 
 	assert(v->q_container != NULL);
 
-	if (vector_str_init(&v->ext_name) == false) {
+	if (!vector_str_init(&v->ext_name)) {
 		free(v->q_container);
 		return (0);
 	}

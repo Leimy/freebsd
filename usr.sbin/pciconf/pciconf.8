@@ -25,7 +25,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd November 23, 2015
+.Dd June 14, 2018
 .Dt PCICONF 8
 .Os
 .Sh NAME
@@ -40,6 +40,8 @@
 .Fl r Oo Fl b | h Oc Ar device addr Ns Op : Ns Ar addr2
 .Nm
 .Fl w Oo Fl b | h Oc Ar device addr value
+.Nm
+.Fl D Oo Fl b | h | x Oc Ar device addr Op start Ns Op : Ns Ar count
 .Sh DESCRIPTION
 The
 .Nm
@@ -58,16 +60,16 @@ option,
 .Nm
 lists PCI devices in the following format:
 .Bd -literal
-foo0@pci0:0:4:0: class=0x010000 card=0x00000000 chip=0x000f1000 rev=0x01 \
-hdr=0x00
-bar0@pci0:0:5:0: class=0x000100 card=0x00000000 chip=0x88c15333 rev=0x00 \
-hdr=0x00
-none0@pci0:0:6:0: class=0x020000 card=0x00000000 chip=0x802910ec rev=0x00 \
-hdr=0x00
+foo0@pci0:0:4:0: class=0x010000 rev=0x01 hdr=0x00 vendor=0x1000 device=0x000f \
+subvendor=0x0000 subdevice=0x0000
+bar0@pci0:0:5:0: class=0x000100 rev=0x00 hdr=0x00 vendor=0x88c1 device=0x5333 \
+subvendor=0x0000 subdevice=0x0000
+none0@pci0:0:6:0: class=0x020000 rev=0x00 hdr=0x00 vendor=0x10ec device=0x8029 \
+subvendor=0x0000 subdevice=0x0000
 .Ed
 .Pp
 The first column gives the
-driver name, unit number, and selector .
+driver name, unit number, and selector.
 If there is no driver attached to the
 .Tn PCI
 device in question, the driver name will be
@@ -78,21 +80,10 @@ The selector
 is in a form which may directly be used for the other forms of the command.
 The second column is the class code, with the class byte printed as two
 hex digits, followed by the sub-class and the interface bytes.
-The third column gives the contents of the subvendorid register, introduced
-in revision 2.1 of the
-.Tn PCI
-standard.
-Note that it will be 0 for older cards.
-The field consists of the card ID in the upper
-half and the card vendor ID in the lower half of the value.
+The third column prints the device's revision.
+The fourth column describes the header type.
 .Pp
-The fourth column contains the chip device ID, which identifies the chip
-this card is based on.
-It consists of two fields, identifying the chip and
-its vendor, as above.
-The fifth column prints the chip's revision.
-The sixth column describes the header type.
-Currently assigned header types include 0 for most devices,
+Currently assigned header types include 0 for standard devices,
 1 for
 .Tn PCI
 to
@@ -110,6 +101,27 @@ device, it is a
 .Em multi-function
 device, which contains several (similar or independent) functions on
 one chip.
+.Pp
+The sixth and seventh columns contain the vendor ID and the device ID of the
+device.
+The eigth and ninth columns contain subvendor and subdevice IDs, introduced
+in revision 2.1 of the
+.Tn PCI
+standard.
+Note that they will be 0 for older cards.
+.Pp
+Adding a second
+.Fl l
+option causes output to be in a compact columnar format, suitable for
+80 column output:
+.Bd -literal
+drv     selector        class   rev hdr vendor device subven subdev
+foo0@pci0:0:4:0:        010000  01  00  1000   000f   0000   0000
+bar0@pci0:0:5:0:        000100  00  00  88c1   5333   0000   0000
+none0@pci0:0:6:0:       020000  00  00  10ec   8029   0000   0000
+.Ed
+.Pp
+All fields retain the same definition as with the non-compact form.
 .Pp
 If the
 .Fl B
@@ -178,6 +190,9 @@ If the
 option is supplied,
 .Nm
 will list any capabilities supported by each device.
+A second invocation of
+.Fl c
+will print additional data for certain capabilities.
 Each capability is enumerated via a line in the following format:
 .Bd -literal
     cap 10[40] = PCI-Express 1 root port
@@ -305,17 +320,38 @@ into a configuration space register at byte offset
 .Ar addr
 of device
 .Ar selector .
-For both operations, the flags
-.Fl b
+.Pp
+The
+.Fl D
+option request a dump of the specified BAR.
+Dump is performed to the standard output, raw register values
+are written.
+Use
+.Xr hexdump 1
+to convert them to human-readable dump,
+or redirect into a file to save the snapshot of the device state.
+Optionally, the
+.Ar start
 and
-.Fl h
+.Ar count
+of the registers dumped can be specified, in multiple of the operation width,
+see next paragraph.
+.Pp
+For read, write, and dump operations, the flags
+.Fl b ,
+.Fl h ,
+and
+.Fl x
 select the width of the operation;
 .Fl b
 indicates a byte operation, and
 .Fl h
 indicates a halfword (two-byte) operation.
+.Fl x
+indicates a quadword (four-byte) operation.
 The default is to read or
 write a longword (four bytes).
+The quadword mode is only valid for BAR dump.
 .Sh ENVIRONMENT
 PCI vendor and device information is read from
 .Pa /usr/local/share/pciids/pci.ids .
@@ -368,3 +404,11 @@ to provide the device with a driver KLD, and reading of configuration space
 registers may cause a failure in badly designed
 .Tn PCI
 chips.
+.Pp
+There is currently no way to specify the caching mode for the mapping
+established by the
+.Fl D
+option,
+.Nm
+always uses uncached access.
+This is fine for control register BARs.

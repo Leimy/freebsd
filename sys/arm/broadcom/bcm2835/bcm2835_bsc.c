@@ -100,7 +100,6 @@ __FBSDID("$FreeBSD$");
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
-#include <arm/broadcom/bcm2835/bcm2835_gpio.h>
 #include <arm/broadcom/bcm2835/bcm2835_bscreg.h>
 #include <arm/broadcom/bcm2835/bcm2835_bscvar.h>
 
@@ -249,16 +248,20 @@ bcm_bsc_sysctl_init(struct bcm_bsc_softc *sc)
 	tree_node = device_get_sysctl_tree(sc->sc_dev);
 	tree = SYSCTL_CHILDREN(tree_node);
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "frequency",
-	    CTLFLAG_RW | CTLTYPE_UINT, sc, sizeof(*sc),
+	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+	    sc, sizeof(*sc),
 	    bcm_bsc_clock_proc, "IU", "I2C BUS clock frequency");
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "clock_stretch",
-	    CTLFLAG_RW | CTLTYPE_UINT, sc, sizeof(*sc),
+	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+	    sc, sizeof(*sc),
 	    bcm_bsc_clkt_proc, "IU", "I2C BUS clock stretch timeout");
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "fall_edge_delay",
-	    CTLFLAG_RW | CTLTYPE_UINT, sc, sizeof(*sc),
+	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+	    sc, sizeof(*sc),
 	    bcm_bsc_fall_proc, "IU", "I2C BUS falling edge delay");
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "rise_edge_delay",
-	    CTLFLAG_RW | CTLTYPE_UINT, sc, sizeof(*sc),
+	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+	    sc, sizeof(*sc),
 	    bcm_bsc_rise_proc, "IU", "I2C BUS rising edge delay");
 	SYSCTL_ADD_INT(ctx, tree, OID_AUTO, "debug",
 	    CTLFLAG_RWTUN, &sc->sc_debug, 0,
@@ -298,9 +301,7 @@ static int
 bcm_bsc_attach(device_t dev)
 {
 	struct bcm_bsc_softc *sc;
-	unsigned long start;
-	device_t gpio;
-	int i, rid;
+	int rid;
 
 	sc = device_get_softc(dev);
 	sc->sc_dev = dev;
@@ -315,31 +316,6 @@ bcm_bsc_attach(device_t dev)
 
 	sc->sc_bst = rman_get_bustag(sc->sc_mem_res);
 	sc->sc_bsh = rman_get_bushandle(sc->sc_mem_res);
-
-	/* Check the unit we are attaching by its base address. */
-	start = rman_get_start(sc->sc_mem_res);
-	for (i = 0; i < nitems(bcm_bsc_pins); i++) {
-		if (bcm_bsc_pins[i].start == (start & BCM_BSC_BASE_MASK))
-			break;
-	}
-	if (i == nitems(bcm_bsc_pins)) {
-		device_printf(dev, "only bsc0 and bsc1 are supported\n");
-		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->sc_mem_res);
-		return (ENXIO);
-	}
-
-	/*
-	 * Configure the GPIO pins to ALT0 function to enable BSC control
-	 * over the pins.
-	 */
-	gpio = devclass_get_device(devclass_find("gpio"), 0);
-	if (!gpio) {
-		device_printf(dev, "cannot find gpio0\n");
-		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->sc_mem_res);
-		return (ENXIO);
-	}
-	bcm_gpio_set_alternate(gpio, bcm_bsc_pins[i].sda, BCM_GPIO_ALT0);
-	bcm_gpio_set_alternate(gpio, bcm_bsc_pins[i].scl, BCM_GPIO_ALT0);
 
 	rid = 0;
 	sc->sc_irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
@@ -375,9 +351,7 @@ bcm_bsc_attach(device_t dev)
 	}
 
 	/* Probe and attach the iicbus when interrupts are available. */
-	config_intrhook_oneshot((ich_func_t)bus_generic_attach, dev);
-
-	return (0);
+	return (bus_delayed_attach_children(dev));
 }
 
 static int

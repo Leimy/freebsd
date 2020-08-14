@@ -57,7 +57,7 @@
 #define	CPU_CMP(p, c)			BIT_CMP(CPU_SETSIZE, p, c)
 #define	CPU_OR(d, s)			BIT_OR(CPU_SETSIZE, d, s)
 #define	CPU_AND(d, s)			BIT_AND(CPU_SETSIZE, d, s)
-#define	CPU_NAND(d, s)			BIT_NAND(CPU_SETSIZE, d, s)
+#define	CPU_ANDNOT(d, s)		BIT_ANDNOT(CPU_SETSIZE, d, s)
 #define	CPU_CLR_ATOMIC(n, p)		BIT_CLR_ATOMIC(CPU_SETSIZE, n, p)
 #define	CPU_SET_ATOMIC(n, p)		BIT_SET_ATOMIC(CPU_SETSIZE, n, p)
 #define	CPU_SET_ATOMIC_ACQ(n, p)	BIT_SET_ATOMIC_ACQ(CPU_SETSIZE, n, p)
@@ -139,6 +139,7 @@ int	cpuset_create_root(struct prison *, struct cpuset **);
 int	cpuset_setproc_update_set(struct proc *, struct cpuset *);
 int	cpuset_which(cpuwhich_t, id_t, struct proc **,
 	    struct thread **, struct cpuset **);
+void	cpuset_kernthread(struct thread *);
 
 char	*cpusetobj_strprint(char *, const cpuset_t *);
 int	cpusetobj_strscan(cpuset_t *, const char *);

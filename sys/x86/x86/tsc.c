@@ -29,12 +29,12 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_clock.h"
 
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/cpu.h>
+#include <sys/eventhandler.h>
 #include <sys/limits.h>
 #include <sys/malloc.h>
 #include <sys/systm.h>
@@ -51,6 +51,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/specialreg.h>
 #include <x86/vmware.h>
 #include <dev/acpica/acpi_hpet.h>
+#include <contrib/dev/acpica/include/acpi.h>
 
 #include "cpufreq_if.h"
 
@@ -83,7 +84,8 @@ SYSCTL_INT(_machdep, OID_AUTO, disable_tsc, CTLFLAG_RDTUN, &tsc_disabled, 0,
 
 static int	tsc_skip_calibration;
 SYSCTL_INT(_machdep, OID_AUTO, disable_tsc_calibration, CTLFLAG_RDTUN,
-    &tsc_skip_calibration, 0, "Disable TSC frequency calibration");
+    &tsc_skip_calibration, 0,
+    "Disable TSC frequency calibration");
 
 static void tsc_freq_changed(void *arg, const struct cf_level *level,
     int status);
@@ -128,6 +130,40 @@ tsc_freq_vmware(void)
 			tsc_freq = regs[0] | ((uint64_t)regs[1] << 32);
 	}
 	tsc_is_invariant = 1;
+}
+
+/*
+ * Calculate TSC frequency using information from the CPUID leaf 0x15
+ * 'Time Stamp Counter and Nominal Core Crystal Clock'.  If leaf 0x15
+ * is not functional, as it is on Skylake/Kabylake, try 0x16 'Processor
+ * Frequency Information'.  Leaf 0x16 is described in the SDM as
+ * informational only, but if 0x15 did not work, and TSC calibration
+ * is disabled, it is the best we can get at all.  It should still be
+ * an improvement over the parsing of the CPU model name in
+ * tsc_freq_intel(), when available.
+ */
+static bool
+tsc_freq_cpuid(uint64_t *res)
+{
+	u_int regs[4];
+
+	if (cpu_high < 0x15)
+		return (false);
+	do_cpuid(0x15, regs);
+	if (regs[0] != 0 && regs[1] != 0 && regs[2] != 0) {
+		*res = (uint64_t)regs[2] * regs[1] / regs[0];
+		return (true);
+	}
+
+	if (cpu_high < 0x16)
+		return (false);
+	do_cpuid(0x16, regs);
+	if (regs[0] != 0) {
+		*res = (uint64_t)regs[0] * 1000000;
+		return (true);
+	}
+
+	return (false);
 }
 
 static void
@@ -192,23 +228,19 @@ tsc_freq_intel(void)
 static void
 probe_tsc_freq(void)
 {
-	u_int regs[4];
-	uint64_t tsc1, tsc2;
+	uint64_t tmp_freq, tsc1, tsc2;
+	int no_cpuid_override;
 
-	if (cpu_high >= 6) {
-		do_cpuid(6, regs);
-		if ((regs[2] & CPUID_PERF_STAT) != 0) {
-			/*
-			 * XXX Some emulators expose host CPUID without actual
-			 * support for these MSRs.  We must test whether they
-			 * really work.
-			 */
-			wrmsr(MSR_MPERF, 0);
-			wrmsr(MSR_APERF, 0);
-			DELAY(10);
-			if (rdmsr(MSR_MPERF) > 0 && rdmsr(MSR_APERF) > 0)
-				tsc_perf_stat = 1;
-		}
+	if (cpu_power_ecx & CPUID_PERF_STAT) {
+		/*
+		 * XXX Some emulators expose host CPUID without actual support
+		 * for these MSRs.  We must test whether they really work.
+		 */
+		wrmsr(MSR_MPERF, 0);
+		wrmsr(MSR_APERF, 0);
+		DELAY(10);
+		if (rdmsr(MSR_MPERF) > 0 && rdmsr(MSR_APERF) > 0)
+			tsc_perf_stat = 1;
 	}
 
 	if (vm_guest == VM_GUEST_VMWARE) {
@@ -218,6 +250,7 @@ probe_tsc_freq(void)
 
 	switch (cpu_vendor_id) {
 	case CPU_VENDOR_AMD:
+	case CPU_VENDOR_HYGON:
 		if ((amd_pminfo & AMDPM_TSC_INVARIANT) != 0 ||
 		    (vm_guest == VM_GUEST_NO &&
 		    CPUID_TO_FAMILY(cpu_id) >= 0x10))
@@ -254,17 +287,47 @@ probe_tsc_freq(void)
 	}
 
 	if (tsc_skip_calibration) {
-		if (cpu_vendor_id == CPU_VENDOR_INTEL)
+		if (tsc_freq_cpuid(&tmp_freq))
+			tsc_freq = tmp_freq;
+		else if (cpu_vendor_id == CPU_VENDOR_INTEL)
 			tsc_freq_intel();
-		return;
-	}
+		if (tsc_freq == 0)
+			tsc_disabled = 1;
+	} else {
+		if (bootverbose)
+			printf("Calibrating TSC clock ... ");
+		tsc1 = rdtsc();
+		DELAY(1000000);
+		tsc2 = rdtsc();
+		tsc_freq = tsc2 - tsc1;
 
-	if (bootverbose)
-	        printf("Calibrating TSC clock ... ");
-	tsc1 = rdtsc();
-	DELAY(1000000);
-	tsc2 = rdtsc();
-	tsc_freq = tsc2 - tsc1;
+		/*
+		 * If the difference between calibrated frequency and
+		 * the frequency reported by CPUID 0x15/0x16 leafs
+		 * differ significantly, this probably means that
+		 * calibration is bogus.  It happens on machines
+		 * without 8254 timer.  The BIOS rarely properly
+		 * reports it in FADT boot flags, so just compare the
+		 * frequencies directly.
+		 */
+		if (tsc_freq_cpuid(&tmp_freq) && qabs(tsc_freq - tmp_freq) >
+		    uqmin(tsc_freq, tmp_freq)) {
+			no_cpuid_override = 0;
+			TUNABLE_INT_FETCH("machdep.disable_tsc_cpuid_override",
+			    &no_cpuid_override);
+			if (!no_cpuid_override) {
+				if (bootverbose) {
+					printf(
+	"TSC clock: calibration freq %ju Hz, CPUID freq %ju Hz%s\n",
+					    (uintmax_t)tsc_freq,
+					    (uintmax_t)tmp_freq,
+					    no_cpuid_override ? "" :
+					    ", doing CPUID override");
+				}
+				tsc_freq = tmp_freq;
+			}
+		}
+	}
 	if (bootverbose)
 		printf("TSC clock: %ju Hz\n", (intmax_t)tsc_freq);
 }
@@ -431,7 +494,7 @@ adj_smp_tsc(void *arg)
 }
 
 static int
-test_tsc(void)
+test_tsc(int adj_max_count)
 {
 	uint64_t *data, *tsc;
 	u_int i, size, adj;
@@ -447,7 +510,7 @@ retry:
 	smp_tsc = 1;	/* XXX */
 	smp_rendezvous(smp_no_rendezvous_barrier, comp_smp_tsc,
 	    smp_no_rendezvous_barrier, data);
-	if (!smp_tsc && adj < smp_tsc_adjust) {
+	if (!smp_tsc && adj < adj_max_count) {
 		adj++;
 		smp_rendezvous(smp_no_rendezvous_barrier, adj_smp_tsc,
 		    smp_no_rendezvous_barrier, data);
@@ -461,6 +524,14 @@ retry:
 	if (smp_tsc && tsc_is_invariant) {
 		switch (cpu_vendor_id) {
 		case CPU_VENDOR_AMD:
+		case CPU_VENDOR_HYGON:
+			/*
+			 * Processor Programming Reference (PPR) for AMD
+			 * Family 17h states that the TSC uses a common
+			 * reference for all sockets, cores and threads.
+			 */
+			if (CPUID_TO_FAMILY(cpu_id) >= 0x17)
+				return (1000);
 			/*
 			 * Starting with Family 15h processors, TSC clock
 			 * source is in the north bridge.  Check whether
@@ -484,19 +555,6 @@ retry:
 }
 
 #undef N
-
-#else
-
-/*
- * The function is not called, it is provided to avoid linking failure
- * on uniprocessor kernel.
- */
-static int
-test_tsc(void)
-{
-
-	return (0);
-}
 
 #endif /* SMP */
 
@@ -558,9 +616,12 @@ init_TSC_tc(void)
 	 * non-zero value.  The TSC seems unreliable in virtualized SMP
 	 * environments, so it is set to a negative quality in those cases.
 	 */
+#ifdef SMP
 	if (mp_ncpus > 1)
-		tsc_timecounter.tc_quality = test_tsc();
-	else if (tsc_is_invariant)
+		tsc_timecounter.tc_quality = test_tsc(smp_tsc_adjust);
+	else
+#endif /* SMP */
+	if (tsc_is_invariant)
 		tsc_timecounter.tc_quality = 1000;
 	max_freq >>= tsc_shift;
 
@@ -568,7 +629,8 @@ init:
 	for (shift = 0; shift <= 31 && (tsc_freq >> shift) > max_freq; shift++)
 		;
 	if ((cpu_feature & CPUID_SSE2) != 0 && mp_ncpus > 1) {
-		if (cpu_vendor_id == CPU_VENDOR_AMD) {
+		if (cpu_vendor_id == CPU_VENDOR_AMD ||
+		    cpu_vendor_id == CPU_VENDOR_HYGON) {
 			tsc_timecounter.tc_get_timecount = shift > 0 ?
 			    tsc_get_timecount_low_mfence :
 			    tsc_get_timecount_mfence;
@@ -594,6 +656,32 @@ init:
 	}
 }
 SYSINIT(tsc_tc, SI_SUB_SMP, SI_ORDER_ANY, init_TSC_tc, NULL);
+
+void
+resume_TSC(void)
+{
+#ifdef SMP
+	int quality;
+
+	/* If TSC was not good on boot, it is unlikely to become good now. */
+	if (tsc_timecounter.tc_quality < 0)
+		return;
+	/* Nothing to do with UP. */
+	if (mp_ncpus < 2)
+		return;
+
+	/*
+	 * If TSC was good, a single synchronization should be enough,
+	 * but honour smp_tsc_adjust if it's set.
+	 */
+	quality = test_tsc(MAX(smp_tsc_adjust, 1));
+	if (quality != tsc_timecounter.tc_quality) {
+		printf("TSC timecounter quality changed: %d -> %d\n",
+		    tsc_timecounter.tc_quality, quality);
+		tsc_timecounter.tc_quality = quality;
+	}
+#endif /* SMP */
+}
 
 /*
  * When cpufreq levels change, find out about the (new) max frequency.  We
@@ -683,8 +771,10 @@ sysctl_machdep_tsc_freq(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_machdep, OID_AUTO, tsc_freq, CTLTYPE_U64 | CTLFLAG_RW,
-    0, 0, sysctl_machdep_tsc_freq, "QU", "Time Stamp Counter frequency");
+SYSCTL_PROC(_machdep, OID_AUTO, tsc_freq,
+    CTLTYPE_U64 | CTLFLAG_RW | CTLFLAG_NEEDGIANT,
+    0, 0, sysctl_machdep_tsc_freq, "QU",
+    "Time Stamp Counter frequency");
 
 static u_int
 tsc_get_timecount(struct timecounter *tc __unused)

@@ -34,9 +34,10 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $FreeBSD$
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <linux/module.h>
 #include <linux/device.h>
@@ -1274,7 +1275,6 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
 		kref_get(&file->ref);
 		mutex_unlock(&uverbs_dev->lists_mutex);
 
-		ib_uverbs_event_handler(&file->event_handler, &event);
 
 		mutex_lock(&file->cleanup_mutex);
 		ucontext = file->ucontext;
@@ -1291,6 +1291,7 @@ static void ib_uverbs_free_hw_resources(struct ib_uverbs_device *uverbs_dev,
 			 * for example due to freeing the resources
 			 * (e.g mmput).
 			 */
+			ib_uverbs_event_handler(&file->event_handler, &event);
 			ib_dev->disassociate_ucontext(ucontext);
 			ib_uverbs_cleanup_ucontext(file, ucontext);
 		}
@@ -1430,5 +1431,5 @@ static void __exit ib_uverbs_cleanup(void)
 	idr_destroy(&ib_uverbs_srq_idr);
 }
 
-module_init_order(ib_uverbs_init, SI_ORDER_THIRD);
-module_exit(ib_uverbs_cleanup);
+module_init_order(ib_uverbs_init, SI_ORDER_FIFTH);
+module_exit_order(ib_uverbs_cleanup, SI_ORDER_FIFTH);

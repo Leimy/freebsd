@@ -34,9 +34,11 @@
  */
 #include <sys/param.h>
 #include <sys/errno.h>
+#include <sys/jail.h>
 #include <sys/time.h>
 #include <sys/sysctl.h>
 #include <sys/ucred.h>
+#include <sys/uio.h>
 #include <sys/mount.h>
 
 #include <security/mac_bsdextended/mac_bsdextended.h>
@@ -332,9 +334,8 @@ bsde_rule_to_string(struct mac_bsdextended_rule *rule, char *buf, size_t buflen)
 		if (rule->mbr_object.mbo_flags & MBO_FSID_DEFINED) {
 			numfs = getmntinfo(&mntbuf, MNT_NOWAIT);
 			for (i = 0; i < numfs; i++)
-				if (memcmp(&(rule->mbr_object.mbo_fsid),
-				    &(mntbuf[i].f_fsid),
-				    sizeof(mntbuf[i].f_fsid)) == 0)
+				if (fsidcmp(&rule->mbr_object.mbo_fsid,
+				    &mntbuf[i].f_fsid) == 0)
 					break;
 			len = snprintf(cur, left, "filesys %s ",
 			    i == numfs ? "???" : mntbuf[i].f_mntonname);
@@ -600,16 +601,45 @@ bsde_parse_gidrange(char *spec, gid_t *min, gid_t *max,
 }
 
 static int
+bsde_get_jailid(const char *name, size_t buflen, char *errstr)
+{
+	char *ep;
+	int jid;
+	struct iovec jiov[4];
+
+	/* Copy jail_getid(3) instead of messing with library dependancies */
+	jid = strtoul(name, &ep, 10);
+	if (*name && !*ep)
+		return jid;
+	jiov[0].iov_base = __DECONST(char *, "name");
+	jiov[0].iov_len = sizeof("name");
+	jiov[1].iov_len = strlen(name) + 1;
+	jiov[1].iov_base = alloca(jiov[1].iov_len);
+	strcpy(jiov[1].iov_base, name);
+	if (errstr && buflen) {
+		jiov[2].iov_base = __DECONST(char *, "errmsg");
+		jiov[2].iov_len = sizeof("errmsg");
+		jiov[3].iov_base = errstr;
+		jiov[3].iov_len = buflen;
+		errstr[0] = 0;
+		jid = jail_get(jiov, 4, 0);
+		if (jid < 0 && !errstr[0])
+			snprintf(errstr, buflen, "jail_get: %s",
+			    strerror(errno));
+	} else
+		jid = jail_get(jiov, 2, 0);
+	return jid;
+}
+
+static int
 bsde_parse_subject(int argc, char *argv[],
     struct mac_bsdextended_subject *subject, size_t buflen, char *errstr)
 {
 	int not_seen, flags;
 	int current, neg, nextnot;
-	char *endp;
 	uid_t uid_min, uid_max;
 	gid_t gid_min, gid_max;
 	int jid = 0;
-	long value;
 
 	current = 0;
 	flags = 0;
@@ -668,13 +698,9 @@ bsde_parse_subject(int argc, char *argv[],
 				snprintf(errstr, buflen, "one jail only");
 				return (-1);
 			}
-			value = strtol(argv[current+1], &endp, 10);
-			if (*endp != '\0') {
-				snprintf(errstr, buflen, "invalid jid: '%s'",
-				    argv[current+1]);
+			jid = bsde_get_jailid(argv[current+1], buflen, errstr);
+			if (jid < 0)
 				return (-1);
-			}
-			jid = value;
 			flags |= MBS_PRISON_DEFINED;
 			if (nextnot) {
 				neg ^= MBS_PRISON_DEFINED;

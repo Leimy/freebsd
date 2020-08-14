@@ -174,6 +174,8 @@ struct denode {
 #define	DE_MODIFIED	0x0020	/* Denode has been modified */
 #define	DE_RENAME	0x0040	/* Denode is in the process of being renamed */
 
+/* Maximum size of a file on a FAT filesystem */
+#define MSDOSFS_FILESIZE_MAX	0xFFFFFFFFLL
 
 /*
  * Transfer directory entries between internal and external form.
@@ -260,9 +262,11 @@ struct defid {
 
 extern struct vop_vector msdosfs_vnodeops;
 
+#ifdef _KERNEL
 int msdosfs_lookup(struct vop_cachedlookup_args *);
 int msdosfs_inactive(struct vop_inactive_args *);
 int msdosfs_reclaim(struct vop_reclaim_args *);
+#endif
 
 /*
  * Internal service routine prototypes.
@@ -283,4 +287,3 @@ int detrunc(struct denode *dep, u_long length, int flags, struct ucred *cred);
 int doscheckpath( struct denode *source, struct denode *target);
 #endif	/* _KERNEL || MAKEFS */
 #endif	/* !_FS_MSDOSFS_DENODE_H_ */
-

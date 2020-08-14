@@ -58,6 +58,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/proc.h>
 
 #include <net/bpf.h>
+#include <net/debugnet.h>
 #include <net/ethernet.h>
 #include <net/if.h>
 #include <net/if_var.h>
@@ -132,6 +133,30 @@ static void cxgb_update_mac_settings(struct port_info *p);
 static int toe_capability(struct port_info *, int);
 #endif
 
+/* Table for probing the cards.  The desc field isn't actually used */
+struct cxgb_ident {
+	uint16_t	vendor;
+	uint16_t	device;
+	int		index;
+	char		*desc;
+} cxgb_identifiers[] = {
+	{PCI_VENDOR_ID_CHELSIO, 0x0020, 0, "PE9000"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0021, 1, "T302E"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0022, 2, "T310E"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0023, 3, "T320X"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0024, 1, "T302X"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0025, 3, "T320E"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0026, 2, "T310X"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0030, 2, "T3B10"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0031, 3, "T3B20"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0032, 1, "T3B02"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0033, 4, "T3B04"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0035, 6, "T3C10"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0036, 3, "S320E-CR"},
+	{PCI_VENDOR_ID_CHELSIO, 0x0037, 7, "N320E-G2"},
+	{0, 0, 0, NULL}
+};
+
 static device_method_t cxgb_controller_methods[] = {
 	DEVMETHOD(device_probe,		cxgb_controller_probe),
 	DEVMETHOD(device_attach,	cxgb_controller_attach),
@@ -150,6 +175,8 @@ static int cxgbc_mod_event(module_t, int, void *);
 static devclass_t	cxgb_controller_devclass;
 DRIVER_MODULE(cxgbc, pci, cxgb_controller_driver, cxgb_controller_devclass,
     cxgbc_mod_event, 0);
+MODULE_PNP_INFO("U16:vendor;U16:device", pci, cxgbc, cxgb_identifiers,
+    nitems(cxgb_identifiers) - 1);
 MODULE_VERSION(cxgbc, 1);
 MODULE_DEPEND(cxgbc, firmware, 1, 1, 1);
 
@@ -191,6 +218,8 @@ static devclass_t	cxgb_port_devclass;
 DRIVER_MODULE(cxgb, cxgbc, cxgb_port_driver, cxgb_port_devclass, 0, 0);
 MODULE_VERSION(cxgb, 1);
 
+DEBUGNET_DEFINE(cxgb);
+
 static struct mtx t3_list_lock;
 static SLIST_HEAD(, adapter) t3_list;
 #ifdef TCP_OFFLOAD
@@ -209,7 +238,8 @@ static SLIST_HEAD(, uld_info) t3_uld_list;
  */
 static int msi_allowed = 2;
 
-SYSCTL_NODE(_hw, OID_AUTO, cxgb, CTLFLAG_RD, 0, "CXGB driver parameters");
+SYSCTL_NODE(_hw, OID_AUTO, cxgb, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "CXGB driver parameters");
 SYSCTL_INT(_hw_cxgb, OID_AUTO, msi_allowed, CTLFLAG_RDTUN, &msi_allowed, 0,
     "MSI-X, MSI, INTx selector");
 
@@ -277,29 +307,6 @@ enum { FILTER_NO_VLAN_PRI = 7 };
 
 #define PORT_MASK ((1 << MAX_NPORTS) - 1)
 
-/* Table for probing the cards.  The desc field isn't actually used */
-struct cxgb_ident {
-	uint16_t	vendor;
-	uint16_t	device;
-	int		index;
-	char		*desc;
-} cxgb_identifiers[] = {
-	{PCI_VENDOR_ID_CHELSIO, 0x0020, 0, "PE9000"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0021, 1, "T302E"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0022, 2, "T310E"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0023, 3, "T320X"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0024, 1, "T302X"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0025, 3, "T320E"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0026, 2, "T310X"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0030, 2, "T3B10"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0031, 3, "T3B20"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0032, 1, "T3B02"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0033, 4, "T3B04"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0035, 6, "T3C10"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0036, 3, "S320E-CR"},
-	{PCI_VENDOR_ID_CHELSIO, 0x0037, 7, "N320E-G2"},
-	{0, 0, 0, NULL}
-};
 
 static int set_eeprom(struct port_info *pi, const uint8_t *data, int len, int offset);
 
@@ -847,6 +854,8 @@ setup_sge_qsets(adapter_t *sc)
 		}
 	}
 
+	sc->nqsets = qset_idx;
+
 	return (0);
 }
 
@@ -1044,6 +1053,9 @@ cxgb_port_attach(device_t dev)
 	}
 
 	ether_ifattach(ifp, p->hw_addr);
+
+	/* Attach driver debugnet methods. */
+	DEBUGNET_SET(ifp, cxgb);
 
 #ifdef DEFAULT_JUMBO
 	if (sc->params.nports <= 2)
@@ -1952,6 +1964,7 @@ fail:
 
 			if (IFCAP_TSO4 & ifp->if_capenable &&
 			    !(IFCAP_TXCSUM & ifp->if_capenable)) {
+				mask &= ~IFCAP_TSO4;
 				ifp->if_capenable &= ~IFCAP_TSO4;
 				if_printf(ifp,
 				    "tso4 disabled due to -txcsum.\n");
@@ -1963,6 +1976,7 @@ fail:
 
 			if (IFCAP_TSO6 & ifp->if_capenable &&
 			    !(IFCAP_TXCSUM_IPV6 & ifp->if_capenable)) {
+				mask &= ~IFCAP_TSO6;
 				ifp->if_capenable &= ~IFCAP_TSO6;
 				if_printf(ifp,
 				    "tso6 disabled due to -txcsum6.\n");
@@ -3578,3 +3592,72 @@ cxgbc_mod_event(module_t mod, int cmd, void *arg)
 
 	return (rc);
 }
+
+#ifdef DEBUGNET
+static void
+cxgb_debugnet_init(struct ifnet *ifp, int *nrxr, int *ncl, int *clsize)
+{
+	struct port_info *pi;
+	adapter_t *adap;
+
+	pi = if_getsoftc(ifp);
+	adap = pi->adapter;
+	ADAPTER_LOCK(adap);
+	*nrxr = adap->nqsets;
+	*ncl = adap->sge.qs[0].fl[1].size;
+	*clsize = adap->sge.qs[0].fl[1].buf_size;
+	ADAPTER_UNLOCK(adap);
+}
+
+static void
+cxgb_debugnet_event(struct ifnet *ifp, enum debugnet_ev event)
+{
+	struct port_info *pi;
+	struct sge_qset *qs;
+	int i;
+
+	pi = if_getsoftc(ifp);
+	if (event == DEBUGNET_START)
+		for (i = 0; i < pi->adapter->nqsets; i++) {
+			qs = &pi->adapter->sge.qs[i];
+
+			/* Need to reinit after debugnet_mbuf_start(). */
+			qs->fl[0].zone = zone_pack;
+			qs->fl[1].zone = zone_clust;
+			qs->lro.enabled = 0;
+		}
+}
+
+static int
+cxgb_debugnet_transmit(struct ifnet *ifp, struct mbuf *m)
+{
+	struct port_info *pi;
+	struct sge_qset *qs;
+
+	pi = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING)
+		return (ENOENT);
+
+	qs = &pi->adapter->sge.qs[pi->first_qset];
+	return (cxgb_debugnet_encap(qs, &m));
+}
+
+static int
+cxgb_debugnet_poll(struct ifnet *ifp, int count)
+{
+	struct port_info *pi;
+	adapter_t *adap;
+	int i;
+
+	pi = if_getsoftc(ifp);
+	if ((if_getdrvflags(ifp) & IFF_DRV_RUNNING) == 0)
+		return (ENOENT);
+
+	adap = pi->adapter;
+	for (i = 0; i < adap->nqsets; i++)
+		(void)cxgb_debugnet_poll_rx(adap, &adap->sge.qs[i]);
+	(void)cxgb_debugnet_poll_tx(&adap->sge.qs[pi->first_qset]);
+	return (0);
+}
+#endif /* DEBUGNET */

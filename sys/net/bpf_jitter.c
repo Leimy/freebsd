@@ -57,7 +57,8 @@ static u_int	bpf_jit_accept_all(u_char *, u_int, u_int);
 #ifdef _KERNEL
 MALLOC_DEFINE(M_BPFJIT, "BPF_JIT", "BPF JIT compiler");
 
-SYSCTL_NODE(_net, OID_AUTO, bpf_jitter, CTLFLAG_RW, 0, "BPF JIT compiler");
+SYSCTL_NODE(_net, OID_AUTO, bpf_jitter, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "BPF JIT compiler");
 int bpf_jitter_enable = 1;
 SYSCTL_INT(_net_bpf_jitter, OID_AUTO, enable, CTLFLAG_RW,
     &bpf_jitter_enable, 0, "enable BPF JIT compiler");
@@ -101,11 +102,13 @@ void
 bpf_destroy_jit_filter(bpf_jit_filter *filter)
 {
 
-	if (filter->func != bpf_jit_accept_all)
-		bpf_jit_free(filter->func, filter->size);
 #ifdef _KERNEL
+	if (filter->func != bpf_jit_accept_all)
+		free(filter->func, M_BPFJIT);
 	free(filter, M_BPFJIT);
 #else
+	if (filter->func != bpf_jit_accept_all)
+		munmap(filter->func, filter->size);
 	free(filter);
 #endif
 }

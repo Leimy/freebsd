@@ -106,8 +106,13 @@ addr_to_string(struct sockaddr_storage *ss, char *buffer, int buflen)
 
 	case AF_INET:
 		sin = (struct sockaddr_in *)ss;
-		snprintf(buffer, buflen, "%s:%d", inet_ntoa(sin->sin_addr),
-		    ntohs(sin->sin_port));
+		if (sin->sin_addr.s_addr == INADDR_ANY)
+		    snprintf(buffer, buflen, "%s:%d", "*",
+		        ntohs(sin->sin_port));
+		else if (inet_ntop(AF_INET, &sin->sin_addr, buffer2,
+		    sizeof(buffer2)) != NULL)
+			snprintf(buffer, buflen, "%s:%d", buffer2,
+		            ntohs(sin->sin_port));
 		break;
 
 	case AF_INET6:
@@ -406,6 +411,11 @@ procstat_files(struct procstat *procstat, struct kinfo_proc *kipp)
 		case PS_FST_TYPE_PROCDESC:
 			str = "P";
 			xo_emit("{eq:fd_type/procdesc}");
+			break;
+
+		case PS_FST_TYPE_DEV:
+			str = "D";
+			xo_emit("{eq:fd_type/dev}");
 			break;
 
 		case PS_FST_TYPE_NONE:

@@ -18,7 +18,6 @@
 #
 # $FreeBSD$
 
-# TODO: Port to INTRNG
 #NO_UNIVERSE
 
 ident		MV-88F78XX0
@@ -27,8 +26,6 @@ include 	"std.armv7"
 include 	"../mv/armadaxp/std.mv78x60"
 
 options 	SOC_MV_ARMADAXP
-
-makeoptions	WERROR="-Werror"
 
 options 	SCHED_ULE		# ULE scheduler
 options 	SMP			# Enable multiple cores
@@ -47,7 +44,6 @@ options 	NO_FFS_SNAPSHOT
 options 	NO_SWAPPING
 
 # Pseudo devices
-device		random
 device		pty
 device		loop
 device		md
@@ -88,3 +84,5 @@ device		pci
 options 	FDT			# Configure using FDT/DTB data
 options 	FDT_DTB_STATIC
 makeoptions	FDT_DTS_FILE=db78460.dts
+
+options 	PLATFORM

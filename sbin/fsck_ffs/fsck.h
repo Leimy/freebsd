@@ -127,7 +127,7 @@ struct inostat {
  * Inode state information is contained on per cylinder group lists
  * which are described by the following structure.
  */
-struct inostatlist {
+extern struct inostatlist {
 	long	il_numalloced;	/* number of inodes allocated in this cg */
 	struct inostat *il_stat;/* inostat info for this cylinder group */
 } *inostathead;
@@ -231,7 +231,9 @@ struct inodesc {
 	ino_t id_parent;	/* for DATA nodes, their parent */
 	ufs_lbn_t id_lbn;	/* logical block number of current block */
 	ufs2_daddr_t id_blkno;	/* current block number being examined */
+	int id_level;		/* level of indirection of this block */
 	int id_numfrags;	/* number of frags contained in block */
+	ufs_lbn_t id_lballoc;	/* pass1: last LBN that is allocated */
 	off_t id_filesize;	/* for DATA nodes, the size of the directory */
 	ufs2_daddr_t id_entryno;/* for DATA nodes, current entry number */
 	int id_loc;		/* for DATA nodes, current location in dir */
@@ -269,13 +271,13 @@ struct dups {
 	struct dups *next;
 	ufs2_daddr_t dup;
 };
-struct dups *duplist;		/* head of dup list */
-struct dups *muldup;		/* end of unique duplicate dup block numbers */
+extern struct dups *duplist;		/* head of dup list */
+extern struct dups *muldup;		/* end of unique duplicate dup block numbers */
 
 /*
  * Inode cache data structures.
  */
-struct inoinfo {
+extern struct inoinfo {
 	struct	inoinfo *i_nexthash;	/* next entry in hash chain */
 	ino_t	i_number;		/* inode number of this entry */
 	ino_t	i_parent;		/* inode number of parent */
@@ -291,6 +293,7 @@ extern long countdirs;		/* number of directories we actually found */
 #define MIBSIZE	3		/* size of fsck sysctl MIBs */
 extern int	adjrefcnt[MIBSIZE];	/* MIB command to adjust inode reference cnt */
 extern int	adjblkcnt[MIBSIZE];	/* MIB command to adjust inode block count */
+extern int	setsize[MIBSIZE];	/* MIB command to set inode size */
 extern int	adjndir[MIBSIZE];	/* MIB command to adjust number of directories */
 extern int	adjnbfree[MIBSIZE];	/* MIB command to adjust number of free blocks */
 extern int	adjnifree[MIBSIZE];	/* MIB command to adjust number of free inodes */
@@ -312,6 +315,7 @@ extern off_t	bflag;			/* location of alternate super block */
 extern int	debug;			/* output debugging info */
 extern int	Eflag;			/* delete empty data blocks */
 extern int	Zflag;			/* zero empty data blocks */
+extern int	zflag;			/* zero unused directory space */
 extern int	inoopt;			/* trim out unused inodes */
 extern char	ckclean;		/* only do work if not cleanly unmounted */
 extern int	cvtlevel;		/* convert to newer file system format */
@@ -417,6 +421,7 @@ void		blzero(int fd, ufs2_daddr_t blk, long size);
 void		cacheino(union dinode *dp, ino_t inumber);
 void		catch(int);
 void		catchquit(int);
+void		cgdirty(struct bufarea *);
 int		changeino(ino_t dir, const char *name, ino_t newnum);
 int		check_cgmagic(int cg, struct bufarea *cgbp);
 int		chkrange(ufs2_daddr_t blk, int cnt);
@@ -448,7 +453,7 @@ union dinode   *ginode(ino_t inumber);
 void		infohandler(int sig);
 void		alarmhandler(int sig);
 void		inocleanup(void);
-void		inodirty(void);
+void		inodirty(union dinode *);
 struct inostat *inoinfo(ino_t inum);
 void		IOstats(char *what);
 int		linkup(ino_t orphan, ino_t parentdir, char *name);
@@ -463,8 +468,8 @@ void		pass4(void);
 int		pass4check(struct inodesc *);
 void		pass5(void);
 void		pfatal(const char *fmt, ...) __printflike(1, 2);
-void		pinode(ino_t ino);
 void		propagate(void);
+void		prtinode(ino_t ino, union dinode *dp);
 void		pwarn(const char *fmt, ...) __printflike(1, 2);
 int		readsb(int listerr);
 int		reply(const char *question);

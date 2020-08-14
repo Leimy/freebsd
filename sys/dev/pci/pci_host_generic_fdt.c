@@ -65,8 +65,6 @@ __FBSDID("$FreeBSD$");
 
 #include "pcib_if.h"
 
-#define	PCI_IO_WINDOW_OFFSET	0x1000
-
 #define	SPACE_CODE_SHIFT	24
 #define	SPACE_CODE_MASK		0x3
 #define	SPACE_CODE_IO_SPACE	0x1
@@ -122,15 +120,11 @@ generic_pcie_fdt_probe(device_t dev)
 }
 
 int
-pci_host_generic_attach(device_t dev)
+pci_host_generic_setup_fdt(device_t dev)
 {
 	struct generic_pcie_fdt_softc *sc;
-	uint64_t phys_base;
-	uint64_t pci_base;
-	uint64_t size;
 	phandle_t node;
 	int error;
-	int tuple;
 
 	sc = device_get_softc(dev);
 
@@ -152,34 +146,30 @@ pci_host_generic_attach(device_t dev)
 		device_printf(dev, "Bus is%s cache-coherent\n",
 		    sc->base.coherent ? "" : " not");
 
+	/* TODO parse FDT bus ranges */
+	sc->base.bus_start = 0;
+	sc->base.bus_end = 0xFF;
+
 	error = pci_host_generic_core_attach(dev);
 	if (error != 0)
 		return (error);
 
-	for (tuple = 0; tuple < MAX_RANGES_TUPLES; tuple++) {
-		phys_base = sc->base.ranges[tuple].phys_base;
-		pci_base = sc->base.ranges[tuple].pci_base;
-		size = sc->base.ranges[tuple].size;
-		if (phys_base == 0 || size == 0)
-			continue; /* empty range element */
-		if (sc->base.ranges[tuple].flags & FLAG_MEM) {
-			error = rman_manage_region(&sc->base.mem_rman,
-			   phys_base, phys_base + size - 1);
-		} else if (sc->base.ranges[tuple].flags & FLAG_IO) {
-			error = rman_manage_region(&sc->base.io_rman,
-			   pci_base + PCI_IO_WINDOW_OFFSET,
-			   pci_base + PCI_IO_WINDOW_OFFSET + size - 1);
-		} else
-			continue;
-		if (error) {
-			device_printf(dev, "rman_manage_region() failed."
-						"error = %d\n", error);
-			rman_fini(&sc->base.mem_rman);
-			return (error);
-		}
-	}
-
 	ofw_bus_setup_iinfo(node, &sc->pci_iinfo, sizeof(cell_t));
+
+	return (0);
+}
+
+int
+pci_host_generic_attach(device_t dev)
+{
+	struct generic_pcie_fdt_softc *sc;
+	int error;
+
+	sc = device_get_softc(dev);
+
+	error = pci_host_generic_setup_fdt(dev);
+	if (error != 0)
+		return (error);
 
 	device_add_child(dev, "pci", -1);
 	return (bus_generic_attach(dev));
@@ -221,9 +211,9 @@ parse_pci_mem_ranges(device_t dev, struct generic_pcie_core_softc *sc)
 		attributes = (base_ranges[j++] >> SPACE_CODE_SHIFT) & \
 							SPACE_CODE_MASK;
 		if (attributes == SPACE_CODE_IO_SPACE) {
-			sc->ranges[i].flags |= FLAG_IO;
+			sc->ranges[i].flags |= FLAG_TYPE_IO;
 		} else {
-			sc->ranges[i].flags |= FLAG_MEM;
+			sc->ranges[i].flags |= FLAG_TYPE_MEM;
 		}
 
 		sc->ranges[i].pci_base = 0;
@@ -379,80 +369,6 @@ pci_host_generic_alloc_resource(device_t dev, device_t child, int type,
 
 	return (bus_generic_alloc_resource(dev, child, type, rid, start,
 	    end, count, flags));
-}
-
-static int
-generic_pcie_fdt_activate_resource(device_t dev, device_t child, int type,
-    int rid, struct resource *r)
-{
-	struct generic_pcie_fdt_softc *sc;
-	uint64_t phys_base;
-	uint64_t pci_base;
-	uint64_t size;
-	int found;
-	int res;
-	int i;
-
-	sc = device_get_softc(dev);
-
-	if ((res = rman_activate_resource(r)) != 0)
-		return (res);
-
-	switch(type) {
-	case SYS_RES_IOPORT:
-		found = 0;
-		for (i = 0; i < MAX_RANGES_TUPLES; i++) {
-			pci_base = sc->base.ranges[i].pci_base;
-			phys_base = sc->base.ranges[i].phys_base;
-			size = sc->base.ranges[i].size;
-
-			if ((rid > pci_base) && (rid < (pci_base + size))) {
-				found = 1;
-				break;
-			}
-		}
-		if (found) {
-			rman_set_start(r, rman_get_start(r) + phys_base);
-			rman_set_end(r, rman_get_end(r) + phys_base);
-			res = BUS_ACTIVATE_RESOURCE(device_get_parent(dev),
-			    child, type, rid, r);
-		} else {
-			device_printf(dev,
-			    "Failed to activate IOPORT resource\n");
-			res = 0;
-		}
-		break;
-	case SYS_RES_MEMORY:
-		res = BUS_ACTIVATE_RESOURCE(device_get_parent(dev), child,
-		    type, rid, r);
-		break;
-	default:
-		break;
-	}
-
-	return (res);
-}
-
-static int
-generic_pcie_fdt_deactivate_resource(device_t dev, device_t child, int type,
-    int rid, struct resource *r)
-{
-	int res;
-
-	if ((res = rman_deactivate_resource(r)) != 0)
-		return (res);
-
-	switch(type) {
-	case SYS_RES_IOPORT:
-	case SYS_RES_MEMORY:
-		res = BUS_DEACTIVATE_RESOURCE(device_get_parent(dev), child,
-		    type, rid, r);
-		break;
-	default:
-		break;
-	}
-
-	return (res);
 }
 
 static int
@@ -625,8 +541,6 @@ static device_method_t generic_pcie_fdt_methods[] = {
 	DEVMETHOD(device_attach,	pci_host_generic_attach),
 	DEVMETHOD(bus_alloc_resource,	pci_host_generic_alloc_resource),
 	DEVMETHOD(bus_release_resource,	generic_pcie_fdt_release_resource),
-	DEVMETHOD(bus_activate_resource, generic_pcie_fdt_activate_resource),
-	DEVMETHOD(bus_deactivate_resource,generic_pcie_fdt_deactivate_resource),
 
 	/* pcib interface */
 	DEVMETHOD(pcib_route_interrupt,	generic_pcie_fdt_route_interrupt),

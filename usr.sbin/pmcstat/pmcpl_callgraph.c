@@ -58,6 +58,7 @@ __FBSDID("$FreeBSD$");
 #include <errno.h>
 #include <fcntl.h>
 #include <gelf.h>
+#include <inttypes.h>
 #include <libgen.h>
 #include <limits.h>
 #include <netdb.h>
@@ -152,10 +153,12 @@ pmcstat_cgnode_hash_lookup_pc(struct pmcstat_process *pp, pmc_id_t pmcid,
 	 * Try determine the function at this offset.  If we can't
 	 * find a function round leave the `pc' value alone.
 	 */
-	if ((sym = pmcstat_symbol_search(image, pc)) != NULL)
-		pc = sym->ps_start;
-	else
-		pmcstat_stats.ps_samples_unknown_function++;
+	if (!(args.pa_flags & (FLAG_SKIP_TOP_FN_RES | FLAG_SHOW_OFFSET))) {
+		if ((sym = pmcstat_symbol_search(image, pc)) != NULL)
+			pc = sym->ps_start;
+		else
+			pmcstat_stats.ps_samples_unknown_function++;
+	}
 
 	for (hash = i = 0; i < sizeof(uintfptr_t); i++)
 		hash += (pc >> i) & 0xFF;
@@ -345,7 +348,7 @@ pmcpl_cg_process(struct pmcstat_process *pp, struct pmcstat_pmcrecord *pmcr,
 
 	pc = cc[0];
 	pmcid = pmcr->pr_pmcid;
-	parent = pmcstat_cgnode_hash_lookup_pc(pp, pmcid, pc, usermode);
+	child = parent = pmcstat_cgnode_hash_lookup_pc(pp, pmcid, pc, usermode);
 	if (parent == NULL) {
 		pmcstat_stats.ps_callchain_dubious_frames++;
 		pmcr->pr_dubious_frames++;
@@ -384,7 +387,7 @@ pmcpl_cg_process(struct pmcstat_process *pp, struct pmcstat_pmcrecord *pmcr,
 			}
 		}
 		if (ppm == NULL)
-			return;
+			continue;
 
 		image = ppm->ppm_image;
 		loadaddress = ppm->ppm_lowpc + image->pi_vaddr -
@@ -473,15 +476,13 @@ pmcstat_callgraph_print(void)
 
 static void
 pmcstat_cgnode_topprint(struct pmcstat_cgnode *cg,
-    int depth, uint32_t nsamples)
+    int depth __unused, uint32_t nsamples)
 {
 	int v_attrs, vs_len, ns_len, width, len, n, nchildren;
 	float v;
 	char ns[30], vs[10];
 	struct pmcstat_symbol *sym;
 	struct pmcstat_cgnode **sortbuffer, **cgn, *pcg;
-
-	(void) depth;
 
 	/* Format value. */
 	v = PMCPL_CG_COUNTP(cg);
@@ -490,17 +491,32 @@ pmcstat_cgnode_topprint(struct pmcstat_cgnode *cg,
 
 	/* Format name. */
 	sym = pmcstat_symbol_search(cg->pcg_image, cg->pcg_func);
-	if (sym != NULL) {
-		snprintf(ns, sizeof(ns), "%s",
-		    pmcstat_string_unintern(sym->ps_name));
-	} else
+	if (sym == NULL) {
 		snprintf(ns, sizeof(ns), "%p",
-		    (void *)cg->pcg_func);
+		    (void *)(cg->pcg_image->pi_vaddr + cg->pcg_func));
+	} else {
+		switch (args.pa_flags & (FLAG_SKIP_TOP_FN_RES | FLAG_SHOW_OFFSET)) {
+		case FLAG_SKIP_TOP_FN_RES | FLAG_SHOW_OFFSET:
+		case FLAG_SKIP_TOP_FN_RES:
+			snprintf(ns, sizeof(ns), "%p",
+			    (void *)(cg->pcg_image->pi_vaddr + cg->pcg_func));
+			break;
+		case FLAG_SHOW_OFFSET:
+			snprintf(ns, sizeof(ns), "%s+%#0" PRIx64,
+			    pmcstat_string_unintern(sym->ps_name),
+			    cg->pcg_func - sym->ps_start);
+			break;
+		default:
+			snprintf(ns, sizeof(ns), "%s",
+			    pmcstat_string_unintern(sym->ps_name));
+			break;
+		}
+	}
 
 	PMCSTAT_ATTRON(v_attrs);
 	PMCSTAT_PRINTW("%5.5s", vs);
 	PMCSTAT_ATTROFF(v_attrs);
-	PMCSTAT_PRINTW(" %-10.10s %-20.20s",
+	PMCSTAT_PRINTW(" %-10.10s %-30.30s",
 	    pmcstat_string_unintern(cg->pcg_image->pi_name),
 	    ns);
 
@@ -624,7 +640,7 @@ pmcpl_cg_topdisplay(void)
 	qsort(sortbuffer, nentries, sizeof(struct pmcstat_cgnode *),
 	    pmcstat_cgnode_compare);
 
-	PMCSTAT_PRINTW("%5.5s %-10.10s %-20.20s %s\n",
+	PMCSTAT_PRINTW("%5.5s %-10.10s %-30.30s %s\n",
 	    "%SAMP", "IMAGE", "FUNCTION", "CALLERS");
 
 	nentries = min(pmcstat_displayheight - 2, nentries);

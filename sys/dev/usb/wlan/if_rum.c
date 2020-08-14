@@ -44,10 +44,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/endian.h>
 #include <sys/kdb.h>
 
-#include <machine/bus.h>
-#include <machine/resource.h>
-#include <sys/rman.h>
-
 #include <net/bpf.h>
 #include <net/if.h>
 #include <net/if_var.h>
@@ -84,7 +80,8 @@ __FBSDID("$FreeBSD$");
 #ifdef USB_DEBUG
 static int rum_debug = 0;
 
-static SYSCTL_NODE(_hw_usb, OID_AUTO, rum, CTLFLAG_RW, 0, "USB rum");
+static SYSCTL_NODE(_hw_usb, OID_AUTO, rum, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "USB rum");
 SYSCTL_INT(_hw_usb_rum, OID_AUTO, debug, CTLFLAG_RWTUN, &rum_debug, 0,
     "Debug level");
 #endif
@@ -341,9 +338,6 @@ static const struct {
 	{ 102, 0x16 },
 	{ 107, 0x04 }
 };
-
-static const uint8_t rum_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 
 static const uint8_t rum_chan_5ghz[] =
 	{ 34, 36, 38, 40, 42, 44, 46, 48, 52, 56, 60, 64,
@@ -1175,6 +1169,7 @@ rum_bulk_read_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_frame_min *wh;
 	struct ieee80211_node *ni;
+	struct epoch_tracker et;
 	struct mbuf *m = NULL;
 	struct usb_page_cache *pc;
 	uint32_t flags;
@@ -1293,6 +1288,7 @@ tr_setup:
 			else
 				ni = NULL;
 
+			NET_EPOCH_ENTER(et);
 			if (ni != NULL) {
 				(void) ieee80211_input(ni, m, rssi,
 				    RT2573_NOISE_FLOOR);
@@ -1300,6 +1296,7 @@ tr_setup:
 			} else
 				(void) ieee80211_input_all(ic, m, rssi,
 				    RT2573_NOISE_FLOOR);
+			NET_EPOCH_EXIT(et);
 		}
 		RUM_LOCK(sc);
 		rum_start(sc);
@@ -3220,8 +3217,7 @@ rum_getradiocaps(struct ieee80211com *ic,
 	memset(bands, 0, sizeof(bands));
 	setbit(bands, IEEE80211_MODE_11B);
 	setbit(bands, IEEE80211_MODE_11G);
-	ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
-	    rum_chan_2ghz, nitems(rum_chan_2ghz), bands, 0);
+	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
 
 	if (sc->rf_rev == RT2573_RF_5225 || sc->rf_rev == RT2573_RF_5226) {
 		setbit(bands, IEEE80211_MODE_11A);

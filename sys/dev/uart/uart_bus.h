@@ -56,6 +56,10 @@
 #define	UART_IOCTL_OFLOW	3
 #define	UART_IOCTL_BAUD		4
 
+/* UART quirk flags */
+#define	UART_F_BUSY_DETECT		0x1
+#define	UART_F_IGNORE_SPCR_REGSHFT	0x2
+
 /*
  * UART class & instance (=softc)
  */
@@ -107,6 +111,7 @@ struct uart_softc {
 	int		sc_rxput;
 	int		sc_rxget;
 	int		sc_rxfifosz;	/* Size of RX FIFO. */
+	int		sc_rxoverruns;
 
 	/* Transmitter data. */
 	uint8_t		*sc_txbuf;
@@ -140,7 +145,7 @@ int uart_bus_detach(device_t dev);
 int uart_bus_resume(device_t dev);
 serdev_intr_t *uart_bus_ihand(device_t dev, int ipend);
 int uart_bus_ipend(device_t dev);
-int uart_bus_probe(device_t dev, int regshft, int regiowidth, int rclk, int rid, int chan);
+int uart_bus_probe(device_t dev, int regshft, int regiowidth, int rclk, int rid, int chan, int quirks);
 int uart_bus_sysdev(device_t dev);
 
 void uart_sched_softih(struct uart_softc *, uint32_t);

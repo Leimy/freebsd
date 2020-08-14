@@ -91,6 +91,7 @@ static struct vop_vector fdesc_vnodeops = {
 	.vop_reclaim =		fdesc_reclaim,
 	.vop_setattr =		fdesc_setattr,
 };
+VFS_VOP_VECTOR_REGISTER(fdesc_vnodeops);
 
 static void fdesc_insmntque_dtr(struct vnode *, void *);
 static void fdesc_remove_entry(struct fdescnode *);
@@ -286,7 +287,6 @@ fdesc_lookup(struct vop_lookup_args *ap)
 	struct thread *td = cnp->cn_thread;
 	struct file *fp;
 	struct fdesc_get_ino_args arg;
-	cap_rights_t rights;
 	int nlen = cnp->cn_namelen;
 	u_int fd, fd1;
 	int error;
@@ -331,7 +331,7 @@ fdesc_lookup(struct vop_lookup_args *ap)
 	/*
 	 * No rights to check since 'fp' isn't actually used.
 	 */
-	if ((error = fget(td, fd, cap_rights_init(&rights), &fp)) != 0)
+	if ((error = fget(td, fd, &cap_no_rights, &fp)) != 0)
 		goto bad;
 
 	/* Check if we're looking up ourselves. */
@@ -341,14 +341,14 @@ fdesc_lookup(struct vop_lookup_args *ap)
 		 * will be re-acquired.
 		 */
 		vhold(dvp);
-		VOP_UNLOCK(dvp, 0);
+		VOP_UNLOCK(dvp);
 		fdrop(fp, td);
 
 		/* Re-aquire the lock afterwards. */
 		vn_lock(dvp, LK_RETRY | LK_EXCLUSIVE);
 		vdrop(dvp);
 		fvp = dvp;
-		if ((dvp->v_iflag & VI_DOOMED) != 0)
+		if (VN_IS_DOOMED(dvp))
 			error = ENOENT;
 	} else {
 		/*
@@ -418,7 +418,7 @@ fdesc_pathconf(struct vop_pathconf_args *ap)
 		if (VTOFDESC(vp)->fd_type == Froot)
 			return (vop_stdpathconf(ap));
 		vref(vp);
-		VOP_UNLOCK(vp, 0);
+		VOP_UNLOCK(vp);
 		error = kern_fpathconf(curthread, VTOFDESC(vp)->fd_fd,
 		    ap->a_name, ap->a_retval);
 		vn_lock(vp, LK_SHARED | LK_RETRY);
@@ -516,7 +516,7 @@ fdesc_setattr(struct vop_setattr_args *ap)
 	if ((error = vn_start_write(vp, &mp, V_WAIT | PCATCH)) == 0) {
 		vn_lock(vp, LK_EXCLUSIVE | LK_RETRY);
 		error = VOP_SETATTR(vp, ap->a_vap, ap->a_cred);
-		VOP_UNLOCK(vp, 0);
+		VOP_UNLOCK(vp);
 		vn_finished_write(mp);
 	}
 	fdrop(fp, td);
@@ -562,8 +562,8 @@ fdesc_readdir(struct vop_readdir_args *ap)
 			dp->d_namlen = i + 1;
 			dp->d_reclen = UIO_MX;
 			bcopy("..", dp->d_name, dp->d_namlen);
-			dp->d_name[i + 1] = '\0';
 			dp->d_type = DT_DIR;
+			dirent_terminate(dp);
 			break;
 		default:
 			if (fdp->fd_ofiles[fcnt].fde_file == NULL)
@@ -573,8 +573,11 @@ fdesc_readdir(struct vop_readdir_args *ap)
 			dp->d_type = (fmp->flags & FMNT_LINRDLNKF) == 0 ?
 			    DT_CHR : DT_LNK;
 			dp->d_fileno = i + FD_DESC;
+			dirent_terminate(dp);
 			break;
 		}
+		/* NOTE: d_off is the offset of the *next* entry. */
+		dp->d_off = UIO_MX * (i + 1);
 		if (dp->d_namlen != 0) {
 			/*
 			 * And ship to userland
@@ -613,7 +616,6 @@ static int
 fdesc_readlink(struct vop_readlink_args *va)
 {
 	struct vnode *vp, *vn;
-	cap_rights_t rights;
 	struct thread *td;
 	struct uio *uio;
 	struct file *fp;
@@ -628,10 +630,10 @@ fdesc_readlink(struct vop_readlink_args *va)
 		panic("fdesc_readlink: not fdescfs link");
 	fd_fd = ((struct fdescnode *)vn->v_data)->fd_fd;
 	lockflags = VOP_ISLOCKED(vn);
-	VOP_UNLOCK(vn, 0);
+	VOP_UNLOCK(vn);
 
 	td = curthread;
-	error = fget_cap(td, fd_fd, cap_rights_init(&rights), &fp, NULL);
+	error = fget_cap(td, fd_fd, &cap_no_rights, &fp, NULL);
 	if (error != 0)
 		goto out;
 

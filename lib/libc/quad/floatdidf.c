@@ -45,8 +45,7 @@ __FBSDID("$FreeBSD$");
  * Convert (signed) quad to double.
  */
 double
-__floatdidf(x)
-	quad_t x;
+__floatdidf(quad_t x)
 {
 	double d;
 	union uu u;
@@ -67,7 +66,7 @@ __floatdidf(x)
 	 * code and does not know how to get at an exponent.  Machine-
 	 * specific code may be able to do this more efficiently.
 	 */
-	d = (double)u.ul[H] * ((1 << (LONG_BITS - 2)) * 4.0);
+	d = (double)u.ul[H] * ((1L << (LONG_BITS - 2)) * 4.0);
 	d += u.ul[L];
 
 	return (neg ? -d : d);

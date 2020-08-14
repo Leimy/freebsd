@@ -39,7 +39,7 @@ __FBSDID("$FreeBSD$");
 #include "libuserboot.h"
 
 #if defined(USERBOOT_ZFS_SUPPORT)
-#include "../zfs/libzfs.h"
+#include "libzfs.h"
 #endif
 
 /*
@@ -70,6 +70,11 @@ struct fs_ops *file_system[] = {
 #endif
 	&gzipfs_fsops,
 	&bzipfs_fsops,
+	NULL
+};
+
+/* to keep libsa happy */
+struct netif_driver *netif_drivers[] = {
 	NULL
 };
 

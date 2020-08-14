@@ -90,11 +90,6 @@ __FBSDID("$FreeBSD$");
 #include <machine/resource.h>
 #include <machine/atomic.h>
 
-#ifdef __sparc64__
-#include <dev/ofw/openfirm.h>
-#include <machine/ofw_machdep.h>
-#endif
-
 #include <sys/rman.h>
 
 #include <cam/cam.h>
@@ -134,8 +129,6 @@ typedef	u_int32_t u32;
 #define MEMORY_BARRIER()	do { ; } while(0)
 #elif	defined	__powerpc__
 #define MEMORY_BARRIER()	__asm__ volatile("eieio; sync" : : : "memory")
-#elif	defined	__sparc64__
-#define MEMORY_BARRIER()	__asm__ volatile("membar #Sync" : : : "memory")
 #elif	defined	__arm__
 #define MEMORY_BARRIER()	dmb()
 #elif	defined	__aarch64__
@@ -2652,9 +2645,6 @@ static int sym_prepare_setting(hcb_p np, struct sym_nvram *nvram)
 	 */
 	np->myaddr = 255;
 	sym_nvram_setup_host (np, nvram);
-#ifdef __sparc64__
-	np->myaddr = OF_getscsinitid(np->device);
-#endif
 
 	/*
 	 *  Get SCSI addr of host adapter (set by bios?).
@@ -8387,8 +8377,7 @@ sym_pci_probe(device_t dev)
 	chip = sym_find_pci_chip(dev);
 	if (chip && sym_find_firmware(chip)) {
 		device_set_desc(dev, chip->name);
-		return (chip->lp_probe_bit & SYM_SETUP_LP_PROBE_MAP)?
-		  BUS_PROBE_LOW_PRIORITY : BUS_PROBE_DEFAULT;
+		return BUS_PROBE_DEFAULT;
 	}
 	return ENXIO;
 }

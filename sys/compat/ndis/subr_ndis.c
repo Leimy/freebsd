@@ -1287,7 +1287,7 @@ NdisMRegisterIoPortRange(offset, adapter, port, numports)
 	if (rman_get_size(sc->ndis_res_io) < numports)
 		return (NDIS_STATUS_INVALID_LENGTH);
 
-	*offset = (void *)rman_get_start(sc->ndis_res_io);
+	*offset = (void *)(uintptr_t)rman_get_start(sc->ndis_res_io);
 
 	return (NDIS_STATUS_SUCCESS);
 }
@@ -2845,7 +2845,7 @@ NdisOpenFile(status, filehandle, filelength, filename, highestaddr)
 
 	/* Get the file size. */
 	VOP_GETATTR(nd.ni_vp, vap, td->td_ucred);
-	VOP_UNLOCK(nd.ni_vp, 0);
+	VOP_UNLOCK(nd.ni_vp);
 
 	fh->nf_vp = nd.ni_vp;
 	fh->nf_map = NULL;

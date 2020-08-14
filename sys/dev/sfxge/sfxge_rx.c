@@ -73,8 +73,8 @@ __FBSDID("$FreeBSD$");
 
 #ifdef SFXGE_LRO
 
-SYSCTL_NODE(_hw_sfxge, OID_AUTO, lro, CTLFLAG_RD, NULL,
-	    "Large receive offload (LRO) parameters");
+SYSCTL_NODE(_hw_sfxge, OID_AUTO, lro, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "Large receive offload (LRO) parameters");
 
 #define	SFXGE_LRO_PARAM(_param)	SFXGE_PARAM(lro._param)
 
@@ -273,7 +273,8 @@ sfxge_rx_qfill(struct sfxge_rxq *rxq, unsigned int target, boolean_t retrying)
 
 		/* m_len specifies length of area to be mapped for DMA */
 		m->m_len  = mblksize;
-		m->m_data = (caddr_t)P2ROUNDUP((uintptr_t)m->m_data, CACHE_LINE_SIZE);
+		m->m_data = (caddr_t)EFX_P2ROUNDUP(uintptr_t, m->m_data,
+						   CACHE_LINE_SIZE);
 		m->m_data += sc->rx_buffer_align;
 
 		sfxge_map_mbuf_fast(rxq->mem.esm_tag, rxq->mem.esm_map, m, &seg);
@@ -1037,8 +1038,8 @@ sfxge_rx_qstart(struct sfxge_softc *sc, unsigned int index)
 
 	/* Create the common code receive queue. */
 	if ((rc = efx_rx_qcreate(sc->enp, index, 0, EFX_RXQ_TYPE_DEFAULT,
-	    esmp, sc->rxq_entries, rxq->buf_base_id, evq->common,
-	    &rxq->common)) != 0)
+	    esmp, sc->rxq_entries, rxq->buf_base_id, EFX_RXQ_FLAG_NONE,
+	    evq->common, &rxq->common)) != 0)
 		goto fail;
 
 	SFXGE_EVQ_LOCK(evq);
@@ -1103,14 +1104,14 @@ sfxge_rx_start(struct sfxge_softc *sc)
 
 	/* Ensure IP headers are 32bit aligned */
 	hdrlen = sc->rx_prefix_size + sizeof (struct ether_header);
-	sc->rx_buffer_align = P2ROUNDUP(hdrlen, 4) - hdrlen;
+	sc->rx_buffer_align = EFX_P2ROUNDUP(size_t, hdrlen, 4) - hdrlen;
 
 	sc->rx_buffer_size += sc->rx_buffer_align;
 
 	/* Align end of packet buffer for RX DMA end padding */
 	align = MAX(1, encp->enc_rx_buf_align_end);
 	EFSYS_ASSERT(ISP2(align));
-	sc->rx_buffer_size = P2ROUNDUP(sc->rx_buffer_size, align);
+	sc->rx_buffer_size = EFX_P2ROUNDUP(size_t, sc->rx_buffer_size, align);
 
 	/*
 	 * Standard mbuf zones only guarantee pointer-size alignment;
@@ -1138,17 +1139,20 @@ sfxge_rx_start(struct sfxge_softc *sc)
 #else
 		sc->rx_indir_table[index] = index % sc->rxq_count;
 #endif
-	if ((rc = efx_rx_scale_tbl_set(sc->enp, sc->rx_indir_table,
+	if ((rc = efx_rx_scale_tbl_set(sc->enp, EFX_RSS_CONTEXT_DEFAULT,
+				       sc->rx_indir_table,
 				       nitems(sc->rx_indir_table))) != 0)
 		goto fail;
-	(void)efx_rx_scale_mode_set(sc->enp, EFX_RX_HASHALG_TOEPLITZ,
+	(void)efx_rx_scale_mode_set(sc->enp, EFX_RSS_CONTEXT_DEFAULT,
+	    EFX_RX_HASHALG_TOEPLITZ,
 	    EFX_RX_HASH_IPV4 | EFX_RX_HASH_TCPIPV4 |
 	    EFX_RX_HASH_IPV6 | EFX_RX_HASH_TCPIPV6, B_TRUE);
 
 #ifdef RSS
 	rss_getkey(toep_key);
 #endif
-	if ((rc = efx_rx_scale_key_set(sc->enp, toep_key,
+	if ((rc = efx_rx_scale_key_set(sc->enp, EFX_RSS_CONTEXT_DEFAULT,
+				       toep_key,
 				       sizeof(toep_key))) != 0)
 		goto fail;
 
@@ -1352,12 +1356,10 @@ sfxge_rx_stat_init(struct sfxge_softc *sc)
 	stat_list = SYSCTL_CHILDREN(sc->stats_node);
 
 	for (id = 0; id < nitems(sfxge_rx_stats); id++) {
-		SYSCTL_ADD_PROC(
-			ctx, stat_list,
-			OID_AUTO, sfxge_rx_stats[id].name,
-			CTLTYPE_UINT|CTLFLAG_RD,
-			sc, id, sfxge_rx_stat_handler, "IU",
-			"");
+		SYSCTL_ADD_PROC(ctx, stat_list, OID_AUTO,
+		    sfxge_rx_stats[id].name,
+		    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_NEEDGIANT,
+		    sc, id, sfxge_rx_stat_handler, "IU", "");
 	}
 }
 

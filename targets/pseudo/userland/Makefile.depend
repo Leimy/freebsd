@@ -70,22 +70,6 @@ DIRDEPS+= \
 	sbin/fsdb \
 	sbin/fsirand \
 	sbin/gbde \
-	sbin/geom/class/cache \
-	sbin/geom/class/concat \
-	sbin/geom/class/eli \
-	sbin/geom/class/journal \
-	sbin/geom/class/label \
-	sbin/geom/class/mirror \
-	sbin/geom/class/mountver \
-	sbin/geom/class/multipath \
-	sbin/geom/class/nop \
-	sbin/geom/class/part \
-	sbin/geom/class/raid \
-	sbin/geom/class/raid3 \
-	sbin/geom/class/sched \
-	sbin/geom/class/shsec \
-	sbin/geom/class/stripe \
-	sbin/geom/class/virstor \
 	sbin/geom/core \
 	sbin/ggate/ggatec \
 	sbin/ggate/ggated \
@@ -204,6 +188,7 @@ DIRDEPS+= \
 	usr.bin/dirname \
 	usr.bin/dpv \
 	usr.bin/drill \
+	usr.bin/dtc \
 	usr.bin/du \
 	usr.bin/ee \
 	usr.bin/elf2aout \
@@ -262,6 +247,7 @@ DIRDEPS+= \
 	usr.bin/lex/lib \
 	usr.bin/limits \
 	usr.bin/locale \
+	usr.bin/localedef \
 	usr.bin/locate/bigram \
 	usr.bin/locate/code \
 	usr.bin/locate/locate \
@@ -302,9 +288,6 @@ DIRDEPS+= \
 	usr.bin/nice \
 	usr.bin/nl \
 	usr.bin/nohup \
-	usr.bin/nslookup \
-	usr.bin/nsupdate \
-	usr.bin/numactl \
 	usr.bin/opieinfo \
 	usr.bin/opiekey \
 	usr.bin/opiepasswd \
@@ -339,7 +322,6 @@ DIRDEPS+= \
 	usr.bin/script \
 	usr.bin/sdiff \
 	usr.bin/sed \
-	usr.bin/send-pr \
 	usr.bin/seq \
 	usr.bin/shar \
 	usr.bin/showmount \
@@ -462,6 +444,7 @@ DIRDEPS+= \
 	usr.sbin/bluetooth/hccontrol \
 	usr.sbin/bluetooth/hcsecd \
 	usr.sbin/bluetooth/hcseriald \
+	usr.sbin/bluetooth/iwmbtfw \
 	usr.sbin/bluetooth/l2control \
 	usr.sbin/bluetooth/l2ping \
 	usr.sbin/bluetooth/rfcomm_pppd \
@@ -670,13 +653,6 @@ DIRDEPS+= \
 	usr.sbin/ntp/ntpq \
 	usr.sbin/ntp/ntptime \
 	usr.sbin/ntp/sntp \
-	usr.sbin/pc-sysinstall/backend \
-	usr.sbin/pc-sysinstall/backend-partmanager \
-	usr.sbin/pc-sysinstall/backend-query \
-	usr.sbin/pc-sysinstall/conf \
-	usr.sbin/pc-sysinstall/doc \
-	usr.sbin/pc-sysinstall/examples \
-	usr.sbin/pc-sysinstall/pc-sysinstall \
 	usr.sbin/pciconf \
 	usr.sbin/periodic \
 	usr.sbin/pkg \
@@ -777,7 +753,6 @@ DIRDEPS+= \
 	usr.sbin/zic/zic \
 	usr.sbin/zonectl \
 	${DEP_RELDIR}/cddl \
-	${DEP_RELDIR}/games \
 	${DEP_RELDIR}/gnu \
 	${DEP_RELDIR}/include \
 	${DEP_RELDIR}/kerberos5 \
@@ -792,15 +767,6 @@ DIRDEPS+= \
 DIRDEPS+=	usr.sbin/efidp
 .endif
 
-.if ${MK_NAND} != "no"
-DIRDEPS+= \
-	sbin/nandfs \
-	sbin/newfs_nandfs \
-	usr.sbin/nandsim \
-	usr.sbin/nandtool \
-
-.endif
-
 DIRDEPS.amd64= \
 	sbin/bsdlabel \
 	sbin/fdisk \
@@ -810,7 +776,6 @@ DIRDEPS.amd64= \
 	usr.sbin/acpi/acpidump \
 	usr.sbin/acpi/iasl \
 	usr.sbin/apm \
-	usr.sbin/asf \
 	usr.sbin/bhyve \
 	usr.sbin/bhyvectl \
 	usr.sbin/bhyveload \
@@ -842,14 +807,12 @@ DIRDEPS.i386= \
 	sbin/sconfig \
 	usr.sbin/apm \
 	usr.sbin/apmd \
-	usr.sbin/asf \
 	usr.sbin/btxld \
 	usr.sbin/cpucontrol \
 	usr.sbin/hyperv/tools \
 	usr.sbin/hyperv/tools/kvp \
 	usr.sbin/hyperv/tools/vss \
 	usr.sbin/kgmon \
-	usr.sbin/kgzip \
 	usr.sbin/lptcontrol \
 	usr.sbin/mptable \
 	usr.sbin/ndiscvt \
@@ -891,10 +854,6 @@ DIRDEPS+= usr.sbin/cxgbetool
 
 .if ${MK_MLX5TOOL} != "no"
 DIRDEPS+= usr.sbin/mlx5tool
-.endif
-
-.if ${MK_GPL_DTC} != "yes"
-DIRDEPS+= usr.bin/dtc
 .endif
 
 DIRDEPS+= ${DIRDEPS.${MACHINE}:U}

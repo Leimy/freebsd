@@ -34,6 +34,7 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/condvar.h>
 #include <sys/dirent.h>
@@ -44,7 +45,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/namei.h>
 #include <sys/signalvar.h>
 #include <sys/stat.h>
-#include <sys/systm.h>
 #include <sys/taskqueue.h>
 #include <sys/tree.h>
 #include <sys/vnode.h>
@@ -152,7 +152,7 @@ autofs_trigger_vn(struct vnode *vp, const char *path, int pathlen,
 	 */
 	lock_flags = VOP_ISLOCKED(vp);
 	vref(vp);
-	VOP_UNLOCK(vp, 0);
+	VOP_UNLOCK(vp);
 
 	sx_xlock(&autofs_softc->sc_lock);
 
@@ -169,8 +169,8 @@ mounted:
 	sx_xunlock(&autofs_softc->sc_lock);
 	vn_lock(vp, lock_flags | LK_RETRY);
 	vunref(vp);
-	if ((vp->v_iflag & VI_DOOMED) != 0) {
-		AUTOFS_DEBUG("VI_DOOMED");
+	if (VN_IS_DOOMED(vp)) {
+		AUTOFS_DEBUG("VIRF_DOOMED");
 		return (ENOENT);
 	}
 
@@ -354,14 +354,11 @@ autofs_readdir_one(struct uio *uio, const char *name, int fileno,
     size_t *reclenp)
 {
 	struct dirent dirent;
-	size_t namlen, padded_namlen, reclen;
+	size_t namlen, reclen;
 	int error;
 
 	namlen = strlen(name);
-	padded_namlen = roundup2(namlen + 1, __alignof(struct dirent));
-	KASSERT(padded_namlen <= MAXNAMLEN, ("%zd > MAXNAMLEN", padded_namlen));
-	reclen = offsetof(struct dirent, d_name) + padded_namlen;
-
+	reclen = _GENERIC_DIRLEN(namlen);
 	if (reclenp != NULL)
 		*reclenp = reclen;
 
@@ -376,7 +373,7 @@ autofs_readdir_one(struct uio *uio, const char *name, int fileno,
 	dirent.d_type = DT_DIR;
 	dirent.d_namlen = namlen;
 	memcpy(dirent.d_name, name, namlen);
-	memset(dirent.d_name + namlen, 0, padded_namlen - namlen);
+	dirent_terminate(&dirent);
 	error = uiomove(&dirent, reclen, uio);
 
 	return (error);
@@ -557,6 +554,7 @@ struct vop_vector autofs_vnodeops = {
 	.vop_write =		VOP_EOPNOTSUPP,
 	.vop_reclaim =		autofs_reclaim,
 };
+VFS_VOP_VECTOR_REGISTER(autofs_vnodeops);
 
 int
 autofs_node_new(struct autofs_node *parent, struct autofs_mount *amp,
@@ -664,7 +662,7 @@ autofs_node_vn(struct autofs_node *anp, struct mount *mp, int flags,
 			sx_xunlock(&anp->an_vnode_lock);
 			return (error);
 		}
-		if (vp->v_iflag & VI_DOOMED) {
+		if (VN_IS_DOOMED(vp)) {
 			/*
 			 * We got forcibly unmounted.
 			 */

@@ -29,7 +29,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd January 27, 2018
+.Dd July 16, 2019
 .Dt TRACEROUTE6 8
 .Os
 .\"
@@ -112,7 +112,10 @@ is not specified, and only numeric addresses if
 is specified.
 .It Fl m Ar hoplimit
 Specify maximum hoplimit, up to 255.
-The default is 30 hops.
+The default is the value of the
+.Va net.inet6.ip6.hlim
+.Xr sysctl 8
+(the same default used for TCP connections).
 .It Fl n
 Do not resolve numeric address to hostname.
 .It Fl N
@@ -169,6 +172,8 @@ Destination Unreachable - Administratively Prohibited.
 Destination Unreachable - Not a Neighbour.
 .It !A
 Destination Unreachable - Address Unreachable.
+.It !H
+Parameter Problem - Unrecognized Next Header Type.
 .It !\&
 This is printed if the hop limit is <= 1 on a port unreachable message.
 This means that the packet got to the destination,

@@ -54,8 +54,10 @@ __FBSDID("$FreeBSD$");
 #include <sys/user.h>
 
 #include <vm/vm.h>
+#include <vm/vm_param.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 
 #include <machine/clock.h>
 #include <machine/cpu.h>
@@ -344,6 +346,15 @@ platform_start(__register_t a0, __register_t a1,  __register_t a2,
 		printf("memsize = %llu (0x%08x)\n",
 		    (unsigned long long) memsize, memsize);
 		printf("ememsize = %llu\n", (unsigned long long) ememsize);
+
+#ifdef __mips_o32
+		/*
+		 * For O32 phys_avail[] can't address memory beyond 2^32,
+		 * so cap extended memory to 2GB minus one page.
+		 */
+		if (ememsize >= 2ULL * 1024 * 1024 * 1024)
+			ememsize = 2ULL * 1024 * 1024 * 1024 - PAGE_SIZE;
+#endif
 	}
 
 	/*

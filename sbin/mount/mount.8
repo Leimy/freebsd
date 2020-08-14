@@ -28,7 +28,7 @@
 .\"     @(#)mount.8	8.8 (Berkeley) 6/16/94
 .\" $FreeBSD$
 .\"
-.Dd March 22, 2017
+.Dd August 28, 2019
 .Dt MOUNT 8
 .Os
 .Sh NAME
@@ -39,14 +39,14 @@
 .Op Fl adflpruvw
 .Op Fl F Ar fstab
 .Op Fl o Ar options
-.Op Fl t Cm ufs | Ar external_type
+.Op Fl t Oo Cm no Oc Ns Cm Ar type Ns Op Cm , Ns Ar type ...
 .Nm
 .Op Fl dfpruvw
 .Ar special | node
 .Nm
 .Op Fl dfpruvw
 .Op Fl o Ar options
-.Op Fl t Cm ufs | Ar external_type
+.Op Fl t Oo Cm no Oc Ns Cm Ar type Ns Op Cm , Ns Ar type ...
 .Ar special node
 .Sh DESCRIPTION
 The
@@ -139,9 +139,7 @@ This flag is mutually exclusive with
 .Cm nfsv4acls
 flag.
 .It Cm async
-All
-.Tn I/O
-to the file system should be done asynchronously.
+All I/O to the file system should be done asynchronously.
 This is a
 .Em dangerous
 flag to set, since it does not guarantee that the file system structure
@@ -155,11 +153,17 @@ This flag indicates that the file system was mounted by
 .Xr automountd 8 .
 Automounted file systems are automatically unmounted by
 .Xr autounmountd 8 .
+.It Cm autoro
+Mount the file system read-write.
+If that fails with an error that suggests that the media could be read-only,
+then automatically try to mount the file system read-only.
 .It Cm current
 When used with the
 .Fl u
 flag, this is the same as specifying the options currently in effect for
 the mounted file system.
+.It Cm emptydir
+Require that the mount point directory be empty.
 .It Cm force
 The same as
 .Fl f ;
@@ -235,6 +239,9 @@ flag.
 Disable read clustering.
 .It Cm noclusterw
 Disable write clustering.
+.It Cm nocover
+Do not mount if the requested mount point is already
+the root of a mount point.
 .It Cm noexec
 Do not allow execution of any binaries on the mounted file system.
 This option is useful for a server that has file systems containing
@@ -341,9 +348,7 @@ See
 .Xr chmod 2
 for more information.
 .It Cm sync
-All
-.Tn I/O
-to the file system should be done synchronously.
+All I/O to the file system should be done synchronously.
 .It Cm update
 The same as
 .Fl u ;
@@ -355,6 +360,12 @@ Lookups will be done in the mounted file system first.
 If those operations fail due to a non-existent file the underlying
 directory is then accessed.
 All creates are done in the mounted file system.
+.It Cm untrusted
+The file system is untrusted and the kernel should use more
+extensive checks on the file-system's metadata before using it.
+This option is intended to be used when mounting file systems
+from untrusted media such as USB memory sticks or other
+externally-provided media.
 .El
 .Pp
 Any additional options specific to a file system type that is not
@@ -411,7 +422,7 @@ The same as the
 argument to the
 .Fl o
 option.
-.It Fl t Cm ufs | Ar external_type
+.It Fl t Oo Cm no Oc Ns Cm Ar type Ns Op Cm , Ns Ar type ...
 The argument following the
 .Fl t
 is used to indicate the file system type.
@@ -425,7 +436,7 @@ to indicate that the actions should only be taken on
 file systems of the specified type.
 More than one type may be specified in a comma separated list.
 The list of file system types can be prefixed with
-.Dq Li no
+.Cm no
 to specify the file system types for which action should
 .Em not
 be taken.
@@ -436,10 +447,7 @@ command:
 mount -a -t nonfs,nullfs
 .Ed
 .Pp
-mounts all file systems except those of type
-.Tn NFS
-and
-.Tn NULLFS .
+mounts all file systems except those of type NFS and NULLFS.
 .Pp
 The default behavior of
 .Nm
@@ -460,16 +468,18 @@ However, for the following file system types:
 .Cm smbfs ,
 .Cm udf ,
 and
-.Cm unionfs .
+.Cm unionfs
 .Nm
 will not call
 .Xr nmount 2
 directly and will instead attempt to execute a program in
-.Pa /sbin/mount_ Ns Sy XXX
+.Pa /sbin/mount_ Ns Ar type
 where
-.Sy XXX
+.Ar type
 is replaced by the file system type name.
-For example, nfs file systems are mounted by the program
+For example,
+.Cm nfs
+file systems are mounted by the program
 .Pa /sbin/mount_nfs .
 .Pp
 Most file systems will be dynamically loaded by the kernel

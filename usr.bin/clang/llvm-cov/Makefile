@@ -1,10 +1,15 @@
 # $FreeBSD$
 
-PROG_CXX=	llvm-cov
+.include <src.opts.mk>
 
-SRCDIR=		tools/llvm-cov
+PROG_CXX=	llvm-cov
+LINKS=		${BINDIR}/llvm-cov	${BINDIR}/gcov
+MLINKS=		llvm-cov.1		gcov.1
+
+SRCDIR=		llvm/tools/llvm-cov
 SRCS+=		CodeCoverage.cpp
 SRCS+=		CoverageExporterJson.cpp
+SRCS+=		CoverageExporterLcov.cpp
 SRCS+=		CoverageFilters.cpp
 SRCS+=		CoverageReport.cpp
 SRCS+=		CoverageSummaryInfo.cpp

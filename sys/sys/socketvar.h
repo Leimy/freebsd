@@ -63,8 +63,15 @@ struct vnet;
  * private data and error information.
  */
 typedef	int so_upcall_t(struct socket *, void *, int);
+typedef	void so_dtor_t(struct socket *);
 
 struct socket;
+
+enum socket_qstate {
+	SQ_NONE = 0,
+	SQ_INCOMP = 0x0800,	/* on sol_incomp */
+	SQ_COMP = 0x1000,	/* on sol_comp */
+};
 
 /*-
  * Locking key to struct socket:
@@ -76,6 +83,7 @@ struct socket;
  * (f) not locked since integer reads/writes are atomic.
  * (g) used only as a sleep/wakeup address, no value.
  * (h) locked by global mutex so_global_mtx.
+ * (k) locked by KTLS workqueue mutex
  */
 TAILQ_HEAD(accept_queue, socket);
 struct socket {
@@ -84,7 +92,7 @@ struct socket {
 	struct selinfo	so_rdsel;	/* (b/cr) for so_rcv/so_comp */
 	struct selinfo	so_wrsel;	/* (b/cs) for so_snd */
 	short	so_type;		/* (a) generic type, see socket.h */
-	short	so_options;		/* (b) from socket call, see socket.h */
+	int	so_options;		/* (b) from socket call, see socket.h */
 	short	so_linger;		/* time to linger close(2) */
 	short	so_state;		/* (b) internal state flags SS_* */
 	void	*so_pcb;		/* protocol control block */
@@ -99,6 +107,7 @@ struct socket {
 	/* NB: generation count must not be first. */
 	so_gen_t so_gencnt;		/* (h) generation count */
 	void	*so_emuldata;		/* (b) private data for emulators */
+	so_dtor_t *so_dtor;		/* (b) optional destructor */
 	struct	osd	osd;		/* Object Specific extensions */
 	/*
 	 * so_fibnum, so_user_cookie and friends can be used to attach
@@ -120,15 +129,13 @@ struct socket {
 			/* (e) Our place on accept queue. */
 			TAILQ_ENTRY(socket)	so_list;
 			struct socket		*so_listen;	/* (b) */
-			enum {
-				SQ_NONE = 0,
-				SQ_INCOMP = 0x0800,	/* on sol_incomp */
-				SQ_COMP = 0x1000,	/* on sol_comp */
-			}			so_qstate;	/* (b) */
-
+			enum socket_qstate so_qstate;		/* (b) */
 			/* (b) cached MAC label for peer */
 			struct	label		*so_peerlabel;
 			u_long	so_oobmark;	/* chars to oob mark */
+
+			/* (k) Our place on KTLS RX work queue. */
+			STAILQ_ENTRY(socket)	so_ktls_rx_list;
 		};
 		/*
 		 * Listening socket, where accepts occur, is so_listen in all
@@ -170,6 +177,10 @@ struct socket {
 			short		sol_sbsnd_flags;
 			sbintime_t	sol_sbrcv_timeo;
 			sbintime_t	sol_sbsnd_timeo;
+
+			/* Information tracking listen queue overflows. */
+			struct timeval	sol_lastover;	/* (e) */
+			int		sol_overcount;	/* (e) */
 		};
 	};
 };
@@ -178,13 +189,13 @@ struct socket {
 /*
  * Socket state bits.
  *
- * Historically, this bits were all kept in the so_state field.  For
- * locking reasons, they are now in multiple fields, as they are
- * locked differently.  so_state maintains basic socket state protected
- * by the socket lock.  so_qstate holds information about the socket
- * accept queues.  Each socket buffer also has a state field holding
- * information relevant to that socket buffer (can't send, rcv).  Many
- * fields will be read without locks to improve performance and avoid
+ * Historically, these bits were all kept in the so_state field.
+ * They are now split into separate, lock-specific fields.
+ * so_state maintains basic socket state protected by the socket lock.
+ * so_qstate holds information about the socket accept queues.
+ * Each socket buffer also has a state field holding information
+ * relevant to that socket buffer (can't send, rcv).
+ * Many fields will be read without locks to improve performance and avoid
  * lock order issues.  However, this approach must be used with caution.
  */
 #define	SS_NOFDREF		0x0001	/* no file table ref any more */
@@ -328,6 +339,22 @@ struct accept_filter {
 	SLIST_ENTRY(accept_filter) accf_next;
 };
 
+#define	ACCEPT_FILTER_DEFINE(modname, filtname, cb, create, destroy, ver) \
+	static struct accept_filter modname##_filter = {		\
+		.accf_name = filtname,					\
+		.accf_callback = cb,					\
+		.accf_create = create,					\
+		.accf_destroy = destroy,				\
+	};								\
+	static moduledata_t modname##_mod = {				\
+		.name = __XSTRING(modname),				\
+		.evhand = accept_filt_generic_mod_event,		\
+		.priv = &modname##_filter,				\
+	};								\
+	DECLARE_MODULE(modname, modname##_mod, SI_SUB_DRIVERS,		\
+	    SI_ORDER_MIDDLE);						\
+	MODULE_VERSION(modname, ver)
+
 #ifdef MALLOC_DECLARE
 MALLOC_DECLARE(M_ACCF);
 MALLOC_DECLARE(M_PCB);
@@ -377,7 +404,8 @@ struct uio;
 /*
  * From uipc_socket and friends
  */
-int	getsockaddr(struct sockaddr **namp, caddr_t uaddr, size_t len);
+int	getsockaddr(struct sockaddr **namp, const struct sockaddr *uaddr,
+	    size_t len);
 int	getsock_cap(struct thread *td, int fd, cap_rights_t *rightsp,
 	    struct file **fpp, u_int *fflagp, struct filecaps *havecaps);
 void	soabort(struct socket *so);
@@ -397,6 +425,7 @@ int	soconnect2(struct socket *so1, struct socket *so2);
 int	socreate(int dom, struct socket **aso, int type, int proto,
 	    struct ucred *cred, struct thread *td);
 int	sodisconnect(struct socket *so);
+void	sodtor_set(struct socket *, so_dtor_t *);
 struct	sockaddr *sodupsockaddr(const struct sockaddr *sa, int mflags);
 void	sofree(struct socket *so);
 void	sohasoutofband(struct socket *so);
@@ -471,15 +500,9 @@ int	accept_filt_generic_mod_event(module_t mod, int event, void *data);
  * Structure to export socket from kernel to utilities, via sysctl(3).
  */
 struct xsocket {
-	size_t		xso_len;	/* length of this structure */
-	union {
-		void	*xso_so;	/* kernel address of struct socket */
-		int64_t ph_so;
-	};
-	union {
-		void 	*so_pcb;	/* kernel address of struct inpcb */
-		int64_t ph_pcb;
-	};
+	ksize_t		xso_len;	/* length of this structure */
+	kvaddr_t	xso_so;		/* kernel address of struct socket */
+	kvaddr_t	so_pcb;		/* kernel address of struct inpcb */
 	uint64_t	so_oobmark;
 	int64_t		so_spare64[8];
 	int32_t		xso_protocol;

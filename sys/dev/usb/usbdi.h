@@ -105,7 +105,7 @@ typedef void (usb_fifo_filter_t)(struct usb_fifo *fifo, struct usb_mbuf *m);
 
 /* USB events */
 #ifndef USB_GLOBAL_INCLUDE_FILE
-#include <sys/eventhandler.h>
+#include <sys/_eventhandler.h>
 #endif
 typedef void (*usb_dev_configured_t)(void *, struct usb_device *,
     struct usb_attach_arg *);
@@ -342,13 +342,13 @@ struct usb_device_id {
 #define USB_STD_PNP_HOST_INFO USB_STD_PNP_INFO "T:mode=host;"
 #define USB_STD_PNP_DEVICE_INFO USB_STD_PNP_INFO "T:mode=device;"
 #define USB_PNP_HOST_INFO(table)					\
-	MODULE_PNP_INFO(USB_STD_PNP_HOST_INFO, uhub, table, table, sizeof(table[0]), \
+	MODULE_PNP_INFO(USB_STD_PNP_HOST_INFO, uhub, table, table,	\
 	    sizeof(table) / sizeof(table[0]))
 #define USB_PNP_DEVICE_INFO(table)					\
-	MODULE_PNP_INFO(USB_STD_PNP_DEVICE_INFO, uhub, table, table, sizeof(table[0]), \
+	MODULE_PNP_INFO(USB_STD_PNP_DEVICE_INFO, uhub, table, table,	\
 	    sizeof(table) / sizeof(table[0]))
 #define USB_PNP_DUAL_INFO(table)					\
-	MODULE_PNP_INFO(USB_STD_PNP_INFO, uhub, table, table, sizeof(table[0]), \
+	MODULE_PNP_INFO(USB_STD_PNP_INFO, uhub, table, table,		\
 	    sizeof(table) / sizeof(table[0]))
 
 /* check that the size of the structure above is correct */
@@ -605,6 +605,9 @@ uint8_t	usbd_get_interface_altindex(struct usb_interface *iface);
 usb_error_t usbd_set_alt_interface_index(struct usb_device *udev,
 	    uint8_t iface_index, uint8_t alt_index);
 uint32_t usbd_get_isoc_fps(struct usb_device *udev);
+uint32_t usbd_get_max_frame_length(const struct usb_endpoint_descriptor *,
+    const struct usb_endpoint_ss_comp_descriptor *,
+    enum usb_dev_speed);
 usb_error_t usbd_transfer_setup(struct usb_device *udev,
 	    const uint8_t *ifaces, struct usb_xfer **pxfer,
 	    const struct usb_config *setup_start, uint16_t n_setup,

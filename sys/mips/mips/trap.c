@@ -43,7 +43,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_ddb.h"
 #include "opt_ktrace.h"
 
@@ -52,6 +51,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/sysent.h>
 #include <sys/proc.h>
 #include <sys/kernel.h>
+#include <sys/ktr.h>
 #include <sys/signalvar.h>
 #include <sys/syscall.h>
 #include <sys/lock.h>
@@ -66,7 +66,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/user.h>
 #include <sys/buf.h>
 #include <sys/vnode.h>
-#include <sys/pioctl.h>
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/bus.h>
@@ -115,22 +114,22 @@ SYSCTL_INT(_machdep, OID_AUTO, trap_debug, CTLFLAG_RW,
 
 #define	lwl_macro(data, addr)						\
 	__asm __volatile ("lwl %0, 0x0(%1)"				\
-			: "=r" (data)	/* outputs */			\
+			: "+r" (data)	/* outputs */			\
 			: "r" (addr));	/* inputs */
 
 #define	lwr_macro(data, addr)						\
 	__asm __volatile ("lwr %0, 0x0(%1)"				\
-			: "=r" (data)	/* outputs */			\
+			: "+r" (data)	/* outputs */			\
 			: "r" (addr));	/* inputs */
 
 #define	ldl_macro(data, addr)						\
 	__asm __volatile ("ldl %0, 0x0(%1)"				\
-			: "=r" (data)	/* outputs */			\
+			: "+r" (data)	/* outputs */			\
 			: "r" (addr));	/* inputs */
 
 #define	ldr_macro(data, addr)						\
 	__asm __volatile ("ldr %0, 0x0(%1)"				\
-			: "=r" (data)	/* outputs */			\
+			: "+r" (data)	/* outputs */			\
 			: "r" (addr));	/* inputs */
 
 #define	sb_macro(data, addr)						\
@@ -282,7 +281,7 @@ struct trapdebug trapdebug[TRAPSIZE], *trp = trapdebug;
 #endif
 
 #define	KERNLAND(x)	((vm_offset_t)(x) >= VM_MIN_KERNEL_ADDRESS && (vm_offset_t)(x) < VM_MAX_KERNEL_ADDRESS)
-#define	DELAYBRANCH(x)	((int)(x) < 0)
+#define	DELAYBRANCH(x)	((x) & MIPS_CR_BR_DELAY)
 
 /*
  * MIPS load/store access type
@@ -443,8 +442,6 @@ cpu_fetch_syscall_args(struct thread *td)
 	 * XXX
 	 * Shouldn't this go before switching on the code?
 	 */
-	if (se->sv_mask)
-		sa->code &= se->sv_mask;
 
 	if (sa->code >= se->sv_size)
 		sa->callp = &se->sv_table[0];
@@ -527,11 +524,16 @@ trap(struct trapframe *trapframe)
 	char *msg = NULL;
 	intptr_t addr = 0;
 	register_t pc;
-	int cop;
+	int cop, error;
 	register_t *frame_regs;
 
 	trapdebug_enter(trapframe, 0);
-	
+#ifdef KDB
+	if (kdb_active) {
+		kdb_reenter();
+		return (0);
+	}
+#endif
 	type = (trapframe->cause & MIPS_CR_EXC_CODE) >> MIPS_CR_EXC_CODE_SHIFT;
 	if (TRAPF_USERMODE(trapframe)) {
 		type |= T_USER;
@@ -666,8 +668,9 @@ trap(struct trapframe *trapframe)
 			int rv;
 
 	kernel_fault:
-			va = trunc_page((vm_offset_t)trapframe->badvaddr);
-			rv = vm_fault(kernel_map, va, ftype, VM_FAULT_NORMAL);
+			va = (vm_offset_t)trapframe->badvaddr;
+			rv = vm_fault_trap(kernel_map, va, ftype,
+			    VM_FAULT_NORMAL, NULL, NULL);
 			if (rv == KERN_SUCCESS)
 				return (trapframe->pc);
 			if (td->td_pcb->pcb_onfault != NULL) {
@@ -684,14 +687,6 @@ trap(struct trapframe *trapframe)
 		 */
 		if (td->td_pcb->pcb_onfault == NULL)
 			goto err;
-
-		/* check for fuswintr() or suswintr() getting a page fault */
-		/* XXX There must be a nicer way to do this.  */
-		if (td->td_pcb->pcb_onfault == fswintrberr) {
-			pc = (register_t)(intptr_t)td->td_pcb->pcb_onfault;
-			td->td_pcb->pcb_onfault = NULL;
-			return (pc);
-		}
 
 		goto dofault;
 
@@ -710,7 +705,7 @@ dofault:
 
 			vm = p->p_vmspace;
 			map = &vm->vm_map;
-			va = trunc_page((vm_offset_t)trapframe->badvaddr);
+			va = (vm_offset_t)trapframe->badvaddr;
 			if (KERNLAND(trapframe->badvaddr)) {
 				/*
 				 * Don't allow user-mode faults in kernel
@@ -719,7 +714,8 @@ dofault:
 				goto nogo;
 			}
 
-			rv = vm_fault(map, va, ftype, VM_FAULT_NORMAL);
+			rv = vm_fault_trap(map, va, ftype, VM_FAULT_NORMAL,
+			    &i, &ucode);
 			/*
 			 * XXXDTRACE: add dtrace_doubletrap_func here?
 			 */
@@ -744,12 +740,7 @@ dofault:
 				}
 				goto err;
 			}
-			i = SIGSEGV;
-			if (rv == KERN_PROTECTION_FAILURE)
-				ucode = SEGV_ACCERR;
-			else
-				ucode = SEGV_MAPERR;
-			addr = trapframe->pc;
+			addr = trapframe->badvaddr;
 
 			msg = "BAD_PAGE_FAULT";
 			log_bad_page_fault(msg, trapframe, type);
@@ -792,10 +783,8 @@ dofault:
 
 	case T_SYSCALL + T_USER:
 		{
-			int error;
-
 			td->td_sa.trapframe = trapframe;
-			error = syscallenter(td);
+			syscallenter(td);
 
 #if !defined(SMP) && (defined(DDB) || defined(DEBUG))
 			if (trp == trapdebug)
@@ -811,17 +800,16 @@ dofault:
 			 * instead of being done here under a special check
 			 * for SYS_ptrace().
 			 */
-			syscallret(td, error);
+			syscallret(td);
 			return (trapframe->pc);
 		}
 
 #if defined(KDTRACE_HOOKS) || defined(DDB)
 	case T_BREAK:
 #ifdef KDTRACE_HOOKS
-		if (!usermode && dtrace_invop_jump_addr != 0) {
-			dtrace_invop_jump_addr(trapframe);
+		if (!usermode && dtrace_invop_jump_addr != NULL &&
+		    dtrace_invop_jump_addr(trapframe) == 0)
 			return (trapframe->pc);
-		}
 #endif
 #ifdef DDB
 		kdb_trap(type, 0, trapframe);
@@ -834,32 +822,34 @@ dofault:
 			intptr_t va;
 			uint32_t instr;
 
+			i = SIGTRAP;
+			ucode = TRAP_BRKPT;
+
 			/* compute address of break instruction */
 			va = trapframe->pc;
 			if (DELAYBRANCH(trapframe->cause))
 				va += sizeof(int);
+			addr = va;
+
+			if (td->td_md.md_ss_addr != va)
+				break;
 
 			/* read break instruction */
 			instr = fuword32((caddr_t)va);
-#if 0
-			printf("trap: %s (%d) breakpoint %x at %x: (adr %x ins %x)\n",
-			    p->p_comm, p->p_pid, instr, trapframe->pc,
-			    p->p_md.md_ss_addr, p->p_md.md_ss_instr);	/* XXX */
-#endif
-			if (td->td_md.md_ss_addr != va ||
-			    instr != MIPS_BREAK_SSTEP) {
-				i = SIGTRAP;
-				addr = trapframe->pc;
+
+			if (instr != MIPS_BREAK_SSTEP)
 				break;
-			}
-			/*
-			 * The restoration of the original instruction and
-			 * the clearing of the breakpoint will be done later
-			 * by the call to ptrace_clear_single_step() in
-			 * issignal() when SIGTRAP is processed.
-			 */
-			addr = trapframe->pc;
-			i = SIGTRAP;
+
+			CTR3(KTR_PTRACE,
+			    "trap: tid %d, single step at %#lx: %#08x",
+			    td->td_tid, va, instr);
+			PROC_LOCK(p);
+			_PHOLD(p);
+			error = ptrace_clear_single_step(td);
+			_PRELE(p);
+			PROC_UNLOCK(p);
+			if (error == 0)
+				ucode = TRAP_TRACE;
 			break;
 		}
 
@@ -874,6 +864,7 @@ dofault:
 				va += sizeof(int);
 			printf("watch exception @ %p\n", (void *)va);
 			i = SIGTRAP;
+			ucode = TRAP_BRKPT;
 			addr = va;
 			break;
 		}
@@ -881,15 +872,12 @@ dofault:
 	case T_TRAP + T_USER:
 		{
 			intptr_t va;
-			uint32_t instr;
 			struct trapframe *locr0 = td->td_frame;
 
 			/* compute address of trap instruction */
 			va = trapframe->pc;
 			if (DELAYBRANCH(trapframe->cause))
 				va += sizeof(int);
-			/* read break instruction */
-			instr = fuword32((caddr_t)va);
 
 			if (DELAYBRANCH(trapframe->cause)) {	/* Check BD bit */
 				locr0->pc = MipsEmulateBranch(locr0, trapframe->pc, 0,
@@ -914,7 +902,7 @@ dofault:
 					if (inst.RType.rd == 29) {
 						frame_regs = &(trapframe->zero);
 						frame_regs[inst.RType.rt] = (register_t)(intptr_t)td->td_md.md_tls;
-						frame_regs[inst.RType.rt] += td->td_md.md_tls_tcb_offset;
+						frame_regs[inst.RType.rt] += td->td_proc->p_md.md_tls_tcb_offset;
 						trapframe->pc += sizeof(int);
 						goto out;
 					}
@@ -1104,8 +1092,10 @@ err:
 #endif
 
 #ifdef KDB
-		if (debugger_on_panic || kdb_active) {
+		if (debugger_on_trap) {
+			kdb_why = KDB_WHY_TRAP;
 			kdb_trap(type, 0, trapframe);
+			kdb_why = KDB_WHY_UNSET;
 		}
 #endif
 		panic("trap");
@@ -1117,7 +1107,7 @@ err:
 	ksi.ksi_signo = i;
 	ksi.ksi_code = ucode;
 	ksi.ksi_addr = (void *)addr;
-	ksi.ksi_trapno = type;
+	ksi.ksi_trapno = type & ~T_USER;
 	trapsignal(td, &ksi);
 out:
 
@@ -1411,7 +1401,7 @@ log_illegal_instruction(const char *msg, struct trapframe *frame)
 {
 	pt_entry_t *ptep;
 	pd_entry_t *pdep;
-	unsigned int *addr;
+	unsigned int *addr, instr[4];
 	struct thread *td;
 	struct proc *p;
 	register_t pc;
@@ -1438,17 +1428,16 @@ log_illegal_instruction(const char *msg, struct trapframe *frame)
 	 * Dump a few words around faulting instruction, if the addres is
 	 * valid.
 	 */
-	if (!(pc & 3) &&
-	    useracc((caddr_t)(intptr_t)pc, sizeof(int) * 4, VM_PROT_READ)) {
+	addr = (unsigned int *)(intptr_t)pc;
+	if ((pc & 3) == 0 && copyin(addr, instr, sizeof(instr)) == 0) {
 		/* dump page table entry for faulting instruction */
 		log(LOG_ERR, "Page table info for pc address %#jx: pde = %p, pte = %#jx\n",
 		    (intmax_t)pc, (void *)(intptr_t)*pdep, (uintmax_t)(ptep ? *ptep : 0));
 
-		addr = (unsigned int *)(intptr_t)pc;
 		log(LOG_ERR, "Dumping 4 words starting at pc address %p: \n",
 		    addr);
 		log(LOG_ERR, "%08x %08x %08x %08x\n",
-		    addr[0], addr[1], addr[2], addr[3]);
+		    instr[0], instr[1], instr[2], instr[3]);
 	} else {
 		log(LOG_ERR, "pc address %#jx is inaccessible, pde = %p, pte = %#jx\n",
 		    (intmax_t)pc, (void *)(intptr_t)*pdep, (uintmax_t)(ptep ? *ptep : 0));
@@ -1460,7 +1449,7 @@ log_bad_page_fault(char *msg, struct trapframe *frame, int trap_type)
 {
 	pt_entry_t *ptep;
 	pd_entry_t *pdep;
-	unsigned int *addr;
+	unsigned int *addr, instr[4];
 	struct thread *td;
 	struct proc *p;
 	char *read_or_write;
@@ -1508,18 +1497,18 @@ log_bad_page_fault(char *msg, struct trapframe *frame, int trap_type)
 	 * Dump a few words around faulting instruction, if the addres is
 	 * valid.
 	 */
-	if (!(pc & 3) && (pc != frame->badvaddr) &&
-	    (trap_type != T_BUS_ERR_IFETCH) &&
-	    useracc((caddr_t)(intptr_t)pc, sizeof(int) * 4, VM_PROT_READ)) {
+	addr = (unsigned int *)(intptr_t)pc;
+	if ((pc & 3) == 0 && pc != frame->badvaddr &&
+	    trap_type != T_BUS_ERR_IFETCH &&
+	    copyin((caddr_t)(intptr_t)pc, instr, sizeof(instr)) == 0) {
 		/* dump page table entry for faulting instruction */
 		log(LOG_ERR, "Page table info for pc address %#jx: pde = %p, pte = %#jx\n",
 		    (intmax_t)pc, (void *)(intptr_t)*pdep, (uintmax_t)(ptep ? *ptep : 0));
 
-		addr = (unsigned int *)(intptr_t)pc;
 		log(LOG_ERR, "Dumping 4 words starting at pc address %p: \n",
 		    addr);
 		log(LOG_ERR, "%08x %08x %08x %08x\n",
-		    addr[0], addr[1], addr[2], addr[3]);
+		    instr[0], instr[1], instr[2], instr[3]);
 	} else {
 		log(LOG_ERR, "pc address %#jx is inaccessible, pde = %p, pte = %#jx\n",
 		    (intmax_t)pc, (void *)(intptr_t)*pdep, (uintmax_t)(ptep ? *ptep : 0));
@@ -1539,7 +1528,7 @@ mips_unaligned_load_store(struct trapframe *frame, int mode, register_t addr, re
 {
 	register_t *reg = (register_t *) frame;
 	u_int32_t inst = *((u_int32_t *)(intptr_t)pc);
-	register_t value_msb, value;
+	register_t value_msb = 0, value = 0;
 	unsigned size;
 
 	/*

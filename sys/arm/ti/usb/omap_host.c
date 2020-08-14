@@ -40,7 +40,7 @@ __FBSDID("$FreeBSD$");
 
 #include <machine/bus.h>
 
-#include <arm/ti/ti_prcm.h>
+#include <arm/ti/ti_sysc.h>
 #include <arm/ti/usb/omap_usb.h>
 
 /*
@@ -139,12 +139,14 @@ omap_uhh_init(struct omap_uhh_softc *isc)
 	int i;
 
 	/* Enable Clocks for high speed USBHOST */
-	ti_prcm_clk_enable(USBHSHOST_CLK);
+	ti_sysc_clock_enable(device_get_parent(isc->sc_dev));
 
 	/* Read the UHH revision */
 	isc->uhh_rev = omap_uhh_read_4(isc, OMAP_USBHOST_UHH_REVISION);
 	device_printf(isc->sc_dev, "UHH revision 0x%08x\n", isc->uhh_rev);
 
+	/* FIXME */
+#if 0
 	if (isc->uhh_rev == OMAP_UHH_REV2) {
 		/* For OMAP44xx devices you have to enable the per-port clocks:
 		 *  PHY_MODE  - External ULPI clock
@@ -200,6 +202,7 @@ omap_uhh_init(struct omap_uhh_softc *isc)
 			device_printf(isc->sc_dev, "unknown port mode %d for port 1\n", isc->port_mode[1]);
 		}
 	}
+#endif
 
 	/* Put UHH in SmartIdle/SmartStandby mode */
 	reg = omap_uhh_read_4(isc, OMAP_USBHOST_UHH_SYSCONFIG);
@@ -327,7 +330,7 @@ omap_uhh_fini(struct omap_uhh_softc *isc)
 	}
 
 	/* Disable functional and interface clocks for the TLL and HOST modules */
-	ti_prcm_clk_disable(USBHSHOST_CLK);
+	ti_sysc_clock_disable(device_get_parent(isc->sc_dev));
 
 	device_printf(isc->sc_dev, "Clock to USB host has been disabled\n");
 }
@@ -392,7 +395,7 @@ omap_uhh_attach(device_t dev)
 		snprintf(propname, sizeof(propname),
 		    "port%d-mode", i+1);
 
-		if (OF_getprop_alloc(node, propname, 1, (void**)&mode) <= 0)
+		if (OF_getprop_alloc(node, propname, (void**)&mode) <= 0)
 			continue;
 		if (strcmp(mode, "ehci-phy") == 0)
 			isc->port_mode[i] = EHCI_HCD_OMAP_MODE_PHY;

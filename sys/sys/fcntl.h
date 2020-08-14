@@ -119,9 +119,11 @@ typedef	__pid_t		pid_t;
 #if __POSIX_VISIBLE >= 200809
 #define	O_DIRECTORY	0x00020000	/* Fail if not directory */
 #define	O_EXEC		0x00040000	/* Open for execute only */
+#define	O_SEARCH	O_EXEC
 #endif
 #ifdef	_KERNEL
 #define	FEXEC		O_EXEC
+#define	FSEARCH		O_SEARCH
 #endif
 
 #if __POSIX_VISIBLE >= 200809
@@ -133,6 +135,7 @@ typedef	__pid_t		pid_t;
 
 #if __BSD_VISIBLE
 #define	O_VERIFY	0x00200000	/* open only after verification */
+#define	O_BENEATH	0x00400000	/* Fail if not under cwd */
 #endif
 
 /*
@@ -206,10 +209,12 @@ typedef	__pid_t		pid_t;
 /*
  * Miscellaneous flags for the *at() syscalls.
  */
-#define	AT_EACCESS		0x100	/* Check access using effective user and group ID */
-#define	AT_SYMLINK_NOFOLLOW	0x200   /* Do not follow symbolic links */
-#define	AT_SYMLINK_FOLLOW	0x400	/* Follow symbolic link */
-#define	AT_REMOVEDIR		0x800	/* Remove directory instead of file */
+#define	AT_EACCESS		0x0100	/* Check access using effective user
+					   and group ID */
+#define	AT_SYMLINK_NOFOLLOW	0x0200	/* Do not follow symbolic links */
+#define	AT_SYMLINK_FOLLOW	0x0400	/* Follow symbolic link */
+#define	AT_REMOVEDIR		0x0800	/* Remove directory instead of file */
+#define	AT_BENEATH		0x1000	/* Fail if not under dirfd */
 #endif
 
 /*
@@ -245,7 +250,16 @@ typedef	__pid_t		pid_t;
 #endif
 #if __BSD_VISIBLE
 #define	F_DUP2FD_CLOEXEC 18		/* Like F_DUP2FD, but FD_CLOEXEC is set */
-#endif
+#define	F_ADD_SEALS	19
+#define	F_GET_SEALS	20
+#define	F_ISUNIONSTACK	21		/* Kludge for libc, don't use it. */
+
+/* Seals (F_ADD_SEALS, F_GET_SEALS). */
+#define	F_SEAL_SEAL	0x0001		/* Prevent adding sealings */
+#define	F_SEAL_SHRINK	0x0002		/* May not shrink */
+#define	F_SEAL_GROW	0x0004		/* May not grow */
+#define	F_SEAL_WRITE	0x0008		/* May not write */
+#endif	/* __BSD_VISIBLE */
 
 /* file descriptor flags (F_GETFD, F_SETFD) */
 #define	FD_CLOEXEC	1		/* close-on-exec flag */
@@ -311,6 +325,16 @@ struct __oflock {
 #define	POSIX_FADV_WILLNEED	3	/* will need these pages */
 #define	POSIX_FADV_DONTNEED	4	/* dont need these pages */
 #define	POSIX_FADV_NOREUSE	5	/* access data only once */
+#endif
+
+
+#ifdef __BSD_VISIBLE
+/*
+ * Magic value that specify that corresponding file descriptor to filename
+ * is unknown and sanitary check should be omitted in the funlinkat() and
+ * similar syscalls.
+ */
+#define	FD_NONE			-200
 #endif
 
 #ifndef _KERNEL

@@ -31,6 +31,7 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/bio.h>
+#include <sys/gsb_crc32.h>
 #include <sys/endian.h>
 #include <sys/kernel.h>
 #include <sys/kobj.h>
@@ -41,7 +42,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/systm.h>
 #include <sys/time.h>
 #include <sys/clock.h>
+#include <sys/disk.h>
 #include <geom/geom.h>
+#include <geom/geom_dbg.h>
 #include "geom/raid/g_raid.h"
 #include "geom/raid/md_ddf.h"
 #include "g_raid_md_if.h"
@@ -572,7 +575,7 @@ ddf_meta_create(struct g_raid_disk *disk, struct ddf_meta *sample)
 	off_t anchorlba;
 	u_int ss, pos, size;
 	int len, error;
-	char serial_buffer[24];
+	char serial_buffer[DISK_IDENT_SIZE];
 
 	if (sample->hdr == NULL)
 		sample = NULL;
@@ -2615,7 +2618,7 @@ g_raid_md_ctl_ddf(struct g_raid_md_object *md,
 				error = -2;
 				break;
 			}
-			if (strncmp(diskname, "/dev/", 5) == 0)
+			if (strncmp(diskname, _PATH_DEV, 5) == 0)
 				diskname += 5;
 
 			TAILQ_FOREACH(disk, &sc->sc_disks, d_next) {

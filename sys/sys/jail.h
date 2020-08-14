@@ -216,7 +216,10 @@ struct prison_racct {
 #define	PR_IP6		0x04000000	/* IPv6 restricted or disabled */
 					/* by this jail or an ancestor */
 
-/* Flags for pr_allow */
+/*
+ * Flags for pr_allow
+ * Bits not noted here may be used for dynamic allow.mount.xxxfs.
+ */
 #define	PR_ALLOW_SET_HOSTNAME		0x00000001
 #define	PR_ALLOW_SYSVIPC		0x00000002
 #define	PR_ALLOW_RAW_SOCKETS		0x00000004
@@ -224,17 +227,18 @@ struct prison_racct {
 #define	PR_ALLOW_MOUNT			0x00000010
 #define	PR_ALLOW_QUOTAS			0x00000020
 #define	PR_ALLOW_SOCKET_AF		0x00000040
-#define	PR_ALLOW_MOUNT_DEVFS		0x00000080
-#define	PR_ALLOW_MOUNT_NULLFS		0x00000100
-#define	PR_ALLOW_MOUNT_ZFS		0x00000200
-#define	PR_ALLOW_MOUNT_PROCFS		0x00000400
-#define	PR_ALLOW_MOUNT_TMPFS		0x00000800
-#define	PR_ALLOW_MOUNT_FDESCFS		0x00001000
-#define	PR_ALLOW_MOUNT_LINPROCFS	0x00002000
-#define	PR_ALLOW_MOUNT_LINSYSFS		0x00004000
+#define	PR_ALLOW_MLOCK			0x00000080
+#define	PR_ALLOW_READ_MSGBUF		0x00000100
+#define	PR_ALLOW_UNPRIV_DEBUG		0x00000200
 #define	PR_ALLOW_RESERVED_PORTS		0x00008000
 #define	PR_ALLOW_KMEM_ACCESS		0x00010000	/* reserved, not used yet */
-#define	PR_ALLOW_ALL			0x0001ffff
+#define	PR_ALLOW_ALL_STATIC		0x000183ff
+
+/*
+ * PR_ALLOW_DIFFERENCES determines which flags are able to be
+ * different between the parent and child jail upon creation.
+ */
+#define	PR_ALLOW_DIFFERENCES		(PR_ALLOW_UNPRIV_DEBUG)
 
 /*
  * OSD methods
@@ -349,9 +353,11 @@ SYSCTL_DECL(_security_jail_param);
 	CTLTYPE_STRUCT | CTLFLAG_MPSAFE | (access), NULL, len,		\
 	sysctl_jail_param, fmt, descr)
 #define	SYSCTL_JAIL_PARAM_NODE(module, descr)				\
-    SYSCTL_NODE(_security_jail_param, OID_AUTO, module, 0, 0, descr)
+    SYSCTL_NODE(_security_jail_param, OID_AUTO, module, CTLFLAG_MPSAFE,	\
+        0, descr)
 #define	SYSCTL_JAIL_PARAM_SUBNODE(parent, module, descr)		\
-    SYSCTL_NODE(_security_jail_param_##parent, OID_AUTO, module, 0, 0, descr)
+    SYSCTL_NODE(_security_jail_param_##parent, OID_AUTO, module, 	\
+        CTLFLAG_MPSAFE, 0, descr)
 #define	SYSCTL_JAIL_PARAM_SYS_NODE(module, access, descr)		\
     SYSCTL_JAIL_PARAM_NODE(module, descr);				\
     SYSCTL_JAIL_PARAM(_##module, , CTLTYPE_INT | (access), "E,jailsys",	\
@@ -364,12 +370,19 @@ struct ucred;
 struct mount;
 struct sockaddr;
 struct statfs;
-int jailed(struct ucred *cred);
+struct vfsconf;
+
+/*
+ * Return 1 if the passed credential is in a jail, otherwise 0.
+ */
+#define jailed(cred)	(cred->cr_prison != &prison0)
+
 int jailed_without_vnet(struct ucred *);
 void getcredhostname(struct ucred *, char *, size_t);
 void getcreddomainname(struct ucred *, char *, size_t);
 void getcredhostuuid(struct ucred *, char *, size_t);
 void getcredhostid(struct ucred *, unsigned long *);
+void getjailname(struct ucred *cred, char *name, size_t len);
 void prison0_init(void);
 int prison_allow(struct ucred *, unsigned);
 int prison_check(struct ucred *cred1, struct ucred *cred2);
@@ -409,10 +422,13 @@ int prison_restrict_ip6(struct prison *, struct in6_addr *);
 int prison_qcmp_v6(const void *, const void *);
 #endif
 int prison_check_af(struct ucred *cred, int af);
-int prison_if(struct ucred *cred, struct sockaddr *sa);
+int prison_if(struct ucred *cred, const struct sockaddr *sa);
 char *prison_name(struct prison *, struct prison *);
 int prison_priv_check(struct ucred *cred, int priv);
 int sysctl_jail_param(SYSCTL_HANDLER_ARGS);
+unsigned prison_add_allow(const char *prefix, const char *name,
+    const char *prefix_descr, const char *descr);
+void prison_add_vfs(struct vfsconf *vfsp);
 void prison_racct_foreach(void (*callback)(struct racct *racct,
     void *arg2, void *arg3), void (*pre)(void), void (*post)(void),
     void *arg2, void *arg3);

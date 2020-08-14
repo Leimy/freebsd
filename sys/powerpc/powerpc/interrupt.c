@@ -32,6 +32,7 @@
  */
 
 #include "opt_hwpmc_hooks.h"
+#include "opt_platform.h"
 
 #include <sys/cdefs.h>                  /* RCS ID & Copyright macro defns */
 
@@ -68,6 +69,10 @@
 
 #include "pic_if.h"
 
+#ifdef POWERNV
+int (*hmi_handler)(struct trapframe *);
+#endif
+
 /*
  * A very short dispatch, to try and maximise assembler code use
  * between all exception types. Maybe 'true' interrupts should go
@@ -86,6 +91,7 @@ powerpc_interrupt(struct trapframe *framep)
 
 	switch (framep->exc) {
 	case EXC_EXI:
+	case EXC_HVI:
 		critical_enter();
 		PIC_DISPATCH(root_pic, framep);
 		critical_exit();
@@ -111,11 +117,18 @@ powerpc_interrupt(struct trapframe *framep)
 	case EXC_PERF:
 		critical_enter();
 		KASSERT(pmc_intr != NULL, ("Performance exception, but no handler!"));
-		(*pmc_intr)(PCPU_GET(cpuid), framep);
+		(*pmc_intr)(framep);
 		if (pmc_hook && (PCPU_GET(curthread)->td_pflags & TDP_CALLCHAIN))
 			pmc_hook(PCPU_GET(curthread), PMC_FN_USER_CALLCHAIN, framep);
 		critical_exit();
 		break;
+#endif
+
+#ifdef POWERNV
+	case EXC_HMI:
+		if (hmi_handler != 0 && hmi_handler(framep) == 0)
+			break;
+		/* If no handler, or failure to handle, just drop to trap. */
 #endif
 
 	default:

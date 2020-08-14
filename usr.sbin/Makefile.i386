@@ -7,7 +7,6 @@ SUBDIR+=	acpi
 SUBDIR+=	apm
 SUBDIR+=	apmd
 .endif
-SUBDIR+=	asf
 SUBDIR+=	boot0cfg
 .if ${MK_TOOLCHAIN} != "no"
 SUBDIR+=	btxld
@@ -17,7 +16,6 @@ SUBDIR+=	cpucontrol
 SUBDIR+=	hyperv
 .endif
 SUBDIR+=	kgmon
-SUBDIR+=	kgzip
 SUBDIR+=	lptcontrol
 SUBDIR+=	mptable
 .if ${MK_NDIS} != "no"

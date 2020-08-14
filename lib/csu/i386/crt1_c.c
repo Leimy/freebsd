@@ -32,7 +32,6 @@ __FBSDID("$FreeBSD$");
 #include <stdlib.h>
 
 #include "libc_private.h"
-#include "crtbrand.c"
 #include "ignore_init.c"
 
 typedef void (*fptr)(void);
@@ -56,10 +55,12 @@ _start1(fptr cleanup, int argc, char *argv[])
 
 	env = argv + argc + 1;
 	handle_argv(argc, argv, env);
-	if (&_DYNAMIC != NULL)
+	if (&_DYNAMIC != NULL) {
 		atexit(cleanup);
-	else
+	} else {
+		process_irelocs();
 		_init_tls();
+	}
 
 #ifdef GCRT
 	atexit(_mcleanup);

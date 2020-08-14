@@ -90,6 +90,7 @@ static int opal_i2c_callback(device_t, int, caddr_t);
 static int opal_i2c_probe(device_t);
 static int opal_i2c_transfer(device_t, struct iic_msg *, uint32_t);
 static int i2c_opal_send_request(uint32_t, struct opal_i2c_request *);
+static phandle_t opal_i2c_get_node(device_t bus, device_t dev);
 
 static device_method_t opal_i2c_methods[] = {
 	/* Device interface */
@@ -99,6 +100,7 @@ static device_method_t opal_i2c_methods[] = {
 	/* iicbus interface */
 	DEVMETHOD(iicbus_callback,	opal_i2c_callback),
 	DEVMETHOD(iicbus_transfer,	opal_i2c_transfer),
+	DEVMETHOD(ofw_bus_get_node,	opal_i2c_get_node),
 	DEVMETHOD_END
 };
 
@@ -111,7 +113,7 @@ static device_method_t opal_i2c_methods[] = {
 static devclass_t opal_i2c_devclass;
 
 static driver_t opal_i2c_driver = {
-	"i2c",
+	"iichb",
 	opal_i2c_methods,
 	sizeof(struct opal_i2c_softc),
 };
@@ -165,33 +167,29 @@ static int
 i2c_opal_send_request(uint32_t bus_id, struct opal_i2c_request *req)
 {
 	struct opal_msg msg;
-	int token, rc;
+	uint64_t token;
+	int rc;
 
-	/*
-	 * XXX:
-	 * Async tokens should be managed globally. Since there is
-	 * only one place now, use hardcoded value.
-	 */
-	token = 0x112233;
+	token = opal_alloc_async_token();
 
 	memset(&msg, 0, sizeof(msg));
 
 	rc = opal_call(OPAL_I2C_REQUEST, token, bus_id,
-	    pmap_kextract((uint64_t)req));
+	    vtophys(req));
 	if (rc != OPAL_ASYNC_COMPLETION)
-		return (rc);
+		goto out;
 
-	do {
-		rc = opal_call(OPAL_CHECK_ASYNC_COMPLETION,
-		    pmap_kextract((uint64_t)&msg), sizeof(msg), token);
-	} while (rc == OPAL_BUSY);
+	rc = opal_wait_completion(&msg, sizeof(msg), token);
 
 	if (rc != OPAL_SUCCESS)
-		return (rc);
+		goto out;
 
 	rc = opal_get_async_rc(msg);
 
-	return rc;
+out:
+	opal_free_async_token(token);
+
+	return (rc);
 }
 
 static int
@@ -205,20 +203,13 @@ opal_i2c_transfer(device_t dev, struct iic_msg *msgs, uint32_t nmsgs)
 
 	memset(&req, 0, sizeof(req));
 
-	/* XXX: Currently OPAL can parse only 1 message */
-	if (nmsgs > 1) {
-		device_printf(dev,
-		    "trying to parse %d messages, while only 1 is supported\n", nmsgs);
-		return (ENOMEM);
-	}
-
 	I2C_LOCK(sc);
 	for (i = 0; i < nmsgs; i++) {
 		req.type = (msgs[i].flags & IIC_M_RD) ?
 		    OPAL_I2C_RAW_READ : OPAL_I2C_RAW_WRITE;
-		req.addr = htobe16(msgs[0].slave);
-		req.size = htobe32(msgs[0].len);
-		req.buffer_pa = htobe64(pmap_kextract((uint64_t)msgs[0].buf));
+		req.addr = htobe16(msgs[i].slave >> 1);
+		req.size = htobe32(msgs[i].len);
+		req.buffer_pa = htobe64(pmap_kextract((uint64_t)msgs[i].buf));
 
 		err = i2c_opal_send_request(sc->opal_id, &req);
 	}
@@ -244,6 +235,14 @@ opal_i2c_callback(device_t dev, int index, caddr_t data)
 	}
 
 	return (error);
+}
+
+static phandle_t
+opal_i2c_get_node(device_t bus, device_t dev)
+{
+
+	/* Share controller node with iibus device. */
+	return (ofw_bus_get_node(bus));
 }
 
 DRIVER_MODULE(opal_i2c, opal_i2cm, opal_i2c_driver, opal_i2c_devclass, NULL,

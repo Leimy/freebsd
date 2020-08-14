@@ -35,6 +35,9 @@
 #ifndef _MPSVAR_H
 #define _MPSVAR_H
 
+#include <sys/lock.h>
+#include <sys/mutex.h>
+
 #define MPS_DRIVER_VERSION	"21.02.00.00-fbsd"
 
 #define MPS_DB_MAX_WAIT		2500
@@ -239,17 +242,19 @@ struct mps_command {
 #define	MPS_CM_FLAGS_ERROR_MASK		MPS_CM_FLAGS_CHAIN_FAILED
 #define	MPS_CM_FLAGS_USE_CCB		(1 << 10)
 #define	MPS_CM_FLAGS_SATA_ID_TIMEOUT	(1 << 11)
+#define MPS_CM_FLAGS_ON_RECOVERY	(1 << 12)
+#define MPS_CM_FLAGS_TIMEDOUT		(1 << 13)
 	u_int				cm_state;
 #define MPS_CM_STATE_FREE		0
 #define MPS_CM_STATE_BUSY		1
-#define MPS_CM_STATE_TIMEDOUT		2
-#define MPS_CM_STATE_INQUEUE		3
+#define MPS_CM_STATE_INQUEUE		2
 	bus_dmamap_t			cm_dmamap;
 	struct scsi_sense_data		*cm_sense;
 	TAILQ_HEAD(, mps_chain)		cm_chain_list;
 	uint32_t			cm_req_busaddr;
 	uint32_t			cm_sense_busaddr;
 	struct callout			cm_callout;
+	mps_command_callback_t		*cm_timeout_handler;
 };
 
 struct mps_column_map {
@@ -325,6 +330,7 @@ struct mps_softc {
 	struct sysctl_ctx_list		sysctl_ctx;
 	struct sysctl_oid		*sysctl_tree;
 	char                            fw_version[16];
+	char				msg_version[8];
 	struct mps_command		*commands;
 	struct mps_chain		*chains;
 	struct callout			periodic;
@@ -541,7 +547,8 @@ mps_free_command(struct mps_softc *sc, struct mps_command *cm)
 {
 	struct mps_chain *chain, *chain_temp;
 
-	KASSERT(cm->cm_state == MPS_CM_STATE_BUSY, ("state not busy\n"));
+	KASSERT(cm->cm_state == MPS_CM_STATE_BUSY,
+	    ("state not busy: %d\n", cm->cm_state));
 
 	if (cm->cm_reply != NULL)
 		mps_free_reply(sc, cm->cm_reply_data);
@@ -577,10 +584,11 @@ mps_alloc_command(struct mps_softc *sc)
 		return (NULL);
 
 	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
-	    ("mps: Allocating busy command\n"));
+	    ("mps: Allocating busy command: %d\n", cm->cm_state));
 
 	TAILQ_REMOVE(&sc->req_list, cm, cm_link);
 	cm->cm_state = MPS_CM_STATE_BUSY;
+	cm->cm_timeout_handler = NULL;
 	return (cm);
 }
 
@@ -589,7 +597,8 @@ mps_free_high_priority_command(struct mps_softc *sc, struct mps_command *cm)
 {
 	struct mps_chain *chain, *chain_temp;
 
-	KASSERT(cm->cm_state == MPS_CM_STATE_BUSY, ("state not busy\n"));
+	KASSERT(cm->cm_state == MPS_CM_STATE_BUSY,
+	    ("state not busy: %d\n", cm->cm_state));
 
 	if (cm->cm_reply != NULL)
 		mps_free_reply(sc, cm->cm_reply_data);
@@ -618,10 +627,13 @@ mps_alloc_high_priority_command(struct mps_softc *sc)
 		return (NULL);
 
 	KASSERT(cm->cm_state == MPS_CM_STATE_FREE,
-	    ("mps: Allocating busy command\n"));
+	    ("mps: Allocating high priority busy command: %d\n", cm->cm_state));
 
 	TAILQ_REMOVE(&sc->high_priority_req_list, cm, cm_link);
 	cm->cm_state = MPS_CM_STATE_BUSY;
+	cm->cm_timeout_handler = NULL;
+	cm->cm_desc.HighPriority.RequestFlags =
+	    MPI2_REQ_DESCRIPT_FLAGS_HIGH_PRIORITY;
 	return (cm);
 }
 
@@ -819,35 +831,14 @@ int mpssas_send_reset(struct mps_softc *sc, struct mps_command *tm,
 SYSCTL_DECL(_hw_mps);
 
 /* Compatibility shims for different OS versions */
-#if __FreeBSD_version >= 800001
 #define mps_kproc_create(func, farg, proc_ptr, flags, stackpgs, fmtstr, arg) \
     kproc_create(func, farg, proc_ptr, flags, stackpgs, fmtstr, arg)
 #define mps_kproc_exit(arg)	kproc_exit(arg)
-#else
-#define mps_kproc_create(func, farg, proc_ptr, flags, stackpgs, fmtstr, arg) \
-    kthread_create(func, farg, proc_ptr, flags, stackpgs, fmtstr, arg)
-#define mps_kproc_exit(arg)	kthread_exit(arg)
-#endif
 
 #if defined(CAM_PRIORITY_XPT)
 #define MPS_PRIORITY_XPT	CAM_PRIORITY_XPT
 #else
 #define MPS_PRIORITY_XPT	5
-#endif
-
-#if __FreeBSD_version < 800107
-// Prior to FreeBSD-8.0 scp3_flags was not defined.
-#define spc3_flags reserved
-
-#define SPC3_SID_PROTECT    0x01
-#define SPC3_SID_3PC        0x08
-#define SPC3_SID_TPGS_MASK  0x30
-#define SPC3_SID_TPGS_IMPLICIT  0x10
-#define SPC3_SID_TPGS_EXPLICIT  0x20
-#define SPC3_SID_ACC        0x40
-#define SPC3_SID_SCCS       0x80
-
-#define CAM_PRIORITY_NORMAL CAM_PRIORITY_NONE
 #endif
 
 #endif

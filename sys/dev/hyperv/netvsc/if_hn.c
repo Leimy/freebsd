@@ -576,12 +576,16 @@ SYSCTL_INT(_hw_hn, OID_AUTO, tx_agg_pkts, CTLFLAG_RDTUN,
     &hn_tx_agg_pkts, 0, "Packet transmission aggregation packet limit");
 
 /* VF list */
-SYSCTL_PROC(_hw_hn, OID_AUTO, vflist, CTLFLAG_RD | CTLTYPE_STRING,
-    0, 0, hn_vflist_sysctl, "A", "VF list");
+SYSCTL_PROC(_hw_hn, OID_AUTO, vflist,
+    CTLFLAG_RD | CTLTYPE_STRING | CTLFLAG_NEEDGIANT, 0, 0,
+    hn_vflist_sysctl, "A",
+    "VF list");
 
 /* VF mapping */
-SYSCTL_PROC(_hw_hn, OID_AUTO, vfmap, CTLFLAG_RD | CTLTYPE_STRING,
-    0, 0, hn_vfmap_sysctl, "A", "VF mapping");
+SYSCTL_PROC(_hw_hn, OID_AUTO, vfmap,
+    CTLFLAG_RD | CTLTYPE_STRING | CTLFLAG_NEEDGIANT, 0, 0,
+    hn_vfmap_sysctl, "A",
+    "VF mapping");
 
 /* Transparent VF */
 static int			hn_xpnt_vf = 1;
@@ -861,7 +865,8 @@ hn_set_hlen(struct mbuf *m_head)
 
 		PULLUP_HDR(m_head, ehlen + sizeof(*ip6));
 		ip6 = mtodo(m_head, ehlen);
-		if (ip6->ip6_nxt != IPPROTO_TCP) {
+		if (ip6->ip6_nxt != IPPROTO_TCP &&
+		    ip6->ip6_nxt != IPPROTO_UDP) {
 			m_freem(m_head);
 			return (NULL);
 		}
@@ -931,7 +936,7 @@ hn_rxfilter_config(struct hn_softc *sc)
 			filter |= NDIS_PACKET_TYPE_BROADCAST;
 		/* TODO: support multicast list */
 		if ((ifp->if_flags & IFF_ALLMULTI) ||
-		    !TAILQ_EMPTY(&ifp->if_multiaddrs))
+		    !CK_STAILQ_EMPTY(&ifp->if_multiaddrs))
 			filter |= NDIS_PACKET_TYPE_ALL_MULTICAST;
 	}
 	return (hn_set_rxfilter(sc, filter));
@@ -1161,6 +1166,13 @@ hn_ismyvf(const struct hn_softc *sc, const struct ifnet *ifp)
 	    strcmp(ifp->if_dname, "vlan") == 0)
 		return (false);
 
+	/*
+	 * During detach events ifp->if_addr might be NULL.
+	 * Make sure the bcmp() below doesn't panic on that:
+	 */
+	if (ifp->if_addr == NULL || hn_ifp->if_addr == NULL)
+		return (false);
+
 	if (bcmp(IF_LLADDR(ifp), IF_LLADDR(hn_ifp), ETHER_ADDR_LEN) != 0)
 		return (false);
 
@@ -1323,7 +1335,7 @@ hn_xpnt_vf_saveifflags(struct hn_softc *sc)
 	HN_LOCK_ASSERT(sc);
 
 	/* XXX vlan(4) style mcast addr maintenance */
-	if (!TAILQ_EMPTY(&ifp->if_multiaddrs))
+	if (!CK_STAILQ_EMPTY(&ifp->if_multiaddrs))
 		allmulti = IFF_ALLMULTI;
 
 	/* Always set the VF's if_flags */
@@ -1498,7 +1510,7 @@ hn_vf_rss_fixup(struct hn_softc *sc, bool reconf)
 	strlcpy(ifrk.ifrk_name, vf_ifp->if_xname, sizeof(ifrk.ifrk_name));
 	error = vf_ifp->if_ioctl(vf_ifp, SIOCGIFRSSKEY, (caddr_t)&ifrk);
 	if (error) {
-		if_printf(ifp, "%s SIOCGRSSKEY failed: %d\n",
+		if_printf(ifp, "%s SIOCGIFRSSKEY failed: %d\n",
 		    vf_ifp->if_xname, error);
 		goto done;
 	}
@@ -5939,8 +5951,7 @@ hn_transmit(struct ifnet *ifp, struct mbuf *m)
 			int obytes, omcast;
 
 			obytes = m->m_pkthdr.len;
-			if (m->m_flags & M_MCAST)
-				omcast = 1;
+			omcast = (m->m_flags & M_MCAST) != 0;
 
 			if (sc->hn_xvf_flags & HN_XVFFLAG_ACCBPF) {
 				if (bpf_peers_present(ifp->if_bpf)) {
@@ -6623,6 +6634,38 @@ hn_synth_detach(struct hn_softc *sc)
 	/* Detach all of the channels. */
 	hn_detach_allchans(sc);
 
+	if (vmbus_current_version >= VMBUS_VERSION_WIN10 && sc->hn_rxbuf_gpadl != 0) {
+		/*
+		 * Host is post-Win2016, disconnect RXBUF from primary channel here.
+		 */
+		int error;
+
+		error = vmbus_chan_gpadl_disconnect(sc->hn_prichan,
+		    sc->hn_rxbuf_gpadl);
+		if (error) {
+			if_printf(sc->hn_ifp,
+			    "rxbuf gpadl disconn failed: %d\n", error);
+			sc->hn_flags |= HN_FLAG_RXBUF_REF;
+		}
+		sc->hn_rxbuf_gpadl = 0;
+	}
+
+	if (vmbus_current_version >= VMBUS_VERSION_WIN10 && sc->hn_chim_gpadl != 0) {
+		/*
+		 * Host is post-Win2016, disconnect chimney sending buffer from
+		 * primary channel here.
+		 */
+		int error;
+
+		error = vmbus_chan_gpadl_disconnect(sc->hn_prichan,
+		    sc->hn_chim_gpadl);
+		if (error) {
+			if_printf(sc->hn_ifp,
+			    "chim gpadl disconn failed: %d\n", error);
+			sc->hn_flags |= HN_FLAG_CHIM_REF;
+		}
+		sc->hn_chim_gpadl = 0;
+	}
 	sc->hn_flags &= ~HN_FLAG_SYNTH_ATTACHED;
 }
 

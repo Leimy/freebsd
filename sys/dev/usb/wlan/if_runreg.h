@@ -781,7 +781,7 @@ struct rt2860_txwi {
 #define	RT2860_PHY_MODE		0xc000
 #define	RT2860_PHY_CCK		(0 << 14)
 #define	RT2860_PHY_OFDM		(1 << 14)
-#define	RT2860_PHY_HT		(2 << 14)
+#define	RT2860_PHY_HT_MIX	(2 << 14)
 #define	RT2860_PHY_HT_GF	(3 << 14)
 #define	RT2860_PHY_SGI		(1 << 8)
 #define	RT2860_PHY_BW40		(1 << 7)
@@ -955,11 +955,6 @@ struct rt2860_rxwi {
 #define	RT5390_EEPROM_IQ_GAIN_CAL_TX1_CH140_TO_CH165_5GHZ	0x14e
 #define	RT5390_EEPROM_IQ_PHASE_CAL_TX1_CH140_TO_CH165_5GHZ	0x14f
 
-#define	RT2860_RIDX_CCK1	 0
-#define	RT2860_RIDX_CCK11	 3
-#define	RT2860_RIDX_OFDM6	 4
-#define	RT2860_RIDX_MAX		12
-
 /*
  * EEPROM access macro.
  */
@@ -1086,9 +1081,6 @@ struct rt2860_rxwi {
 /*
  * Channel map for run(4) driver; taken from the table below.
  */
-static const uint8_t run_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
-
 static const uint8_t run_chan_5ghz[] =
 	{ 36, 38, 40, 44, 46, 48, 52, 54, 56, 60, 62, 64, 100, 102, 104,
 	  108, 110, 112, 116, 118, 120, 124, 126, 128, 132, 134, 136, 140,

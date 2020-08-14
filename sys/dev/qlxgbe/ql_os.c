@@ -176,10 +176,9 @@ qla_add_sysctls(qla_host_t *ha)
                 ha->fw_ver_str, 0, "firmware version");
 
         SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
-                SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
-                OID_AUTO, "link_status", CTLTYPE_INT | CTLFLAG_RW,
-                (void *)ha, 0,
-                qla_sysctl_get_link_status, "I", "Link Status");
+            SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
+	    "link_status", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, 
+	    (void *)ha, 0, qla_sysctl_get_link_status, "I", "Link Status");
 
 	ha->dbg_level = 0;
         SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
@@ -977,32 +976,28 @@ qla_init(void *arg)
 	QL_DPRINT2(ha, (ha->pci_dev, "%s: exit\n", __func__));
 }
 
+static u_int
+qla_copy_maddr(void *arg, struct sockaddr_dl *sdl, u_int mcnt)
+{
+	uint8_t *mta = arg;
+
+	if (mcnt == Q8_MAX_NUM_MULTICAST_ADDRS)
+		return (0);
+
+	bcopy(LLADDR(sdl), &mta[mcnt * Q8_MAC_ADDR_LEN], Q8_MAC_ADDR_LEN);
+
+	return (1);
+}
+
 static int
 qla_set_multi(qla_host_t *ha, uint32_t add_multi)
 {
 	uint8_t mta[Q8_MAX_NUM_MULTICAST_ADDRS * Q8_MAC_ADDR_LEN];
-	struct ifmultiaddr *ifma;
 	int mcnt = 0;
 	struct ifnet *ifp = ha->ifp;
 	int ret = 0;
 
-	if_maddr_rlock(ifp);
-
-	TAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-
-		if (mcnt == Q8_MAX_NUM_MULTICAST_ADDRS)
-			break;
-
-		bcopy(LLADDR((struct sockaddr_dl *) ifma->ifma_addr),
-			&mta[mcnt * Q8_MAC_ADDR_LEN], Q8_MAC_ADDR_LEN);
-
-		mcnt++;
-	}
-
-	if_maddr_runlock(ifp);
+	mcnt = if_foreach_llmaddr(ifp, qla_copy_maddr, mta);
 
 	if (QLA_LOCK(ha, __func__, QLA_LOCK_DEFAULT_MS_TIMEOUT,
 		QLA_LOCK_NO_SLEEP) != 0)
@@ -1289,13 +1284,20 @@ qla_send(qla_host_t *ha, struct mbuf **m_headp, uint32_t txr_idx,
 
 	tx_idx = ha->hw.tx_cntxt[txr_idx].txr_next;
 
-	if (NULL != ha->tx_ring[txr_idx].tx_buf[tx_idx].m_head) {
+	if ((NULL != ha->tx_ring[txr_idx].tx_buf[tx_idx].m_head) ||
+		(QL_ERR_INJECT(ha, INJCT_TXBUF_MBUF_NON_NULL))){
 		QL_ASSERT(ha, 0, ("%s [%d]: txr_idx = %d tx_idx = %d "\
 			"mbuf = %p\n", __func__, __LINE__, txr_idx, tx_idx,\
 			ha->tx_ring[txr_idx].tx_buf[tx_idx].m_head));
+
+		device_printf(ha->pci_dev, "%s [%d]: txr_idx = %d tx_idx = %d "
+			"mbuf = %p\n", __func__, __LINE__, txr_idx, tx_idx,
+			ha->tx_ring[txr_idx].tx_buf[tx_idx].m_head);
+
 		if (m_head)
 			m_freem(m_head);
 		*m_headp = NULL;
+		QL_INITIATE_RECOVERY(ha);
 		return (ret);
 	}
 
@@ -1428,8 +1430,8 @@ qla_fp_taskqueue(void *context, int pending)
         qla_tx_fp_t *fp;
         qla_host_t *ha;
         struct ifnet *ifp;
-        struct mbuf  *mp;
-        int ret;
+        struct mbuf  *mp = NULL;
+        int ret = 0;
 	uint32_t txr_idx;
 	uint32_t iscsi_pdu = 0;
 	uint32_t rx_pkts_left = -1;
@@ -1453,7 +1455,7 @@ qla_fp_taskqueue(void *context, int pending)
         }
 
 	while (rx_pkts_left && !ha->stop_rcv &&
-		(ifp->if_drv_flags & IFF_DRV_RUNNING)) {
+		(ifp->if_drv_flags & IFF_DRV_RUNNING) && ha->hw.link_up) {
 		rx_pkts_left = ql_rcv_isr(ha, fp->txr_idx, 64);
 
 #ifdef QL_ENABLE_ISCSI_TLV
@@ -1498,13 +1500,18 @@ qla_fp_taskqueue(void *context, int pending)
 
 			/* Send a copy of the frame to the BPF listener */
 			ETHER_BPF_MTAP(ifp, mp);
-			if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+
+			if (((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0) ||
+				(!ha->hw.link_up))
 				break;
 
 			mp = drbr_peek(ifp, fp->tx_br);
 		}
 	}
         mtx_unlock(&fp->tx_mtx);
+
+	if ((ifp->if_drv_flags & IFF_DRV_RUNNING) == 0)
+		goto qla_fp_taskqueue_exit;
 
 qla_fp_taskqueue_exit0:
 
@@ -1535,7 +1542,7 @@ qla_create_fp_taskqueues(qla_host_t *ha)
                 bzero(tq_name, sizeof (tq_name));
                 snprintf(tq_name, sizeof (tq_name), "ql_fp_tq_%d", i);
 
-                TASK_INIT(&fp->fp_task, 0, qla_fp_taskqueue, fp);
+                NET_TASK_INIT(&fp->fp_task, 0, qla_fp_taskqueue, fp);
 
                 fp->fp_taskqueue = taskqueue_create_fast(tq_name, M_NOWAIT,
                                         taskqueue_thread_enqueue,

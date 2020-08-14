@@ -29,6 +29,7 @@
  */
 
 #include <sys/param.h>
+#include <sys/queue.h>
 #include <sys/sysctl.h>
 
 #include <err.h>
@@ -323,6 +324,13 @@ memstat_get_sleeps(const struct memory_type *mtp)
 {
 
 	return (mtp->mt_sleeps);
+}
+
+uint64_t
+memstat_get_xdomain(const struct memory_type *mtp)
+{
+
+	return (mtp->mt_xdomain);
 }
 
 void *

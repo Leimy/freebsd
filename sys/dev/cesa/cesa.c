@@ -59,15 +59,16 @@ __FBSDID("$FreeBSD$");
 #include <machine/resource.h>
 #include <machine/fdt.h>
 
+#include <dev/fdt/simplebus.h>
 #include <dev/fdt/fdt_common.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
 
-#include <sys/md5.h>
 #include <crypto/sha1.h>
 #include <crypto/sha2/sha256.h>
 #include <crypto/rijndael/rijndael.h>
 #include <opencrypto/cryptodev.h>
+#include <opencrypto/xform.h>
 #include "cryptodev_if.h"
 
 #include <arm/mv/mvreg.h>
@@ -76,10 +77,13 @@ __FBSDID("$FreeBSD$");
 
 static int	cesa_probe(device_t);
 static int	cesa_attach(device_t);
+static int	cesa_attach_late(device_t);
 static int	cesa_detach(device_t);
 static void	cesa_intr(void *);
-static int	cesa_newsession(device_t, u_int32_t *, struct cryptoini *);
-static int	cesa_freesession(device_t, u_int64_t);
+static int	cesa_probesession(device_t,
+    const struct crypto_session_params *);
+static int	cesa_newsession(device_t, crypto_session_t,
+    const struct crypto_session_params *);
 static int	cesa_process(device_t, struct cryptop *, int);
 
 static struct resource_spec cesa_res_spec[] = {
@@ -96,8 +100,8 @@ static device_method_t cesa_methods[] = {
 	DEVMETHOD(device_detach,	cesa_detach),
 
 	/* Crypto device methods */
+	DEVMETHOD(cryptodev_probesession, cesa_probesession),
 	DEVMETHOD(cryptodev_newsession,	cesa_newsession),
-	DEVMETHOD(cryptodev_freesession,cesa_freesession),
 	DEVMETHOD(cryptodev_process,	cesa_process),
 
 	DEVMETHOD_END
@@ -229,33 +233,6 @@ cesa_sync_desc(struct cesa_softc *sc, bus_dmasync_op_t op)
 	cesa_sync_dma_mem(&sc->sc_tdesc_cdm, op);
 	cesa_sync_dma_mem(&sc->sc_sdesc_cdm, op);
 	cesa_sync_dma_mem(&sc->sc_requests_cdm, op);
-}
-
-static struct cesa_session *
-cesa_alloc_session(struct cesa_softc *sc)
-{
-	struct cesa_session *cs;
-
-	CESA_GENERIC_ALLOC_LOCKED(sc, cs, sessions);
-
-	return (cs);
-}
-
-static struct cesa_session *
-cesa_get_session(struct cesa_softc *sc, uint32_t sid)
-{
-
-	if (sid >= CESA_SESSIONS)
-		return (NULL);
-
-	return (&sc->sc_sessions[sid]);
-}
-
-static void
-cesa_free_session(struct cesa_softc *sc, struct cesa_session *cs)
-{
-
-	CESA_GENERIC_FREE_LOCKED(sc, cs, sessions);
 }
 
 static struct cesa_request *
@@ -444,78 +421,61 @@ cesa_append_packet(struct cesa_softc *sc, struct cesa_request *cr,
 	return (0);
 }
 
-static int
+static void
 cesa_set_mkey(struct cesa_session *cs, int alg, const uint8_t *mkey, int mklen)
 {
-	uint8_t ipad[CESA_MAX_HMAC_BLOCK_LEN];
-	uint8_t opad[CESA_MAX_HMAC_BLOCK_LEN];
-	SHA1_CTX sha1ctx;
-	SHA256_CTX sha256ctx;
-	MD5_CTX md5ctx;
+	union authctx auth_ctx;
 	uint32_t *hout;
 	uint32_t *hin;
 	int i;
-
-	memset(ipad, HMAC_IPAD_VAL, CESA_MAX_HMAC_BLOCK_LEN);
-	memset(opad, HMAC_OPAD_VAL, CESA_MAX_HMAC_BLOCK_LEN);
-	for (i = 0; i < mklen; i++) {
-		ipad[i] ^= mkey[i];
-		opad[i] ^= mkey[i];
-	}
 
 	hin = (uint32_t *)cs->cs_hiv_in;
 	hout = (uint32_t *)cs->cs_hiv_out;
 
 	switch (alg) {
-	case CRYPTO_MD5_HMAC:
-		MD5Init(&md5ctx);
-		MD5Update(&md5ctx, ipad, MD5_HMAC_BLOCK_LEN);
-		memcpy(hin, md5ctx.state, sizeof(md5ctx.state));
-		MD5Init(&md5ctx);
-		MD5Update(&md5ctx, opad, MD5_HMAC_BLOCK_LEN);
-		memcpy(hout, md5ctx.state, sizeof(md5ctx.state));
-		break;
 	case CRYPTO_SHA1_HMAC:
-		SHA1Init(&sha1ctx);
-		SHA1Update(&sha1ctx, ipad, SHA1_HMAC_BLOCK_LEN);
-		memcpy(hin, sha1ctx.h.b32, sizeof(sha1ctx.h.b32));
-		SHA1Init(&sha1ctx);
-		SHA1Update(&sha1ctx, opad, SHA1_HMAC_BLOCK_LEN);
-		memcpy(hout, sha1ctx.h.b32, sizeof(sha1ctx.h.b32));
+		hmac_init_ipad(&auth_hash_hmac_sha1, mkey, mklen, &auth_ctx);
+		memcpy(hin, auth_ctx.sha1ctx.h.b32,
+		    sizeof(auth_ctx.sha1ctx.h.b32));
+		hmac_init_opad(&auth_hash_hmac_sha1, mkey, mklen, &auth_ctx);
+		memcpy(hout, auth_ctx.sha1ctx.h.b32,
+		    sizeof(auth_ctx.sha1ctx.h.b32));
 		break;
 	case CRYPTO_SHA2_256_HMAC:
-		SHA256_Init(&sha256ctx);
-		SHA256_Update(&sha256ctx, ipad, SHA2_256_HMAC_BLOCK_LEN);
-		memcpy(hin, sha256ctx.state, sizeof(sha256ctx.state));
-		SHA256_Init(&sha256ctx);
-		SHA256_Update(&sha256ctx, opad, SHA2_256_HMAC_BLOCK_LEN);
-		memcpy(hout, sha256ctx.state, sizeof(sha256ctx.state));
+		hmac_init_ipad(&auth_hash_hmac_sha2_256, mkey, mklen,
+		    &auth_ctx);
+		memcpy(hin, auth_ctx.sha256ctx.state,
+		    sizeof(auth_ctx.sha256ctx.state));
+		hmac_init_opad(&auth_hash_hmac_sha2_256, mkey, mklen,
+		    &auth_ctx);
+		memcpy(hout, auth_ctx.sha256ctx.state,
+		    sizeof(auth_ctx.sha256ctx.state));
 		break;
 	default:
-		return (EINVAL);
+		panic("shouldn't get here");
 	}
 
 	for (i = 0; i < CESA_MAX_HASH_LEN / sizeof(uint32_t); i++) {
 		hin[i] = htobe32(hin[i]);
 		hout[i] = htobe32(hout[i]);
 	}
-
-	return (0);
+	explicit_bzero(&auth_ctx, sizeof(auth_ctx));
 }
 
 static int
-cesa_prep_aes_key(struct cesa_session *cs)
+cesa_prep_aes_key(struct cesa_session *cs,
+    const struct crypto_session_params *csp)
 {
 	uint32_t ek[4 * (RIJNDAEL_MAXNR + 1)];
 	uint32_t *dkey;
 	int i;
 
-	rijndaelKeySetupEnc(ek, cs->cs_key, cs->cs_klen * 8);
+	rijndaelKeySetupEnc(ek, cs->cs_key, csp->csp_cipher_klen * 8);
 
 	cs->cs_config &= ~CESA_CSH_AES_KLEN_MASK;
 	dkey = (uint32_t *)cs->cs_aes_dkey;
 
-	switch (cs->cs_klen) {
+	switch (csp->csp_cipher_klen) {
 	case 16:
 		cs->cs_config |= CESA_CSH_AES_KLEN_128;
 		for (i = 0; i < 4; i++)
@@ -540,22 +500,6 @@ cesa_prep_aes_key(struct cesa_session *cs)
 	}
 
 	return (0);
-}
-
-static int
-cesa_is_hash(int alg)
-{
-
-	switch (alg) {
-	case CRYPTO_MD5:
-	case CRYPTO_MD5_HMAC:
-	case CRYPTO_SHA1:
-	case CRYPTO_SHA1_HMAC:
-	case CRYPTO_SHA2_256_HMAC:
-		return (1);
-	default:
-		return (0);
-	}
 }
 
 static void
@@ -611,6 +555,7 @@ cesa_create_chain_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	unsigned int skip, len;
 	struct cesa_sa_desc *csd;
 	struct cesa_request *cr;
+	struct cryptop *crp;
 	struct cesa_softc *sc;
 	struct cesa_packet cp;
 	bus_dma_segment_t seg;
@@ -620,72 +565,106 @@ cesa_create_chain_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	cci = arg;
 	sc = cci->cci_sc;
 	cr = cci->cci_cr;
+	crp = cr->cr_crp;
 
 	if (error) {
 		cci->cci_error = error;
 		return;
 	}
 
-	elen = cci->cci_enc ? cci->cci_enc->crd_len : 0;
-	eskip = cci->cci_enc ? cci->cci_enc->crd_skip : 0;
-	mlen = cci->cci_mac ? cci->cci_mac->crd_len : 0;
-	mskip = cci->cci_mac ? cci->cci_mac->crd_skip : 0;
-
-	if (elen && mlen &&
-	    ((eskip > mskip && ((eskip - mskip) & (cr->cr_cs->cs_ivlen - 1))) ||
-	    (mskip > eskip && ((mskip - eskip) & (cr->cr_cs->cs_mblen - 1))) ||
-	    (eskip > (mskip + mlen)) || (mskip > (eskip + elen)))) {
+	/*
+	 * Only do a combined op if the AAD is adjacent to the payload
+	 * and the AAD length is a multiple of the IV length.  The
+	 * checks against 'config' are to avoid recursing when the
+	 * logic below invokes separate operations.
+	 */
+	config = cci->cci_config;
+	if (((config & CESA_CSHD_OP_MASK) == CESA_CSHD_MAC_AND_ENC ||
+	    (config & CESA_CSHD_OP_MASK) == CESA_CSHD_ENC_AND_MAC) &&
+	    crp->crp_aad_length != 0 &&
+	    (crp->crp_aad_length & (cr->cr_cs->cs_ivlen - 1)) != 0) {
 		/*
 		 * Data alignment in the request does not meet CESA requiremnts
 		 * for combined encryption/decryption and hashing. We have to
 		 * split the request to separate operations and process them
 		 * one by one.
 		 */
-		config = cci->cci_config;
 		if ((config & CESA_CSHD_OP_MASK) == CESA_CSHD_MAC_AND_ENC) {
 			config &= ~CESA_CSHD_OP_MASK;
 
 			cci->cci_config = config | CESA_CSHD_MAC;
-			cci->cci_enc = NULL;
-			cci->cci_mac = cr->cr_mac;
-			cesa_create_chain_cb(cci, segs, nseg, cci->cci_error);
+			cesa_create_chain_cb(cci, segs, nseg, 0);
 
 			cci->cci_config = config | CESA_CSHD_ENC;
-			cci->cci_enc = cr->cr_enc;
-			cci->cci_mac = NULL;
-			cesa_create_chain_cb(cci, segs, nseg, cci->cci_error);
+			cesa_create_chain_cb(cci, segs, nseg, 0);
 		} else {
 			config &= ~CESA_CSHD_OP_MASK;
 
 			cci->cci_config = config | CESA_CSHD_ENC;
-			cci->cci_enc = cr->cr_enc;
-			cci->cci_mac = NULL;
-			cesa_create_chain_cb(cci, segs, nseg, cci->cci_error);
+			cesa_create_chain_cb(cci, segs, nseg, 0);
 
 			cci->cci_config = config | CESA_CSHD_MAC;
-			cci->cci_enc = NULL;
-			cci->cci_mac = cr->cr_mac;
-			cesa_create_chain_cb(cci, segs, nseg, cci->cci_error);
+			cesa_create_chain_cb(cci, segs, nseg, 0);
 		}
 
 		return;
+	}
+
+	mskip = mlen = eskip = elen = 0;
+
+	if (crp->crp_aad_length == 0) {
+		skip = crp->crp_payload_start;
+		len = crp->crp_payload_length;
+		switch (config & CESA_CSHD_OP_MASK) {
+		case CESA_CSHD_ENC:
+			eskip = skip;
+			elen = len;
+			break;
+		case CESA_CSHD_MAC:
+			mskip = skip;
+			mlen = len;
+			break;
+		default:
+			eskip = skip;
+			elen = len;
+			mskip = skip;
+			mlen = len;
+			break;
+		}
+	} else {
+		/*
+		 * For an encryption-only separate request, only
+		 * process the payload.  For combined requests and
+		 * hash-only requests, process the entire region.
+		 */
+		switch (config & CESA_CSHD_OP_MASK) {
+		case CESA_CSHD_ENC:
+			skip = crp->crp_payload_start;
+			len = crp->crp_payload_length;
+			eskip = skip;
+			elen = len;
+			break;
+		case CESA_CSHD_MAC:
+			skip = crp->crp_aad_start;
+			len = crp->crp_aad_length + crp->crp_payload_length;
+			mskip = skip;
+			mlen = len;
+			break;
+		default:
+			skip = crp->crp_aad_start;
+			len = crp->crp_aad_length + crp->crp_payload_length;
+			mskip = skip;
+			mlen = len;
+			eskip = crp->crp_payload_start;
+			elen = crp->crp_payload_length;
+			break;
+		}
 	}
 
 	tmlen = mlen;
 	fragmented = 0;
 	mpsize = CESA_MAX_PACKET_SIZE;
 	mpsize &= ~((cr->cr_cs->cs_ivlen - 1) | (cr->cr_cs->cs_mblen - 1));
-
-	if (elen && mlen) {
-		skip = MIN(eskip, mskip);
-		len = MAX(elen + eskip, mlen + mskip) - skip;
-	} else if (elen) {
-		skip = eskip;
-		len = elen;
-	} else {
-		skip = mskip;
-		len = mlen;
-	}
 
 	/* Start first packet in chain */
 	cesa_start_packet(&cp, MIN(mpsize, len));
@@ -804,16 +783,9 @@ cesa_create_chain_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 	}
 }
 
-static void
-cesa_create_chain_cb2(void *arg, bus_dma_segment_t *segs, int nseg,
-    bus_size_t size, int error)
-{
-
-	cesa_create_chain_cb(arg, segs, nseg, error);
-}
-
 static int
-cesa_create_chain(struct cesa_softc *sc, struct cesa_request *cr)
+cesa_create_chain(struct cesa_softc *sc,
+    const struct crypto_session_params *csp, struct cesa_request *cr)
 {
 	struct cesa_chain_info cci;
 	struct cesa_tdma_desc *ctd;
@@ -824,17 +796,17 @@ cesa_create_chain(struct cesa_softc *sc, struct cesa_request *cr)
 	CESA_LOCK_ASSERT(sc, sessions);
 
 	/* Create request metadata */
-	if (cr->cr_enc) {
-		if (cr->cr_enc->crd_alg == CRYPTO_AES_CBC &&
-		    (cr->cr_enc->crd_flags & CRD_F_ENCRYPT) == 0)
+	if (csp->csp_cipher_klen != 0) {
+		if (csp->csp_cipher_alg == CRYPTO_AES_CBC &&
+		    !CRYPTO_OP_IS_ENCRYPT(cr->cr_crp->crp_op))
 			memcpy(cr->cr_csd->csd_key, cr->cr_cs->cs_aes_dkey,
-			    cr->cr_cs->cs_klen);
+			    csp->csp_cipher_klen);
 		else
 			memcpy(cr->cr_csd->csd_key, cr->cr_cs->cs_key,
-			    cr->cr_cs->cs_klen);
+			    csp->csp_cipher_klen);
 	}
 
-	if (cr->cr_mac) {
+	if (csp->csp_auth_klen != 0) {
 		memcpy(cr->cr_csd->csd_hiv_in, cr->cr_cs->cs_hiv_in,
 		    CESA_MAX_HASH_LEN);
 		memcpy(cr->cr_csd->csd_hiv_out, cr->cr_cs->cs_hiv_out,
@@ -850,37 +822,30 @@ cesa_create_chain(struct cesa_softc *sc, struct cesa_request *cr)
 	/* Prepare SA configuration */
 	config = cr->cr_cs->cs_config;
 
-	if (cr->cr_enc && (cr->cr_enc->crd_flags & CRD_F_ENCRYPT) == 0)
+	if (csp->csp_cipher_alg != 0 &&
+	    !CRYPTO_OP_IS_ENCRYPT(cr->cr_crp->crp_op))
 		config |= CESA_CSHD_DECRYPT;
-	if (cr->cr_enc && !cr->cr_mac)
+	switch (csp->csp_mode) {
+	case CSP_MODE_CIPHER:
 		config |= CESA_CSHD_ENC;
-	if (!cr->cr_enc && cr->cr_mac)
+		break;
+	case CSP_MODE_DIGEST:
 		config |= CESA_CSHD_MAC;
-	if (cr->cr_enc && cr->cr_mac)
+		break;
+	case CSP_MODE_ETA:
 		config |= (config & CESA_CSHD_DECRYPT) ? CESA_CSHD_MAC_AND_ENC :
 		    CESA_CSHD_ENC_AND_MAC;
+		break;
+	}
 
 	/* Create data packets */
 	cci.cci_sc = sc;
 	cci.cci_cr = cr;
-	cci.cci_enc = cr->cr_enc;
-	cci.cci_mac = cr->cr_mac;
 	cci.cci_config = config;
 	cci.cci_error = 0;
 
-	if (cr->cr_crp->crp_flags & CRYPTO_F_IOV)
-		error = bus_dmamap_load_uio(sc->sc_data_dtag,
-		    cr->cr_dmap, (struct uio *)cr->cr_crp->crp_buf,
-		    cesa_create_chain_cb2, &cci, BUS_DMA_NOWAIT);
-	else if (cr->cr_crp->crp_flags & CRYPTO_F_IMBUF)
-		error = bus_dmamap_load_mbuf(sc->sc_data_dtag,
-		    cr->cr_dmap, (struct mbuf *)cr->cr_crp->crp_buf,
-		    cesa_create_chain_cb2, &cci, BUS_DMA_NOWAIT);
-	else
-		error = bus_dmamap_load(sc->sc_data_dtag,
-		    cr->cr_dmap, cr->cr_crp->crp_buf,
-		    cr->cr_crp->crp_ilen, cesa_create_chain_cb, &cci,
-		    BUS_DMA_NOWAIT);
+	error = bus_dmamap_load_crp(sc->sc_data_dtag, cr->cr_dmap, cr->cr_crp,
+	    cesa_create_chain_cb, &cci, BUS_DMA_NOWAIT);
 
 	if (!error)
 		cr->cr_dmap_loaded = 1;
@@ -1003,6 +968,122 @@ cesa_setup_sram(struct cesa_softc *sc)
 	return (0);
 }
 
+/*
+ * Function: device_from_node
+ * This function returns appropriate device_t to phandle_t
+ * Parameters:
+ * root - device where you want to start search
+ *     if you provide NULL here, function will take
+ *     "root0" device as root.
+ * node - we are checking every device_t to be
+ *     appropriate with this.
+ */
+static device_t
+device_from_node(device_t root, phandle_t node)
+{
+	device_t *children, retval;
+	int nkid, i;
+
+	/* Nothing matches no node */
+	if (node == -1)
+		return (NULL);
+
+	if (root == NULL)
+		/* Get root of device tree */
+		if ((root = device_lookup_by_name("root0")) == NULL)
+			return (NULL);
+
+	if (device_get_children(root, &children, &nkid) != 0)
+		return (NULL);
+
+	retval = NULL;
+	for (i = 0; i < nkid; i++) {
+		/* Check if device and node matches */
+		if (OFW_BUS_GET_NODE(root, children[i]) == node) {
+			retval = children[i];
+			break;
+		}
+		/* or go deeper */
+		if ((retval = device_from_node(children[i], node)) != NULL)
+			break;
+	}
+	free(children, M_TEMP);
+
+	return (retval);
+}
+
+static int
+cesa_setup_sram_armada(struct cesa_softc *sc)
+{
+	phandle_t sram_node;
+	ihandle_t sram_ihandle;
+	pcell_t sram_handle[2];
+	void *sram_va;
+	int rv, j;
+	struct resource_list rl;
+	struct resource_list_entry *rle;
+	struct simplebus_softc *ssc;
+	device_t sdev;
+
+	/* Get refs to SRAMS from CESA node */
+	rv = OF_getencprop(ofw_bus_get_node(sc->sc_dev), "marvell,crypto-srams",
+	    (void *)sram_handle, sizeof(sram_handle));
+	if (rv <= 0)
+		return (rv);
+
+	if (sc->sc_cesa_engine_id >= 2)
+		return (ENXIO);
+
+	/* Get SRAM node on the basis of sc_cesa_engine_id */
+	sram_ihandle = (ihandle_t)sram_handle[sc->sc_cesa_engine_id];
+	sram_node = OF_instance_to_package(sram_ihandle);
+
+	/* Get device_t of simplebus (sram_node parent) */
+	sdev = device_from_node(NULL, OF_parent(sram_node));
+	if (!sdev)
+		return (ENXIO);
+
+	ssc = device_get_softc(sdev);
+
+	resource_list_init(&rl);
+	/* Parse reg property to resource list */
+	ofw_bus_reg_to_rl(sdev, sram_node, ssc->acells,
+	    ssc->scells, &rl);
+
+	/* We expect only one resource */
+	rle = resource_list_find(&rl, SYS_RES_MEMORY, 0);
+	if (rle == NULL)
+		return (ENXIO);
+
+	/* Remap through ranges property */
+	for (j = 0; j < ssc->nranges; j++) {
+		if (rle->start >= ssc->ranges[j].bus &&
+		    rle->end < ssc->ranges[j].bus + ssc->ranges[j].size) {
+			rle->start -= ssc->ranges[j].bus;
+			rle->start += ssc->ranges[j].host;
+			rle->end -= ssc->ranges[j].bus;
+			rle->end += ssc->ranges[j].host;
+		}
+	}
+
+	sc->sc_sram_base_pa = rle->start;
+	sc->sc_sram_size = rle->count;
+
+	/* SRAM memory was not mapped in platform_sram_devmap(), map it now */
+	sram_va = pmap_mapdev(sc->sc_sram_base_pa, sc->sc_sram_size);
+	if (sram_va == NULL)
+		return (ENOMEM);
+	sc->sc_sram_base_va = (vm_offset_t)sram_va;
+
+	return (0);
+}
+
+struct ofw_compat_data cesa_devices[] = {
+	{ "mrvl,cesa", (uintptr_t)true },
+	{ "marvell,armada-38x-crypto", (uintptr_t)true },
+	{ NULL, 0 }
+};
+
 static int
 cesa_probe(device_t dev)
 {
@@ -1010,7 +1091,7 @@ cesa_probe(device_t dev)
 	if (!ofw_bus_status_okay(dev))
 		return (ENXIO);
 
-	if (!ofw_bus_is_compatible(dev, "mrvl,cesa"))
+	if (!ofw_bus_search_compatible(dev, cesa_devices)->ocd_data)
 		return (ENXIO);
 
 	device_set_desc(dev, "Marvell Cryptographic Engine and Security "
@@ -1021,6 +1102,77 @@ cesa_probe(device_t dev)
 
 static int
 cesa_attach(device_t dev)
+{
+	static int engine_idx = 0;
+	struct simplebus_devinfo *ndi;
+	struct resource_list *rl;
+	struct cesa_softc *sc;
+
+	if (!ofw_bus_is_compatible(dev, "marvell,armada-38x-crypto"))
+		return (cesa_attach_late(dev));
+
+	/*
+	 * Get simplebus_devinfo which contains
+	 * resource list filled with adresses and
+	 * interrupts read form FDT.
+	 * Let's correct it by splitting resources
+	 * for each engine.
+	 */
+	if ((ndi = device_get_ivars(dev)) == NULL)
+		return (ENXIO);
+
+	rl = &ndi->rl;
+
+	switch (engine_idx) {
+		case 0:
+			/* Update regs values */
+			resource_list_add(rl, SYS_RES_MEMORY, 0, CESA0_TDMA_ADDR,
+			    CESA0_TDMA_ADDR + CESA_TDMA_SIZE - 1, CESA_TDMA_SIZE);
+			resource_list_add(rl, SYS_RES_MEMORY, 1, CESA0_CESA_ADDR,
+			    CESA0_CESA_ADDR + CESA_CESA_SIZE - 1, CESA_CESA_SIZE);
+
+			/* Remove unused interrupt */
+			resource_list_delete(rl, SYS_RES_IRQ, 1);
+			break;
+
+		case 1:
+			/* Update regs values */
+			resource_list_add(rl, SYS_RES_MEMORY, 0, CESA1_TDMA_ADDR,
+			    CESA1_TDMA_ADDR + CESA_TDMA_SIZE - 1, CESA_TDMA_SIZE);
+			resource_list_add(rl, SYS_RES_MEMORY, 1, CESA1_CESA_ADDR,
+			    CESA1_CESA_ADDR + CESA_CESA_SIZE - 1, CESA_CESA_SIZE);
+
+			/* Remove unused interrupt */
+			resource_list_delete(rl, SYS_RES_IRQ, 0);
+			resource_list_find(rl, SYS_RES_IRQ, 1)->rid = 0;
+			break;
+
+		default:
+			device_printf(dev, "Bad cesa engine_idx\n");
+			return (ENXIO);
+	}
+
+	sc = device_get_softc(dev);
+	sc->sc_cesa_engine_id = engine_idx;
+
+	/*
+	 * Call simplebus_add_device only once.
+	 * It will create second cesa driver instance
+	 * with the same FDT node as first instance.
+	 * When second driver reach this function,
+	 * it will be configured to use second cesa engine
+	 */
+	if (engine_idx == 0)
+		simplebus_add_device(device_get_parent(dev), ofw_bus_get_node(dev),
+		    0, "cesa", 1, NULL);
+
+	engine_idx++;
+
+	return (cesa_attach_late(dev));
+}
+
+static int
+cesa_attach_late(device_t dev)
 {
 	struct cesa_softc *sc;
 	uint32_t d, r, val;
@@ -1086,7 +1238,11 @@ cesa_attach(device_t dev)
 	}
 
 	/* Acquire SRAM base address */
-	error = cesa_setup_sram(sc);
+	if (!ofw_bus_is_compatible(dev, "marvell,armada-38x-crypto"))
+		error = cesa_setup_sram(sc);
+	else
+		error = cesa_setup_sram_armada(sc);
+
 	if (error) {
 		device_printf(dev, "could not setup SRAM\n");
 		goto err1;
@@ -1179,14 +1335,6 @@ cesa_attach(device_t dev)
 		    cr_stq);
 	}
 
-	/* Initialize data structures: Sessions Pool */
-	STAILQ_INIT(&sc->sc_free_sessions);
-	for (i = 0; i < CESA_SESSIONS; i++) {
-		sc->sc_sessions[i].cs_sid = i;
-		STAILQ_INSERT_TAIL(&sc->sc_free_sessions, &sc->sc_sessions[i],
-		    cs_stq);
-	}
-
 	/*
 	 * Initialize TDMA:
 	 * - Burst limit: 128 bytes,
@@ -1222,23 +1370,12 @@ cesa_attach(device_t dev)
 	    CESA_TDMA_EMR_DATA_ERROR);
 
 	/* Register in OCF */
-	sc->sc_cid = crypto_get_driverid(dev, CRYPTOCAP_F_HARDWARE);
+	sc->sc_cid = crypto_get_driverid(dev, sizeof(struct cesa_session),
+	    CRYPTOCAP_F_HARDWARE);
 	if (sc->sc_cid < 0) {
 		device_printf(dev, "could not get crypto driver id\n");
 		goto err8;
 	}
-
-	crypto_register(sc->sc_cid, CRYPTO_AES_CBC, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_DES_CBC, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_3DES_CBC, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_MD5, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_MD5_HMAC, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_SHA1, 0, 0);
-	crypto_register(sc->sc_cid, CRYPTO_SHA1_HMAC, 0, 0);
-	if (sc->sc_soc_id == MV_DEV_88F6828 ||
-	    sc->sc_soc_id == MV_DEV_88F6820 ||
-	    sc->sc_soc_id == MV_DEV_88F6810)
-		crypto_register(sc->sc_cid, CRYPTO_SHA2_256_HMAC, 0, 0);
 
 	return (0);
 err8:
@@ -1330,6 +1467,7 @@ cesa_intr(void *arg)
 	struct cesa_request *cr, *tmp;
 	struct cesa_softc *sc;
 	uint32_t ecr, icr;
+	uint8_t hash[HASH_MAX_LEN];
 	int blocked;
 
 	sc = arg;
@@ -1390,11 +1528,19 @@ cesa_intr(void *arg)
 		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
 		cr->cr_crp->crp_etype = sc->sc_error;
-		if (cr->cr_mac)
-			crypto_copyback(cr->cr_crp->crp_flags,
-			    cr->cr_crp->crp_buf, cr->cr_mac->crd_inject,
-			    cr->cr_cs->cs_hlen, cr->cr_csd->csd_hash);
-
+		if (cr->cr_cs->cs_hlen != 0 && cr->cr_crp->crp_etype == 0) {
+			if (cr->cr_crp->crp_op & CRYPTO_OP_VERIFY_DIGEST) {
+				crypto_copydata(cr->cr_crp,
+				    cr->cr_crp->crp_digest_start,
+				    cr->cr_cs->cs_hlen, hash);
+				if (timingsafe_bcmp(hash, cr->cr_csd->csd_hash,
+				    cr->cr_cs->cs_hlen) != 0)
+					cr->cr_crp->crp_etype = EBADMSG;
+			} else
+				crypto_copyback(cr->cr_crp,
+				    cr->cr_crp->crp_digest_start,
+				    cr->cr_cs->cs_hlen, cr->cr_csd->csd_hash);
+		}
 		crypto_done(cr->cr_crp);
 		cesa_free_request(sc, cr);
 	}
@@ -1414,207 +1560,175 @@ cesa_intr(void *arg)
 		crypto_unblock(sc->sc_cid, blocked);
 }
 
+static bool
+cesa_cipher_supported(const struct crypto_session_params *csp)
+{
+
+	switch (csp->csp_cipher_alg) {
+	case CRYPTO_AES_CBC:
+		if (csp->csp_ivlen != AES_BLOCK_LEN)
+			return (false);
+		break;
+	default:
+		return (false);
+	}
+
+	if (csp->csp_cipher_klen > CESA_MAX_KEY_LEN)
+		return (false);
+
+	return (true);
+}
+
+static bool
+cesa_auth_supported(struct cesa_softc *sc,
+    const struct crypto_session_params *csp)
+{
+
+	switch (csp->csp_auth_alg) {
+	case CRYPTO_SHA2_256_HMAC:
+		if (!(sc->sc_soc_id == MV_DEV_88F6828 ||
+		    sc->sc_soc_id == MV_DEV_88F6820 ||
+		    sc->sc_soc_id == MV_DEV_88F6810))
+			return (false);
+		/* FALLTHROUGH */
+	case CRYPTO_SHA1:
+	case CRYPTO_SHA1_HMAC:
+		break;
+	default:
+		return (false);
+	}
+
+	if (csp->csp_auth_klen > CESA_MAX_MKEY_LEN)
+		return (false);
+
+	return (true);
+}
+
 static int
-cesa_newsession(device_t dev, uint32_t *sidp, struct cryptoini *cri)
+cesa_probesession(device_t dev, const struct crypto_session_params *csp)
+{
+	struct cesa_softc *sc;
+
+	sc = device_get_softc(dev);
+	if (csp->csp_flags != 0)
+		return (EINVAL);
+	switch (csp->csp_mode) {
+	case CSP_MODE_DIGEST:
+		if (!cesa_auth_supported(sc, csp))
+			return (EINVAL);
+		break;
+	case CSP_MODE_CIPHER:
+		if (!cesa_cipher_supported(csp))
+			return (EINVAL);
+		break;
+	case CSP_MODE_ETA:
+		if (!cesa_auth_supported(sc, csp) ||
+		    !cesa_cipher_supported(csp))
+			return (EINVAL);
+		break;
+	default:
+		return (EINVAL);
+	}
+	return (CRYPTODEV_PROBE_HARDWARE);
+}
+
+static int
+cesa_newsession(device_t dev, crypto_session_t cses,
+    const struct crypto_session_params *csp)
 {
 	struct cesa_session *cs;
 	struct cesa_softc *sc;
-	struct cryptoini *enc;
-	struct cryptoini *mac;
 	int error;
  
 	sc = device_get_softc(dev);
-	enc = NULL;
-	mac = NULL;
 	error = 0;
 
-	/* Check and parse input */
-	if (cesa_is_hash(cri->cri_alg))
-		mac = cri;
-	else
-		enc = cri;
-
-	cri = cri->cri_next;
-
-	if (cri) {
-		if (!enc && !cesa_is_hash(cri->cri_alg))
-			enc = cri;
-
-		if (!mac && cesa_is_hash(cri->cri_alg))
-			mac = cri;
-
-		if (cri->cri_next || !(enc && mac))
-			return (EINVAL);
-	}
-
-	if ((enc && (enc->cri_klen / 8) > CESA_MAX_KEY_LEN) ||
-	    (mac && (mac->cri_klen / 8) > CESA_MAX_MKEY_LEN))
-		return (E2BIG);
-
 	/* Allocate session */
-	cs = cesa_alloc_session(sc);
-	if (!cs)
-		return (ENOMEM);
+	cs = crypto_get_driver_session(cses);
 
 	/* Prepare CESA configuration */
 	cs->cs_config = 0;
 	cs->cs_ivlen = 1;
 	cs->cs_mblen = 1;
 
-	if (enc) {
-		switch (enc->cri_alg) {
-		case CRYPTO_AES_CBC:
-			cs->cs_config |= CESA_CSHD_AES | CESA_CSHD_CBC;
-			cs->cs_ivlen = AES_BLOCK_LEN;
-			break;
-		case CRYPTO_DES_CBC:
-			cs->cs_config |= CESA_CSHD_DES | CESA_CSHD_CBC;
-			cs->cs_ivlen = DES_BLOCK_LEN;
-			break;
-		case CRYPTO_3DES_CBC:
-			cs->cs_config |= CESA_CSHD_3DES | CESA_CSHD_3DES_EDE |
-			    CESA_CSHD_CBC;
-			cs->cs_ivlen = DES3_BLOCK_LEN;
-			break;
-		default:
-			error = EINVAL;
-			break;
-		}
+	switch (csp->csp_cipher_alg) {
+	case CRYPTO_AES_CBC:
+		cs->cs_config |= CESA_CSHD_AES | CESA_CSHD_CBC;
+		cs->cs_ivlen = AES_BLOCK_LEN;
+		break;
 	}
 
-	if (!error && mac) {
-		switch (mac->cri_alg) {
-		case CRYPTO_MD5:
-			cs->cs_mblen = 1;
-			cs->cs_hlen = (mac->cri_mlen == 0) ? MD5_HASH_LEN :
-			    mac->cri_mlen;
-			cs->cs_config |= CESA_CSHD_MD5;
-			break;
-		case CRYPTO_MD5_HMAC:
-			cs->cs_mblen = MD5_HMAC_BLOCK_LEN;
-			cs->cs_hlen = (mac->cri_mlen == 0) ? MD5_HASH_LEN :
-			    mac->cri_mlen;
-			cs->cs_config |= CESA_CSHD_MD5_HMAC;
-			if (cs->cs_hlen == CESA_HMAC_TRUNC_LEN)
-				cs->cs_config |= CESA_CSHD_96_BIT_HMAC;
-			break;
-		case CRYPTO_SHA1:
-			cs->cs_mblen = 1;
-			cs->cs_hlen = (mac->cri_mlen == 0) ? SHA1_HASH_LEN :
-			    mac->cri_mlen;
-			cs->cs_config |= CESA_CSHD_SHA1;
-			break;
-		case CRYPTO_SHA1_HMAC:
-			cs->cs_mblen = SHA1_HMAC_BLOCK_LEN;
-			cs->cs_hlen = (mac->cri_mlen == 0) ? SHA1_HASH_LEN :
-			    mac->cri_mlen;
-			cs->cs_config |= CESA_CSHD_SHA1_HMAC;
-			if (cs->cs_hlen == CESA_HMAC_TRUNC_LEN)
-				cs->cs_config |= CESA_CSHD_96_BIT_HMAC;
-			break;
-		case CRYPTO_SHA2_256_HMAC:
-			cs->cs_mblen = SHA2_256_HMAC_BLOCK_LEN;
-			cs->cs_hlen = (mac->cri_mlen == 0) ? SHA2_256_HASH_LEN :
-			    mac->cri_mlen;
-			cs->cs_config |= CESA_CSHD_SHA2_256_HMAC;
-			break;
-		default:
-			error = EINVAL;
-			break;
-		}
+	switch (csp->csp_auth_alg) {
+	case CRYPTO_SHA1:
+		cs->cs_mblen = 1;
+		cs->cs_hlen = (csp->csp_auth_mlen == 0) ? SHA1_HASH_LEN :
+		    csp->csp_auth_mlen;
+		cs->cs_config |= CESA_CSHD_SHA1;
+		break;
+	case CRYPTO_SHA1_HMAC:
+		cs->cs_mblen = SHA1_BLOCK_LEN;
+		cs->cs_hlen = (csp->csp_auth_mlen == 0) ? SHA1_HASH_LEN :
+		    csp->csp_auth_mlen;
+		cs->cs_config |= CESA_CSHD_SHA1_HMAC;
+		if (cs->cs_hlen == CESA_HMAC_TRUNC_LEN)
+			cs->cs_config |= CESA_CSHD_96_BIT_HMAC;
+		break;
+	case CRYPTO_SHA2_256_HMAC:
+		cs->cs_mblen = SHA2_256_BLOCK_LEN;
+		cs->cs_hlen = (csp->csp_auth_mlen == 0) ? SHA2_256_HASH_LEN :
+		    csp->csp_auth_mlen;
+		cs->cs_config |= CESA_CSHD_SHA2_256_HMAC;
+		break;
 	}
 
 	/* Save cipher key */
-	if (!error && enc && enc->cri_key) {
-		cs->cs_klen = enc->cri_klen / 8;
-		memcpy(cs->cs_key, enc->cri_key, cs->cs_klen);
-		if (enc->cri_alg == CRYPTO_AES_CBC)
-			error = cesa_prep_aes_key(cs);
+	if (csp->csp_cipher_key != NULL) {
+		memcpy(cs->cs_key, csp->csp_cipher_key,
+		    csp->csp_cipher_klen);
+		if (csp->csp_cipher_alg == CRYPTO_AES_CBC)
+			error = cesa_prep_aes_key(cs, csp);
 	}
 
 	/* Save digest key */
-	if (!error && mac && mac->cri_key)
-		error = cesa_set_mkey(cs, mac->cri_alg, mac->cri_key,
-		    mac->cri_klen / 8);
+	if (csp->csp_auth_key != NULL)
+		cesa_set_mkey(cs, csp->csp_auth_alg, csp->csp_auth_key,
+		    csp->csp_auth_klen);
 
-	if (error) {
-		cesa_free_session(sc, cs);
-		return (EINVAL);
-	}
-
-	*sidp = cs->cs_sid;
-
-	return (0);
-}
-
-static int
-cesa_freesession(device_t dev, uint64_t tid)
-{
-	struct cesa_session *cs;
-	struct cesa_softc *sc;
- 
-	sc = device_get_softc(dev);
-	cs = cesa_get_session(sc, CRYPTO_SESID2LID(tid));
-	if (!cs)
-		return (EINVAL);
-
-	/* Free session */
-	cesa_free_session(sc, cs);
-
-	return (0);
+	return (error);
 }
 
 static int
 cesa_process(device_t dev, struct cryptop *crp, int hint)
 {
+	const struct crypto_session_params *csp;
 	struct cesa_request *cr;
 	struct cesa_session *cs;
-	struct cryptodesc *crd;
-	struct cryptodesc *enc;
-	struct cryptodesc *mac;
 	struct cesa_softc *sc;
 	int error;
 
 	sc = device_get_softc(dev);
-	crd = crp->crp_desc;
-	enc = NULL;
-	mac = NULL;
 	error = 0;
 
-	/* Check session ID */
-	cs = cesa_get_session(sc, CRYPTO_SESID2LID(crp->crp_sid));
-	if (!cs) {
-		crp->crp_etype = EINVAL;
-		crypto_done(crp);
-		return (0);
-	}
+	cs = crypto_get_driver_session(crp->crp_session);
+	csp = crypto_get_params(crp->crp_session);
 
 	/* Check and parse input */
-	if (crp->crp_ilen > CESA_MAX_REQUEST_SIZE) {
+	if (crypto_buffer_len(&crp->crp_buf) > CESA_MAX_REQUEST_SIZE) {
 		crp->crp_etype = E2BIG;
 		crypto_done(crp);
 		return (0);
 	}
 
-	if (cesa_is_hash(crd->crd_alg))
-		mac = crd;
-	else
-		enc = crd;
-
-	crd = crd->crd_next;
-
-	if (crd) {
-		if (!enc && !cesa_is_hash(crd->crd_alg))
-			enc = crd;
-
-		if (!mac && cesa_is_hash(crd->crd_alg))
-			mac = crd;
-
-		if (crd->crd_next || !(enc && mac)) {
-			crp->crp_etype = EINVAL;
-			crypto_done(crp);
-			return (0);
-		}
+	/*
+	 * For requests with AAD, only requests where the AAD is
+	 * immediately adjacent to the payload are supported.
+	 */
+	if (crp->crp_aad_length != 0 &&
+	    (crp->crp_aad_start + crp->crp_aad_length) !=
+	    crp->crp_payload_start) {
+		crp->crp_etype = EINVAL;
+		crypto_done(crp);
+		return (0);
 	}
 
 	/*
@@ -1631,51 +1745,28 @@ cesa_process(device_t dev, struct cryptop *crp, int hint)
 
 	/* Prepare request */
 	cr->cr_crp = crp;
-	cr->cr_enc = enc;
-	cr->cr_mac = mac;
 	cr->cr_cs = cs;
 
 	CESA_LOCK(sc, sessions);
 	cesa_sync_desc(sc, BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
 
-	if (enc && enc->crd_flags & CRD_F_ENCRYPT) {
-		if (enc->crd_flags & CRD_F_IV_EXPLICIT)
-			memcpy(cr->cr_csd->csd_iv, enc->crd_iv, cs->cs_ivlen);
-		else
-			arc4rand(cr->cr_csd->csd_iv, cs->cs_ivlen, 0);
+	if (csp->csp_cipher_alg != 0)
+		crypto_read_iv(crp, cr->cr_csd->csd_iv);
 
-		if ((enc->crd_flags & CRD_F_IV_PRESENT) == 0)
-			crypto_copyback(crp->crp_flags, crp->crp_buf,
-			    enc->crd_inject, cs->cs_ivlen, cr->cr_csd->csd_iv);
-	} else if (enc) {
-		if (enc->crd_flags & CRD_F_IV_EXPLICIT)
-			memcpy(cr->cr_csd->csd_iv, enc->crd_iv, cs->cs_ivlen);
-		else
-			crypto_copydata(crp->crp_flags, crp->crp_buf,
-			    enc->crd_inject, cs->cs_ivlen, cr->cr_csd->csd_iv);
+	if (crp->crp_cipher_key != NULL) {
+		memcpy(cs->cs_key, crp->crp_cipher_key,
+		    csp->csp_cipher_klen);
+		if (csp->csp_cipher_alg == CRYPTO_AES_CBC)
+			error = cesa_prep_aes_key(cs, csp);
 	}
 
-	if (enc && enc->crd_flags & CRD_F_KEY_EXPLICIT) {
-		if ((enc->crd_klen / 8) <= CESA_MAX_KEY_LEN) {
-			cs->cs_klen = enc->crd_klen / 8;
-			memcpy(cs->cs_key, enc->crd_key, cs->cs_klen);
-			if (enc->crd_alg == CRYPTO_AES_CBC)
-				error = cesa_prep_aes_key(cs);
-		} else
-			error = E2BIG;
-	}
-
-	if (!error && mac && mac->crd_flags & CRD_F_KEY_EXPLICIT) {
-		if ((mac->crd_klen / 8) <= CESA_MAX_MKEY_LEN)
-			error = cesa_set_mkey(cs, mac->crd_alg, mac->crd_key,
-			    mac->crd_klen / 8);
-		else
-			error = E2BIG;
-	}
+	if (!error && crp->crp_auth_key != NULL)
+		cesa_set_mkey(cs, csp->csp_auth_alg, crp->crp_auth_key,
+		    csp->csp_auth_klen);
 
 	/* Convert request to chain of TDMA and SA descriptors */
 	if (!error)
-		error = cesa_create_chain(sc, cr);
+		error = cesa_create_chain(sc, csp, cr);
 
 	cesa_sync_desc(sc, BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 	CESA_UNLOCK(sc, sessions);

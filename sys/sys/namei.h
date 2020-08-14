@@ -38,7 +38,7 @@
 #include <sys/caprights.h>
 #include <sys/filedesc.h>
 #include <sys/queue.h>
-#include <sys/uio.h>
+#include <sys/_uio.h>
 
 struct componentname {
 	/*
@@ -69,7 +69,7 @@ struct nameidata {
 	 */
 	const	char *ni_dirp;		/* pathname pointer */
 	enum	uio_seg ni_segflg;	/* location of pathname */
-	cap_rights_t ni_rightsneeded;	/* rights required to look up vnode */
+	cap_rights_t *ni_rightsneeded;	/* rights required to look up vnode */
 	/*
 	 * Arguments to lookup.
 	 */
@@ -88,6 +88,10 @@ struct nameidata {
 	struct	vnode *ni_vp;		/* vnode of result */
 	struct	vnode *ni_dvp;		/* vnode of intermediate directory */
 	/*
+	 * Results: flags returned from namei
+	 */
+	u_int	ni_resflags;
+	/*
 	 * Shared between namei and lookup/commit routines.
 	 */
 	size_t	ni_pathlen;		/* remaining chars in path */
@@ -100,9 +104,16 @@ struct nameidata {
 	 */
 	struct componentname ni_cnd;
 	struct nameicap_tracker_head ni_cap_tracker;
+	struct vnode *ni_beneath_latch;
 };
 
 #ifdef _KERNEL
+
+enum cache_fpl_status { CACHE_FPL_STATUS_ABORTED, CACHE_FPL_STATUS_PARTIAL,
+    CACHE_FPL_STATUS_HANDLED, CACHE_FPL_STATUS_UNSET };
+int	cache_fplookup(struct nameidata *ndp, enum cache_fpl_status *status,
+    struct pwd **pwdp);
+
 /*
  * namei operations
  */
@@ -119,6 +130,7 @@ struct nameidata {
 #define	WANTPARENT	0x0010	/* want parent vnode returned unlocked */
 #define	NOCACHE		0x0020	/* name must not be left in cache */
 #define	FOLLOW		0x0040	/* follow symbolic links */
+#define	BENEATH		0x0080	/* No escape from the start dir */
 #define	LOCKSHARED	0x0100	/* Shared lock leaf */
 #define	NOFOLLOW	0x0000	/* do not follow symbolic links (pseudo) */
 #define	MODMASK		0x01fc	/* mask of operational modifiers */
@@ -140,44 +152,84 @@ struct nameidata {
 #define	HASBUF		0x00000400 /* has allocated pathname buffer */
 #define	SAVENAME	0x00000800 /* save pathname buffer */
 #define	SAVESTART	0x00001000 /* save starting directory */
-#define	ISDOTDOT	0x00002000 /* current component name is .. */
-#define	MAKEENTRY	0x00004000 /* entry is to be added to name cache */
-#define	ISLASTCN	0x00008000 /* this is last component of pathname */
-#define	ISSYMLINK	0x00010000 /* symlink needs interpretation */
-#define	ISWHITEOUT	0x00020000 /* found whiteout */
-#define	DOWHITEOUT	0x00040000 /* do whiteouts */
-#define	WILLBEDIR	0x00080000 /* new files will be dirs; allow trailing / */
-#define	ISUNICODE	0x00100000 /* current component name is unicode*/
-#define	ISOPEN		0x00200000 /* caller is opening; return a real vnode. */
-#define	NOCROSSMOUNT	0x00400000 /* do not cross mount points */
-#define	NOMACCHECK	0x00800000 /* do not perform MAC checks */
-#define	AUDITVNODE1	0x04000000 /* audit the looked up vnode information */
-#define	AUDITVNODE2	0x08000000 /* audit the looked up vnode information */
-#define	TRAILINGSLASH	0x10000000 /* path ended in a slash */
-#define	NOCAPCHECK	0x20000000 /* do not perform capability checks */
-#define	PARAMASK	0x3ffffe00 /* mask of parameter descriptors */
+#define	ISWHITEOUT	0x00002000 /* found whiteout */
+#define	DOWHITEOUT	0x00004000 /* do whiteouts */
+#define	WILLBEDIR	0x00008000 /* new files will be dirs; allow trailing / */
+#define	ISOPEN		0x00010000 /* caller is opening; return a real vnode. */
+#define	NOCROSSMOUNT	0x00020000 /* do not cross mount points */
+#define	NOMACCHECK	0x00040000 /* do not perform MAC checks */
+#define	AUDITVNODE1	0x00080000 /* audit the looked up vnode information */
+#define	AUDITVNODE2	0x00100000 /* audit the looked up vnode information */
+#define	NOCAPCHECK	0x00200000 /* do not perform capability checks */
+/* UNUSED		0x00400000 */
+/* UNUSED		0x00800000 */
+/* UNUSED		0x01000000 */
+#define	NOEXECCHECK	0x02000000 /* do not perform exec check on dir */
+#define	MAKEENTRY	0x04000000 /* entry is to be added to name cache */
+#define	ISSYMLINK	0x08000000 /* symlink needs interpretation */
+#define	ISLASTCN	0x10000000 /* this is last component of pathname */
+#define	ISDOTDOT	0x20000000 /* current component name is .. */
+#define	TRAILINGSLASH	0x40000000 /* path ended in a slash */
+#define	PARAMASK	0x7ffffe00 /* mask of parameter descriptors */
+
+/*
+ * Flags which must not be passed in by callers.
+ */
+#define NAMEI_INTERNAL_FLAGS	\
+	(NOEXECCHECK | MAKEENTRY | ISSYMLINK | ISLASTCN | ISDOTDOT | TRAILINGSLASH)
+
+/*
+ * Namei results flags
+ */
+#define	NIRES_ABS	0x00000001 /* Path was absolute */
 
 /*
  * Flags in ni_lcf, valid for the duration of the namei call.
  */
 #define	NI_LCF_STRICTRELATIVE	0x0001	/* relative lookup only */
 #define	NI_LCF_CAP_DOTDOT	0x0002	/* ".." in strictrelative case */
+#define	NI_LCF_BENEATH_ABS	0x0004	/* BENEATH with absolute path */
+#define	NI_LCF_BENEATH_LATCHED	0x0008	/* BENEATH_ABS traversed starting dir */
+#define	NI_LCF_LATCH		0x0010	/* ni_beneath_latch valid */
 
 /*
  * Initialization of a nameidata structure.
  */
 #define	NDINIT(ndp, op, flags, segflg, namep, td)			\
-	NDINIT_ALL(ndp, op, flags, segflg, namep, AT_FDCWD, NULL, 0, td)
+	NDINIT_ALL(ndp, op, flags, segflg, namep, AT_FDCWD, NULL, &cap_no_rights, td)
 #define	NDINIT_AT(ndp, op, flags, segflg, namep, dirfd, td)		\
-	NDINIT_ALL(ndp, op, flags, segflg, namep, dirfd, NULL, 0, td)
+	NDINIT_ALL(ndp, op, flags, segflg, namep, dirfd, NULL, &cap_no_rights, td)
 #define	NDINIT_ATRIGHTS(ndp, op, flags, segflg, namep, dirfd, rightsp, td) \
 	NDINIT_ALL(ndp, op, flags, segflg, namep, dirfd, NULL, rightsp, td)
 #define	NDINIT_ATVP(ndp, op, flags, segflg, namep, vp, td)		\
-	NDINIT_ALL(ndp, op, flags, segflg, namep, AT_FDCWD, vp, 0, td)
+	NDINIT_ALL(ndp, op, flags, segflg, namep, AT_FDCWD, vp, &cap_no_rights, td)
 
-void NDINIT_ALL(struct nameidata *ndp, u_long op, u_long flags,
-    enum uio_seg segflg, const char *namep, int dirfd, struct vnode *startdir,
-    cap_rights_t *rightsp, struct thread *td);
+/*
+ * Note the constant pattern may *hide* bugs.
+ */
+#ifdef INVARIANTS
+#define NDINIT_PREFILL(arg)	memset(arg, 0xff, sizeof(*arg))
+#else
+#define NDINIT_PREFILL(arg)	do { } while (0)
+#endif
+
+#define NDINIT_ALL(ndp, op, flags, segflg, namep, dirfd, startdir, rightsp, td)	\
+do {										\
+	struct nameidata *_ndp = (ndp);						\
+	cap_rights_t *_rightsp = (rightsp);					\
+	MPASS(_rightsp != NULL);						\
+	NDINIT_PREFILL(_ndp);							\
+	_ndp->ni_cnd.cn_nameiop = op;						\
+	_ndp->ni_cnd.cn_flags = flags;						\
+	_ndp->ni_segflg = segflg;						\
+	_ndp->ni_dirp = namep;							\
+	_ndp->ni_dirfd = dirfd;							\
+	_ndp->ni_startdir = startdir;						\
+	_ndp->ni_resflags = 0;							\
+	filecaps_init(&_ndp->ni_filecaps);					\
+	_ndp->ni_cnd.cn_thread = td;						\
+	_ndp->ni_rightsneeded = _rightsp;					\
+} while (0)
 
 #define NDF_NO_DVP_RELE		0x00000001
 #define NDF_NO_DVP_UNLOCK	0x00000002
@@ -189,7 +241,15 @@ void NDINIT_ALL(struct nameidata *ndp, u_long op, u_long flags,
 #define NDF_NO_FREE_PNBUF	0x00000020
 #define NDF_ONLY_PNBUF		(~NDF_NO_FREE_PNBUF)
 
+void NDFREE_PNBUF(struct nameidata *);
 void NDFREE(struct nameidata *, const u_int);
+#define NDFREE(ndp, flags) do {						\
+	struct nameidata *_ndp = (ndp);					\
+	if (__builtin_constant_p(flags) && flags == NDF_ONLY_PNBUF)	\
+		NDFREE_PNBUF(_ndp);					\
+	else								\
+		NDFREE(_ndp, flags);					\
+} while (0)
 
 int	namei(struct nameidata *ndp);
 int	lookup(struct nameidata *ndp);

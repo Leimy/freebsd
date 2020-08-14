@@ -11,17 +11,13 @@ static const char rcsid[] = "@(#)$Id$";
 #endif
 #include <sys/types.h>
 #include <sys/socket.h>
-#if !defined(ultrix) && !defined(hpux) && !defined(__hpux) && !defined(__osf__) && !defined(_AIX51)
 # include <sys/sockio.h>
-#endif
 #include <sys/ioctl.h>
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <net/if.h>
 #include <netinet/if_ether.h>
-#ifndef	ultrix
 # include <net/if_arp.h>
-#endif
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_var.h>
@@ -88,7 +84,6 @@ int	arp(ip, ether)
 	sin = (struct sockaddr_in *)&ar.arp_pa;
 	sin->sin_family = AF_INET;
 	bcopy(ip, (char *)&sin->sin_addr.s_addr, 4);
-#ifndef	hpux
 	if ((hp = gethostbyaddr(ip, 4, AF_INET)))
 # if SOLARIS && (SOLARIS2 >= 10)
 		if (!(ether_hostton(hp->h_name, (struct ether_addr *)ether)))
@@ -96,7 +91,6 @@ int	arp(ip, ether)
 		if (!(ether_hostton(hp->h_name, ether)))
 # endif
 			goto savearp;
-#endif
 
 	if (sfd == -1)
 		if ((sfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)

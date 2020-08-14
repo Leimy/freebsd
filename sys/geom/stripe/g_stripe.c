@@ -41,6 +41,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/malloc.h>
 #include <vm/uma.h>
 #include <geom/geom.h>
+#include <geom/geom_dbg.h>
 #include <geom/stripe/g_stripe.h>
 
 FEATURE(geom_stripe, "GEOM striping support");
@@ -70,7 +71,7 @@ struct g_class g_stripe_class = {
 };
 
 SYSCTL_DECL(_kern_geom);
-static SYSCTL_NODE(_kern_geom, OID_AUTO, stripe, CTLFLAG_RW, 0,
+static SYSCTL_NODE(_kern_geom, OID_AUTO, stripe, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
     "GEOM_STRIPE stuff");
 static u_int g_stripe_debug = 0;
 SYSCTL_UINT(_kern_geom_stripe, OID_AUTO, debug, CTLFLAG_RWTUN, &g_stripe_debug, 0,
@@ -87,8 +88,10 @@ g_sysctl_stripe_fast(SYSCTL_HANDLER_ARGS)
 		g_stripe_fast = fast;
 	return (error);
 }
-SYSCTL_PROC(_kern_geom_stripe, OID_AUTO, fast, CTLTYPE_INT | CTLFLAG_RWTUN,
-    NULL, 0, g_sysctl_stripe_fast, "I", "Fast, but memory-consuming, mode");
+SYSCTL_PROC(_kern_geom_stripe, OID_AUTO, fast,
+    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_NEEDGIANT, NULL, 0,
+    g_sysctl_stripe_fast, "I",
+    "Fast, but memory-consuming, mode");
 static u_int g_stripe_maxmem = MAXPHYS * 100;
 SYSCTL_UINT(_kern_geom_stripe, OID_AUTO, maxmem, CTLFLAG_RDTUN, &g_stripe_maxmem,
     0, "Maximum memory that can be allocated in \"fast\" mode (in bytes)");
@@ -249,7 +252,7 @@ static void
 g_stripe_copy(struct g_stripe_softc *sc, char *src, char *dst, off_t offset,
     off_t length, int mode)
 {
-	u_int stripesize;
+	off_t stripesize;
 	size_t len;
 
 	stripesize = sc->sc_stripesize;
@@ -265,8 +268,8 @@ g_stripe_copy(struct g_stripe_softc *sc, char *src, char *dst, off_t offset,
 		}
 		length -= len;
 		KASSERT(length >= 0,
-		    ("Length < 0 (stripesize=%zu, offset=%jd, length=%jd).",
-		    (size_t)stripesize, (intmax_t)offset, (intmax_t)length));
+		    ("Length < 0 (stripesize=%ju, offset=%ju, length=%jd).",
+		    (uintmax_t)stripesize, (uintmax_t)offset, (intmax_t)length));
 		if (length > stripesize)
 			len = stripesize;
 		else
@@ -297,6 +300,8 @@ g_stripe_done(struct bio *bp)
 		mtx_unlock(&sc->sc_lock);
 		if (pbp->bio_driver1 != NULL)
 			uma_zfree(g_stripe_zone, pbp->bio_driver1);
+		if (bp->bio_cmd == BIO_SPEEDUP)
+			pbp->bio_completed = pbp->bio_length;
 		g_io_deliver(pbp, pbp->bio_error);
 	} else
 		mtx_unlock(&sc->sc_lock);
@@ -307,10 +312,11 @@ static int
 g_stripe_start_fast(struct bio *bp, u_int no, off_t offset, off_t length)
 {
 	TAILQ_HEAD(, bio) queue = TAILQ_HEAD_INITIALIZER(queue);
-	u_int nparts = 0, stripesize;
 	struct g_stripe_softc *sc;
 	char *addr, *data = NULL;
 	struct bio *cbp;
+	off_t stripesize;
+	u_int nparts = 0;
 	int error;
 
 	sc = bp->bio_to->geom->softc;
@@ -436,7 +442,7 @@ g_stripe_start_economic(struct bio *bp, u_int no, off_t offset, off_t length)
 {
 	TAILQ_HEAD(, bio) queue = TAILQ_HEAD_INITIALIZER(queue);
 	struct g_stripe_softc *sc;
-	uint32_t stripesize;
+	off_t stripesize;
 	struct bio *cbp;
 	char *addr;
 	int error;
@@ -533,7 +539,7 @@ failure:
 }
 
 static void
-g_stripe_flush(struct g_stripe_softc *sc, struct bio *bp)
+g_stripe_pushdown(struct g_stripe_softc *sc, struct bio *bp)
 {
 	struct bio_queue_head queue;
 	struct g_consumer *cp;
@@ -571,9 +577,9 @@ g_stripe_flush(struct g_stripe_softc *sc, struct bio *bp)
 static void
 g_stripe_start(struct bio *bp)
 {
-	off_t offset, start, length, nstripe;
+	off_t offset, start, length, nstripe, stripesize;
 	struct g_stripe_softc *sc;
-	u_int no, stripesize;
+	u_int no;
 	int error, fast = 0;
 
 	sc = bp->bio_to->geom->softc;
@@ -592,8 +598,9 @@ g_stripe_start(struct bio *bp)
 	case BIO_WRITE:
 	case BIO_DELETE:
 		break;
+	case BIO_SPEEDUP:
 	case BIO_FLUSH:
-		g_stripe_flush(sc, bp);
+		g_stripe_pushdown(sc, bp);
 		return;
 	case BIO_GETATTR:
 		/* To which provider it should be delivered? */
@@ -1044,7 +1051,7 @@ g_stripe_ctl_create(struct gctl_req *req, struct g_class *mp)
 	struct g_stripe_softc *sc;
 	struct g_geom *gp;
 	struct sbuf *sb;
-	intmax_t *stripesize;
+	off_t *stripesize;
 	const char *name;
 	char param[16];
 	int *nargs;
@@ -1076,7 +1083,7 @@ g_stripe_ctl_create(struct gctl_req *req, struct g_class *mp)
 		gctl_error(req, "No '%s' argument.", "stripesize");
 		return;
 	}
-	md.md_stripesize = *stripesize;
+	md.md_stripesize = (uint32_t)*stripesize;
 	bzero(md.md_provider, sizeof(md.md_provider));
 	/* This field is not important here. */
 	md.md_provsize = 0;
@@ -1084,19 +1091,9 @@ g_stripe_ctl_create(struct gctl_req *req, struct g_class *mp)
 	/* Check all providers are valid */
 	for (no = 1; no < *nargs; no++) {
 		snprintf(param, sizeof(param), "arg%u", no);
-		name = gctl_get_asciiparam(req, param);
-		if (name == NULL) {
-			gctl_error(req, "No 'arg%u' argument.", no);
+		pp = gctl_get_provider(req, param);
+		if (pp == NULL)
 			return;
-		}
-		if (strncmp(name, "/dev/", strlen("/dev/")) == 0)
-			name += strlen("/dev/");
-		pp = g_provider_by_name(name);
-		if (pp == NULL) {
-			G_STRIPE_DEBUG(1, "Disk %s is invalid.", name);
-			gctl_error(req, "Disk %s is invalid.", name);
-			return;
-		}
 	}
 
 	gp = g_stripe_create(mp, &md, G_STRIPE_TYPE_MANUAL);
@@ -1110,15 +1107,13 @@ g_stripe_ctl_create(struct gctl_req *req, struct g_class *mp)
 	sbuf_printf(sb, "Can't attach disk(s) to %s:", gp->name);
 	for (attached = 0, no = 1; no < *nargs; no++) {
 		snprintf(param, sizeof(param), "arg%u", no);
-		name = gctl_get_asciiparam(req, param);
-		if (name == NULL) {
-			gctl_error(req, "No 'arg%u' argument.", no);
+		pp  = gctl_get_provider(req, param);
+		if (pp == NULL) {
+			name = gctl_get_asciiparam(req, param);
+			MPASS(name != NULL);
+			sbuf_printf(sb, " %s", name);
 			continue;
 		}
-		if (strncmp(name, "/dev/", strlen("/dev/")) == 0)
-			name += strlen("/dev/");
-		pp = g_provider_by_name(name);
-		KASSERT(pp != NULL, ("Provider %s disappear?!", name));
 		if (g_stripe_add_disk(sc, pp, no - 1) != 0) {
 			G_STRIPE_DEBUG(1, "Disk %u (%s) not attached to %s.",
 			    no, pp->name, gp->name);
@@ -1243,30 +1238,31 @@ g_stripe_dumpconf(struct sbuf *sb, const char *indent, struct g_geom *gp,
 		    (u_int)cp->index);
 	} else {
 		sbuf_printf(sb, "%s<ID>%u</ID>\n", indent, (u_int)sc->sc_id);
-		sbuf_printf(sb, "%s<Stripesize>%u</Stripesize>\n", indent,
-		    (u_int)sc->sc_stripesize);
+		sbuf_printf(sb, "%s<Stripesize>%ju</Stripesize>\n", indent,
+		    (uintmax_t)sc->sc_stripesize);
 		sbuf_printf(sb, "%s<Type>", indent);
 		switch (sc->sc_type) {
 		case G_STRIPE_TYPE_AUTOMATIC:
-			sbuf_printf(sb, "AUTOMATIC");
+			sbuf_cat(sb, "AUTOMATIC");
 			break;
 		case G_STRIPE_TYPE_MANUAL:
-			sbuf_printf(sb, "MANUAL");
+			sbuf_cat(sb, "MANUAL");
 			break;
 		default:
-			sbuf_printf(sb, "UNKNOWN");
+			sbuf_cat(sb, "UNKNOWN");
 			break;
 		}
-		sbuf_printf(sb, "</Type>\n");
+		sbuf_cat(sb, "</Type>\n");
 		sbuf_printf(sb, "%s<Status>Total=%u, Online=%u</Status>\n",
 		    indent, sc->sc_ndisks, g_stripe_nvalid(sc));
 		sbuf_printf(sb, "%s<State>", indent);
 		if (sc->sc_provider != NULL && sc->sc_provider->error == 0)
-			sbuf_printf(sb, "UP");
+			sbuf_cat(sb, "UP");
 		else
-			sbuf_printf(sb, "DOWN");
-		sbuf_printf(sb, "</State>\n");
+			sbuf_cat(sb, "DOWN");
+		sbuf_cat(sb, "</State>\n");
 	}
 }
 
 DECLARE_GEOM_CLASS(g_stripe_class, g_stripe);
+MODULE_VERSION(geom_stripe, 0);

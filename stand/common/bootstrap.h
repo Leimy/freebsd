@@ -33,10 +33,12 @@
 #include <sys/queue.h>
 #include <sys/linker_set.h>
 
+#include "readin.h"
+
 /* Commands and return values; nonzero return sets command_errmsg != NULL */
 typedef int	(bootblk_cmd_t)(int argc, char *argv[]);
 #define	COMMAND_ERRBUFSZ	(256)
-extern char	*command_errmsg;	
+extern const char *command_errmsg;
 extern char	command_errbuf[COMMAND_ERRBUFSZ];
 #define CMD_OK		0
 #define CMD_WARN	1
@@ -61,7 +63,6 @@ char	*backslash(const char *str);
 int	parse(int *argc, char ***argv, const char *str);
 
 /* boot.c */
-int	autoboot(int timeout, char *prompt);
 void	autoboot_maybe(void);
 int	getrootmount(char *rootdev);
 
@@ -71,8 +72,8 @@ void	hexdump(caddr_t region, size_t len);
 size_t	strlenout(vm_offset_t str);
 char	*strdupout(vm_offset_t str);
 void	kern_bzero(vm_offset_t dest, size_t len);
-int	kern_pread(int fd, vm_offset_t dest, size_t len, off_t off);
-void	*alloc_pread(int fd, off_t off, size_t len);
+int	kern_pread(readin_handle_t fd, vm_offset_t dest, size_t len, off_t off);
+void	*alloc_pread(readin_handle_t fd, off_t off, size_t len);
 
 /* bcache.c */
 void	bcache_init(size_t nblks, size_t bsize);
@@ -158,6 +159,19 @@ char			*pnp_eisaformat(uint8_t *data);
  *  > 0	- ISA in system, value is read data port address
  */
 extern int			isapnp_readport;
+
+/*
+ * Version information
+ */
+extern char bootprog_info[];
+
+/*
+ * Interpreter information
+ */
+extern const char bootprog_interp[];
+#define	INTERP_DEFINE(interpstr) \
+const char bootprog_interp[] = "$Interpreter:" interpstr
+
 
 /*
  * Preloaded file metadata header.
@@ -291,7 +305,7 @@ struct arch_switch
     ssize_t	(*arch_copyout)(const vm_offset_t src, void *dest,
 				const size_t len);
     /* Read from file to module address space, same semantics as read() */
-    ssize_t	(*arch_readin)(const int fd, vm_offset_t dest,
+    ssize_t	(*arch_readin)(readin_handle_t fd, vm_offset_t dest,
 			       const size_t len);
     /* Perform ISA byte port I/O (only for systems with ISA) */
     int		(*arch_isainb)(int port);
@@ -318,6 +332,9 @@ struct arch_switch
     /* Probe ZFS pool(s), if needed. */
     void	(*arch_zfs_probe)(void);
 
+    /* Return the hypervisor name/type or NULL if not virtualized. */
+    const char *(*arch_hypervisor)(void);
+
     /* For kexec-type loaders, get ksegment structure */
     void	(*arch_kexec_kseg_get)(int *nseg, void **kseg);
 };
@@ -328,12 +345,8 @@ void	delay(int delay);
 
 void	dev_cleanup(void);
 
-time_t	time(time_t *tloc);
-
-#ifndef CTASSERT                /* Allow lint to override */
-#define CTASSERT(x)             _CTASSERT(x, __LINE__)
-#define _CTASSERT(x, y)         __CTASSERT(x, y)
-#define __CTASSERT(x, y)        typedef char __assert ## y[(x) ? 1 : -1]
+#ifndef CTASSERT
+#define	CTASSERT(x)	_Static_assert(x, "compile-time assertion failed")
 #endif
 
 #endif /* !_BOOTSTRAP_H_ */

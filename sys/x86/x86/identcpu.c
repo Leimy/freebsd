@@ -53,6 +53,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/sysctl.h>
 #include <sys/power.h>
 
+#include <vm/vm.h>
+#include <vm/pmap.h>
+
 #include <machine/asmacros.h>
 #include <machine/clock.h>
 #include <machine/cputypes.h>
@@ -115,6 +118,10 @@ u_int	cpu_mon_mwait_flags;	/* MONITOR/MWAIT flags (CPUID.05H.ECX) */
 u_int	cpu_mon_min_size;	/* MONITOR minimum range size, bytes */
 u_int	cpu_mon_max_size;	/* MONITOR minimum range size, bytes */
 u_int	cpu_maxphyaddr;		/* Max phys addr width in bits */
+u_int	cpu_power_eax;		/* 06H: Power management leaf, %eax */
+u_int	cpu_power_ebx;		/* 06H: Power management leaf, %ebx */
+u_int	cpu_power_ecx;		/* 06H: Power management leaf, %ecx */
+u_int	cpu_power_edx;		/* 06H: Power management leaf, %edx */
 char machine[] = MACHINE;
 
 SYSCTL_UINT(_hw, OID_AUTO, via_feature_rng, CTLFLAG_RD,
@@ -161,6 +168,7 @@ static int hw_clockrate;
 SYSCTL_INT(_hw, OID_AUTO, clockrate, CTLFLAG_RD,
     &hw_clockrate, 0, "CPU instruction clock rate");
 
+u_int hv_base;
 u_int hv_high;
 char hv_vendor[16];
 SYSCTL_STRING(_hw, OID_AUTO, hv_vendor, CTLFLAG_RD | CTLFLAG_MPSAFE, hv_vendor,
@@ -215,6 +223,7 @@ static struct {
 } cpu_vendors[] = {
 	{ INTEL_VENDOR_ID,	CPU_VENDOR_INTEL },	/* GenuineIntel */
 	{ AMD_VENDOR_ID,	CPU_VENDOR_AMD },	/* AuthenticAMD */
+	{ HYGON_VENDOR_ID,	CPU_VENDOR_HYGON },	/* HygonGenuine*/
 	{ CENTAUR_VENDOR_ID,	CPU_VENDOR_CENTAUR },	/* CentaurHauls */
 #ifdef __i386__
 	{ NSC_VENDOR_ID,	CPU_VENDOR_NSC },	/* Geode by NSC */
@@ -275,7 +284,7 @@ printcpuinfo(void)
 			switch (cpu_id & 0xf00) {
 			case 0x400:
 				strcat(cpu_model, "i486 ");
-			        /* Check the particular flavor of 486 */
+				/* Check the particular flavor of 486 */
 				switch (cpu_id & 0xf0) {
 				case 0x00:
 				case 0x10:
@@ -303,32 +312,32 @@ printcpuinfo(void)
 				}
 				break;
 			case 0x500:
-			        /* Check the particular flavor of 586 */
-			        strcat(cpu_model, "Pentium");
-			        switch (cpu_id & 0xf0) {
+				/* Check the particular flavor of 586 */
+				strcat(cpu_model, "Pentium");
+				switch (cpu_id & 0xf0) {
 				case 0x00:
-				        strcat(cpu_model, " A-step");
+					strcat(cpu_model, " A-step");
 					break;
 				case 0x10:
-				        strcat(cpu_model, "/P5");
+					strcat(cpu_model, "/P5");
 					break;
 				case 0x20:
-				        strcat(cpu_model, "/P54C");
+					strcat(cpu_model, "/P54C");
 					break;
 				case 0x30:
-				        strcat(cpu_model, "/P24T");
+					strcat(cpu_model, "/P24T");
 					break;
 				case 0x40:
-				        strcat(cpu_model, "/P55C");
+					strcat(cpu_model, "/P55C");
 					break;
 				case 0x70:
-				        strcat(cpu_model, "/P54C");
+					strcat(cpu_model, "/P54C");
 					break;
 				case 0x80:
-				        strcat(cpu_model, "/P55C (quarter-micron)");
+					strcat(cpu_model, "/P55C (quarter-micron)");
 					break;
 				default:
-				        /* nothing */
+					/* nothing */
 					break;
 				}
 #if defined(I586_CPU) && !defined(NO_F00F_HACK)
@@ -341,18 +350,18 @@ printcpuinfo(void)
 #endif
 				break;
 			case 0x600:
-			        /* Check the particular flavor of 686 */
-  			        switch (cpu_id & 0xf0) {
+				/* Check the particular flavor of 686 */
+				switch (cpu_id & 0xf0) {
 				case 0x00:
-				        strcat(cpu_model, "Pentium Pro A-step");
+					strcat(cpu_model, "Pentium Pro A-step");
 					break;
 				case 0x10:
-				        strcat(cpu_model, "Pentium Pro");
+					strcat(cpu_model, "Pentium Pro");
 					break;
 				case 0x30:
 				case 0x50:
 				case 0x60:
-				        strcat(cpu_model,
+					strcat(cpu_model,
 				"Pentium II/Pentium II Xeon/Celeron");
 					cpu = CPU_PII;
 					break;
@@ -360,12 +369,12 @@ printcpuinfo(void)
 				case 0x80:
 				case 0xa0:
 				case 0xb0:
-				        strcat(cpu_model,
+					strcat(cpu_model,
 					"Pentium III/Pentium III Xeon/Celeron");
 					cpu = CPU_PIII;
 					break;
 				default:
-				        strcat(cpu_model, "Unknown 80686");
+					strcat(cpu_model, "Unknown 80686");
 					break;
 				}
 				break;
@@ -674,6 +683,18 @@ printcpuinfo(void)
 		}
 		break;
 #endif
+	case CPU_VENDOR_HYGON:
+		strcpy(cpu_model, "Hygon ");
+#ifdef __i386__
+		strcat(cpu_model, "Unknown");
+#else
+		if ((cpu_id & 0xf00) == 0xf00)
+			strcat(cpu_model, "AMD64 Processor");
+		else
+			strcat(cpu_model, "Unknown");
+#endif
+		break;
+
 	default:
 		strcat(cpu_model, "Unknown");
 		break;
@@ -733,6 +754,7 @@ printcpuinfo(void)
 
 	if (cpu_vendor_id == CPU_VENDOR_INTEL ||
 	    cpu_vendor_id == CPU_VENDOR_AMD ||
+	    cpu_vendor_id == CPU_VENDOR_HYGON ||
 	    cpu_vendor_id == CPU_VENDOR_CENTAUR ||
 #ifdef __i386__
 	    cpu_vendor_id == CPU_VENDOR_TRANSMETA ||
@@ -911,7 +933,7 @@ printcpuinfo(void)
 				"\034PTSC"	/* Performance TSC */
 				"\035PL2I"	/* L2I perf count */
 				"\036MWAITX"	/* MONITORX/MWAITX instructions */
-				"\037<b30>"
+				"\037ADMSKX"	/* Address mask extension */
 				"\040<b31>"
 				);
 			}
@@ -956,7 +978,8 @@ printcpuinfo(void)
 				       /* Supervisor Mode Access Prevention */
 				       "\025SMAP"
 				       "\026AVX512IFMA"
-				       "\027PCOMMIT"
+				       /* Formerly PCOMMIT */
+				       "\027<b22>"
 				       "\030CLFLUSHOPT"
 				       "\031CLWB"
 				       "\032PROCTRACE"
@@ -978,7 +1001,21 @@ printcpuinfo(void)
 				       "\003UMIP"
 				       "\004PKU"
 				       "\005OSPKE"
+				       "\006WAITPKG"
+				       "\007AVX512VBMI2"
+				       "\011GFNI"
+				       "\012VAES"
+				       "\013VPCLMULQDQ"
+				       "\014AVX512VNNI"
+				       "\015AVX512BITALG"
+				       "\016TME"
+				       "\017AVX512VPOPCNTDQ"
+				       "\021LA57"
 				       "\027RDPID"
+				       "\032CLDEMOTE"
+				       "\034MOVDIRI"
+				       "\035MOVDIR64B"
+				       "\036ENQCMD"
 				       "\037SGXLC"
 				       );
 			}
@@ -987,9 +1024,21 @@ printcpuinfo(void)
 				printf("\n  Structured Extended Features3=0x%b",
 				    cpu_stdext_feature3,
 				       "\020"
+				       "\003AVX512_4VNNIW"
+				       "\004AVX512_4FMAPS"
+				       "\005FSRM"
+				       "\011AVX512VP2INTERSECT"
+				       "\012MCUOPT"
+				       "\013MD_CLEAR"
+				       "\016TSXFA"
+				       "\023PCONFIG"
+				       "\025IBT"
 				       "\033IBPB"
 				       "\034STIBP"
+				       "\035L1DFL"
 				       "\036ARCH_CAP"
+				       "\037CORE_CAP"
+				       "\040SSBD"
 				       );
 			}
 
@@ -1012,17 +1061,48 @@ printcpuinfo(void)
 				       "\020"
 				       "\001RDCL_NO"
 				       "\002IBRS_ALL"
+				       "\003RSBA"
+				       "\004SKIP_L1DFL_VME"
+				       "\005SSB_NO"
+				       "\006MDS_NO"
+				       "\010TSX_CTRL"
+				       "\011TAA_NO"
 				       );
 			}
 
 			if (amd_extended_feature_extensions != 0) {
+				u_int amd_fe_masked;
+
+				amd_fe_masked = amd_extended_feature_extensions;
+				if ((amd_fe_masked & AMDFEID_IBRS) == 0)
+					amd_fe_masked &=
+					    ~(AMDFEID_IBRS_ALWAYSON |
+						AMDFEID_PREFER_IBRS);
+				if ((amd_fe_masked & AMDFEID_STIBP) == 0)
+					amd_fe_masked &=
+					    ~AMDFEID_STIBP_ALWAYSON;
+
 				printf("\n  "
 				    "AMD Extended Feature Extensions ID EBX="
-				    "0x%b", amd_extended_feature_extensions,
+				    "0x%b", amd_fe_masked,
 				    "\020"
 				    "\001CLZERO"
 				    "\002IRPerf"
-				    "\003XSaveErPtr");
+				    "\003XSaveErPtr"
+				    "\005RDPRU"
+				    "\011MCOMMIT"
+				    "\012WBNOINVD"
+				    "\015IBPB"
+				    "\017IBRS"
+				    "\020STIBP"
+				    "\021IBRS_ALWAYSON"
+				    "\022STIBP_ALWAYSON"
+				    "\023PREFER_IBRS"
+				    "\030PPIN"
+				    "\031SSBD"
+				    "\032VIRT_SSBD"
+				    "\033SSB_NO"
+				    );
 			}
 
 			if (via_feature_rng != 0 || via_feature_xcrypt != 0)
@@ -1035,7 +1115,8 @@ printcpuinfo(void)
 				print_svm_info();
 
 			if ((cpu_feature & CPUID_HTT) &&
-			    cpu_vendor_id == CPU_VENDOR_AMD)
+			    (cpu_vendor_id == CPU_VENDOR_AMD ||
+			     cpu_vendor_id == CPU_VENDOR_HYGON))
 				cpu_feature &= ~CPUID_HTT;
 
 			/*
@@ -1065,7 +1146,8 @@ printcpuinfo(void)
 		printf("\n");
 
 	if (bootverbose) {
-		if (cpu_vendor_id == CPU_VENDOR_AMD)
+		if (cpu_vendor_id == CPU_VENDOR_AMD ||
+		    cpu_vendor_id == CPU_VENDOR_HYGON)
 			print_AMD_info();
 		else if (cpu_vendor_id == CPU_VENDOR_INTEL)
 			print_INTEL_info();
@@ -1267,30 +1349,45 @@ hook_tsc_freq(void *arg __unused)
 
 SYSINIT(hook_tsc_freq, SI_SUB_CONFIGURE, SI_ORDER_ANY, hook_tsc_freq, NULL);
 
-static const char *const vm_bnames[] = {
-	"QEMU",				/* QEMU */
-	"Plex86",			/* Plex86 */
-	"Bochs",			/* Bochs */
-	"Xen",				/* Xen */
-	"BHYVE",			/* bhyve */
-	"Seabios",			/* KVM */
-	NULL
+static const struct {
+	const char *	vm_bname;
+	int		vm_guest;
+} vm_bnames[] = {
+	{ "QEMU",	VM_GUEST_VM },		/* QEMU */
+	{ "Plex86",	VM_GUEST_VM },		/* Plex86 */
+	{ "Bochs",	VM_GUEST_VM },		/* Bochs */
+	{ "Xen",	VM_GUEST_XEN },		/* Xen */
+	{ "BHYVE",	VM_GUEST_BHYVE },	/* bhyve */
+	{ "Seabios",	VM_GUEST_KVM },		/* KVM */
 };
 
-static const char *const vm_pnames[] = {
-	"VMware Virtual Platform",	/* VMWare VM */
-	"Virtual Machine",		/* Microsoft VirtualPC */
-	"VirtualBox",			/* Sun xVM VirtualBox */
-	"Parallels Virtual Platform",	/* Parallels VM */
-	"KVM",				/* KVM */
-	NULL
+static const struct {
+	const char *	vm_pname;
+	int		vm_guest;
+} vm_pnames[] = {
+	{ "VMware Virtual Platform",	VM_GUEST_VMWARE },
+	{ "Virtual Machine",		VM_GUEST_VM }, /* Microsoft VirtualPC */
+	{ "VirtualBox",			VM_GUEST_VBOX },
+	{ "Parallels Virtual Platform",	VM_GUEST_PARALLELS },
+	{ "KVM",			VM_GUEST_KVM },
 };
 
-void
-identify_hypervisor(void)
+static struct {
+	const char	*vm_cpuid;
+	int		vm_guest;
+} vm_cpuids[] = {
+	{ "XENXENXEN",		VM_GUEST_XEN },		/* XEN */
+	{ "Microsoft Hv",	VM_GUEST_HV },		/* Microsoft Hyper-V */
+	{ "VMwareVMware",	VM_GUEST_VMWARE },	/* VMware VM */
+	{ "KVMKVMKVM",		VM_GUEST_KVM },		/* KVM */
+	{ "bhyve bhyve ",	VM_GUEST_BHYVE },	/* bhyve */
+	{ "VBoxVBoxVBox",	VM_GUEST_VBOX },	/* VirtualBox */
+};
+
+static void
+identify_hypervisor_cpuid_base(void)
 {
-	u_int regs[4];
-	char *p;
+	u_int leaf, regs[4];
 	int i;
 
 	/*
@@ -1300,26 +1397,74 @@ identify_hypervisor(void)
 	 * KB1009458: Mechanisms to determine if software is running in
 	 * a VMware virtual machine
 	 * http://kb.vmware.com/kb/1009458
+	 *
+	 * Search for a hypervisor that we recognize. If we cannot find
+	 * a specific hypervisor, return the first information about the
+	 * hypervisor that we found, as others may be able to use.
+	 */
+	for (leaf = 0x40000000; leaf < 0x40010000; leaf += 0x100) {
+		do_cpuid(leaf, regs);
+
+		/*
+		 * KVM from Linux kernels prior to commit
+		 * 57c22e5f35aa4b9b2fe11f73f3e62bbf9ef36190 set %eax
+		 * to 0 rather than a valid hv_high value.  Check for
+		 * the KVM signature bytes and fixup %eax to the
+		 * highest supported leaf in that case.
+		 */
+		if (regs[0] == 0 && regs[1] == 0x4b4d564b &&
+		    regs[2] == 0x564b4d56 && regs[3] == 0x0000004d)
+			regs[0] = leaf + 1;
+
+		if (regs[0] >= leaf) {
+			for (i = 0; i < nitems(vm_cpuids); i++)
+				if (strncmp((const char *)&regs[1],
+				    vm_cpuids[i].vm_cpuid, 12) == 0) {
+					vm_guest = vm_cpuids[i].vm_guest;
+					break;
+				}
+
+			/*
+			 * If this is the first entry or we found a
+			 * specific hypervisor, record the base, high value,
+			 * and vendor identifier.
+			 */
+			if (vm_guest != VM_GUEST_VM || leaf == 0x40000000) {
+				hv_base = leaf;
+				hv_high = regs[0];
+				((u_int *)&hv_vendor)[0] = regs[1];
+				((u_int *)&hv_vendor)[1] = regs[2];
+				((u_int *)&hv_vendor)[2] = regs[3];
+				hv_vendor[12] = '\0';
+
+				/*
+				 * If we found a specific hypervisor, then
+				 * we are finished.
+				 */
+				if (vm_guest != VM_GUEST_VM)
+					return;
+			}
+		}
+	}
+}
+
+void
+identify_hypervisor(void)
+{
+	u_int regs[4];
+	char *p;
+	int i;
+
+	/*
+	 * If CPUID2_HV is set, we are running in a hypervisor environment.
 	 */
 	if (cpu_feature2 & CPUID2_HV) {
 		vm_guest = VM_GUEST_VM;
-		do_cpuid(0x40000000, regs);
-		if (regs[0] >= 0x40000000) {
-			hv_high = regs[0];
-			((u_int *)&hv_vendor)[0] = regs[1];
-			((u_int *)&hv_vendor)[1] = regs[2];
-			((u_int *)&hv_vendor)[2] = regs[3];
-			hv_vendor[12] = '\0';
-			if (strcmp(hv_vendor, "VMwareVMware") == 0)
-				vm_guest = VM_GUEST_VMWARE;
-			else if (strcmp(hv_vendor, "Microsoft Hv") == 0)
-				vm_guest = VM_GUEST_HV;
-			else if (strcmp(hv_vendor, "KVMKVMKVM") == 0)
-				vm_guest = VM_GUEST_KVM;
-			else if (strcmp(hv_vendor, "bhyve bhyve") == 0)
-				vm_guest = VM_GUEST_BHYVE;
-		}
-		return;
+		identify_hypervisor_cpuid_base();
+
+		/* If we have a definitive vendor, we can return now. */
+		if (*hv_vendor != '\0')
+			return;
 	}
 
 	/*
@@ -1330,7 +1475,7 @@ identify_hypervisor(void)
 		if (strncmp(p, "VMware-", 7) == 0 || strncmp(p, "VMW", 3) == 0) {
 			vmware_hvcall(VMW_HVCMD_GETVERSION, regs);
 			if (regs[1] == VMW_HVMAGIC) {
-				vm_guest = VM_GUEST_VMWARE;			
+				vm_guest = VM_GUEST_VMWARE;
 				freeenv(p);
 				return;
 			}
@@ -1344,19 +1489,27 @@ identify_hypervisor(void)
 	 */
 	p = kern_getenv("smbios.bios.vendor");
 	if (p != NULL) {
-		for (i = 0; vm_bnames[i] != NULL; i++)
-			if (strcmp(p, vm_bnames[i]) == 0) {
-				vm_guest = VM_GUEST_VM;
-				freeenv(p);
-				return;
+		for (i = 0; i < nitems(vm_bnames); i++)
+			if (strcmp(p, vm_bnames[i].vm_bname) == 0) {
+				vm_guest = vm_bnames[i].vm_guest;
+				/* If we have a specific match, return */
+				if (vm_guest != VM_GUEST_VM) {
+					freeenv(p);
+					return;
+				}
+				/*
+				 * We are done with bnames, but there might be
+				 * a more specific match in the pnames
+				 */
+				break;
 			}
 		freeenv(p);
 	}
 	p = kern_getenv("smbios.system.product");
 	if (p != NULL) {
-		for (i = 0; vm_pnames[i] != NULL; i++)
-			if (strcmp(p, vm_pnames[i]) == 0) {
-				vm_guest = VM_GUEST_VM;
+		for (i = 0; i < nitems(vm_pnames); i++)
+			if (strcmp(p, vm_pnames[i].vm_pname) == 0) {
+				vm_guest = vm_pnames[i].vm_guest;
 				freeenv(p);
 				return;
 			}
@@ -1431,6 +1584,14 @@ identify_cpu2(void)
 {
 	u_int regs[4], cpu_stdext_disable;
 
+	if (cpu_high >= 6) {
+		cpuid_count(6, 0, regs);
+		cpu_power_eax = regs[0];
+		cpu_power_ebx = regs[1];
+		cpu_power_ecx = regs[2];
+		cpu_power_edx = regs[3];
+	}
+
 	if (cpu_high >= 7) {
 		cpuid_count(7, 0, regs);
 		cpu_stdext_feature = regs[1];
@@ -1453,6 +1614,19 @@ identify_cpu2(void)
 	}
 }
 
+void
+identify_cpu_fixup_bsp(void)
+{
+	u_int regs[4];
+
+	cpu_vendor_id = find_cpu_vendor_id();
+
+	if (fix_cpuid()) {
+		do_cpuid(0, regs);
+		cpu_high = regs[0];
+	}
+}
+
 /*
  * Final stage of CPU identification.
  */
@@ -1464,12 +1638,7 @@ finishidentcpu(void)
 	u_char ccr3;
 #endif
 
-	cpu_vendor_id = find_cpu_vendor_id();
-
-	if (fix_cpuid()) {
-		do_cpuid(0, regs);
-		cpu_high = regs[0];
-	}
+	identify_cpu_fixup_bsp();
 
 	if (cpu_high >= 5 && (cpu_feature2 & CPUID2_MON) != 0) {
 		do_cpuid(5, regs);
@@ -1484,6 +1653,7 @@ finishidentcpu(void)
 	if (cpu_high > 0 &&
 	    (cpu_vendor_id == CPU_VENDOR_INTEL ||
 	     cpu_vendor_id == CPU_VENDOR_AMD ||
+	     cpu_vendor_id == CPU_VENDOR_HYGON ||
 	     cpu_vendor_id == CPU_VENDOR_TRANSMETA ||
 	     cpu_vendor_id == CPU_VENDOR_CENTAUR ||
 	     cpu_vendor_id == CPU_VENDOR_NSC)) {
@@ -1494,6 +1664,7 @@ finishidentcpu(void)
 #else
 	if (cpu_vendor_id == CPU_VENDOR_INTEL ||
 	    cpu_vendor_id == CPU_VENDOR_AMD ||
+	    cpu_vendor_id == CPU_VENDOR_HYGON ||
 	    cpu_vendor_id == CPU_VENDOR_CENTAUR) {
 		do_cpuid(0x80000000, regs);
 		cpu_exthigh = regs[0];
@@ -1613,7 +1784,8 @@ int
 pti_get_default(void)
 {
 
-	if (strcmp(cpu_vendor, AMD_VENDOR_ID) == 0)
+	if (strcmp(cpu_vendor, AMD_VENDOR_ID) == 0 ||
+	    strcmp(cpu_vendor, HYGON_VENDOR_ID) == 0)
 		return (0);
 	if ((cpu_ia32_arch_caps & IA32_ARCH_CAP_RDCL_NO) != 0)
 		return (0);
@@ -2173,23 +2345,23 @@ print_svm_info(void)
 		comma = 0;
 		if (features & (1 << 0)) {
 			printf("%sNP", comma ? "," : "");
-                        comma = 1; 
+			comma = 1;
 		}
 		if (features & (1 << 3)) {
 			printf("%sNRIP", comma ? "," : "");
-                        comma = 1; 
+			comma = 1;
 		}
 		if (features & (1 << 5)) {
 			printf("%sVClean", comma ? "," : "");
-                        comma = 1; 
+			comma = 1;
 		}
 		if (features & (1 << 6)) {
 			printf("%sAFlush", comma ? "," : "");
-                        comma = 1; 
+			comma = 1;
 		}
 		if (features & (1 << 7)) {
 			printf("%sDAssist", comma ? "," : "");
-                        comma = 1; 
+			comma = 1;
 		}
 		printf("%sNAsids=%d", comma ? "," : "", regs[1]);
 		return;
@@ -2207,17 +2379,17 @@ print_svm_info(void)
 	       "\010DecodeAssist"	/* Decode assist */
 	       "\011<b8>"
 	       "\012<b9>"
-	       "\013PauseFilter"	/* PAUSE intercept filter */    
+	       "\013PauseFilter"	/* PAUSE intercept filter */
 	       "\014EncryptedMcodePatch"
 	       "\015PauseFilterThreshold" /* PAUSE filter threshold */
 	       "\016AVIC"		/* virtual interrupt controller */
 	       "\017<b14>"
 	       "\020V_VMSAVE_VMLOAD"
 	       "\021vGIF"
-	       "\022<b17>"
+	       "\022GMET"		/* Guest Mode Execute Trap */
 	       "\023<b18>"
 	       "\024<b19>"
-	       "\025<b20>"
+	       "\025GuesSpecCtl"	/* Guest Spec_ctl */
 	       "\026<b21>"
 	       "\027<b22>"
 	       "\030<b23>"
@@ -2229,7 +2401,7 @@ print_svm_info(void)
 	       "\036<b29>"
 	       "\037<b30>"
 	       "\040<b31>"
-                );
+	       );
 	printf("\nRevision=%d, ASIDs=%d", regs[0] & 0xff, regs[1]);
 }
 
@@ -2484,6 +2656,21 @@ static void
 print_hypervisor_info(void)
 {
 
-	if (*hv_vendor)
+	if (*hv_vendor != '\0')
 		printf("Hypervisor: Origin = \"%s\"\n", hv_vendor);
+}
+
+/*
+ * Returns the maximum physical address that can be used with the
+ * current system.
+ */
+vm_paddr_t
+cpu_getmaxphyaddr(void)
+{
+
+#if defined(__i386__)
+	if (!pae_mode)
+		return (0xffffffff);
+#endif
+	return ((1ULL << cpu_maxphyaddr) - 1);
 }

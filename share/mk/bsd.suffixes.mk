@@ -5,7 +5,7 @@
 	chmod a+x ${.TARGET}
 
 .c:
-	${CC} ${CFLAGS} ${LDFLAGS} ${.IMPSRC} ${LDLIBS} -o ${.TARGET}
+	${CC:N${CCACHE_BIN}} ${CFLAGS} ${LDFLAGS} ${.IMPSRC} ${LDLIBS} -o ${.TARGET}
 	${CTFCONVERT_CMD}
 
 .c.o:
@@ -19,7 +19,7 @@
 	${CC} -emit-llvm ${IR_CFLAGS} -S ${.IMPSRC} -o ${.TARGET}
 
 .cc .cpp .cxx .C:
-	${CXX} ${CXXFLAGS} ${LDFLAGS} ${.IMPSRC} ${LDLIBS} -o ${.TARGET}
+	${CXX:N${CCACHE_BIN}} ${CXXFLAGS} ${LDFLAGS} ${.IMPSRC} ${LDLIBS} -o ${.TARGET}
 
 .cc.o .cpp.o .cxx.o .C.o:
 	${CXX} ${STATIC_CXXFLAGS} ${CXXFLAGS} -c ${.IMPSRC} -o ${.TARGET}

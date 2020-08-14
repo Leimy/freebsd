@@ -3,11 +3,13 @@
 
 .PATH:	${.CURDIR:H}/bthidd
 
+PACKAGE=	bluetooth
 PROG=		bthidcontrol
 MAN=		bthidcontrol.8
 SRCS=		bthidcontrol.c hid.c lexer.l  parser.y sdp.c
 WARNS?=		1
-CFLAGS+=	-DBTHIDCONTROL=1 -I${.CURDIR:H}/bthidd
+CFLAGS+=	-DBTHIDCONTROL=1 -I${.CURDIR:H}/bthidd -I${SRCTOP}/lib/libsdp \
+		-I${SRCTOP}/lib/libbluetooth
 
 LIBADD+=	bluetooth sdp usbhid
 

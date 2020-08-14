@@ -8,9 +8,24 @@ DIRDEPS = \
 	lib/${CSU_DIR} \
 	lib/atf/libatf-c \
 	lib/atf/libatf-c++ \
+	lib/geom/cache \
+	lib/geom/concat \
+	lib/geom/eli \
+	lib/geom/journal \
+	lib/geom/label \
+	lib/geom/mirror \
+	lib/geom/mountver \
+	lib/geom/multipath \
+	lib/geom/nop \
+	lib/geom/part \
+	lib/geom/raid \
+	lib/geom/raid3 \
+	lib/geom/sched \
+	lib/geom/shsec \
+	lib/geom/stripe \
+	lib/geom/virstor \
 	lib/lib80211 \
 	lib/libalias/libalias \
-	lib/libalias/modules/cuseeme \
 	lib/libalias/modules/dummy \
 	lib/libalias/modules/ftp \
 	lib/libalias/modules/irc \
@@ -44,6 +59,7 @@ DIRDEPS = \
 	lib/libdevdctl \
 	lib/libdevinfo \
 	lib/libdevstat \
+	lib/libdl \
 	lib/libdwarf \
 	lib/libedit/edit/readline \
 	lib/libelf \
@@ -177,8 +193,7 @@ DIRDEPS = \
 
 .if ${MK_CLANG} != "no" && \
     (${MACHINE_CPUARCH} == "aarch64" || ${MACHINE_CPUARCH} == "amd64" || \
-    (${MACHINE_CPUARCH} == "arm" && ${MACHINE_ARCH} != "armeb") || \
-    (${MACHINE_CPUARCH} == "i386"))
+    ${MACHINE_CPUARCH} == "arm" || ${MACHINE_CPUARCH} == "i386")
 DIRDEPS+= \
 	lib/libclang_rt/asan-preinit \
 	lib/libclang_rt/asan \
@@ -199,21 +214,12 @@ DIRDEPS+= \
 DIRDEPS+= stand/libsa32
 .endif
 
-.if defined(LINKER_FEATURES) && ${LINKER_FEATURES:Mfilter}
-DIRDEPS+= lib/libdl
-.endif
-
-.if ${MK_NAND} != "no"
-DIRDEPS+= lib/libnandfs
-.endif
-
 .if ${MK_CASPER} != "no"
 DIRDEPS+= \
 	lib/libcasper/libcasper \
 	lib/libcasper/services/cap_dns \
 	lib/libcasper/services/cap_grp \
 	lib/libcasper/services/cap_pwd \
-	lib/libcasper/services/cap_random \
 	lib/libcasper/services/cap_sysctl \
 
 .endif
@@ -230,11 +236,9 @@ DIRDEPS+= lib/libgpio
 DIRDEPS+= lib/libefivar
 .endif
 
-.if ${MK_LLVM_LIBUNWIND} != "no"
 DIRDEPS+= \
 	lib/libgcc_eh \
 	lib/libgcc_s
-.endif
 
 .if ${MK_PMC} != "no"
 DIRDEPS+= \

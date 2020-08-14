@@ -40,15 +40,13 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
-
-#include <sys/types.h>
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/sysent.h>
 #include <sys/proc.h>
 #include <sys/signalvar.h>
 #include <sys/exec.h>
+#include <sys/ktr.h>
 #include <sys/imgact.h>
 #include <sys/ucontext.h>
 #include <sys/lock.h>
@@ -149,12 +147,10 @@ sendsig(sig_t catcher, ksiginfo_t *ksi, sigset_t *mask)
 		/* fill siginfo structure */
 		sf.sf_si = ksi->ksi_info;
 		sf.sf_si.si_signo = sig;
-		sf.sf_si.si_code = ksi->ksi_code;
-		sf.sf_si.si_addr = (void*)(intptr_t)regs->badvaddr;
 	} else {
 		/* Old FreeBSD-style arguments. */
 		regs->a1 = ksi->ksi_code;
-		regs->a3 = regs->badvaddr;
+		regs->a3 = (uintptr_t)ksi->ksi_addr;
 		/* sf.sf_ahu.sf_handler = catcher; */
 	}
 
@@ -218,29 +214,29 @@ ptrace_set_pc(struct thread *td, unsigned long addr)
 }
 
 static int
-ptrace_read_int(struct thread *td, off_t addr, int *v)
+ptrace_read_int(struct thread *td, uintptr_t addr, int *v)
 {
 
 	if (proc_readmem(td, td->td_proc, addr, v, sizeof(*v)) != sizeof(*v))
-		return (ENOMEM);
+		return (EFAULT);
 	return (0);
 }
 
 static int
-ptrace_write_int(struct thread *td, off_t addr, int v)
+ptrace_write_int(struct thread *td, uintptr_t addr, int v)
 {
 
 	if (proc_writemem(td, td->td_proc, addr, &v, sizeof(v)) != sizeof(v))
-		return (ENOMEM);
+		return (EFAULT);
 	return (0);
 }
 
 int
 ptrace_single_step(struct thread *td)
 {
-	unsigned va;
+	uintptr_t va;
 	struct trapframe *locr0 = td->td_frame;
-	int i;
+	int error;
 	int bpinstr = MIPS_BREAK_SSTEP;
 	int curinstr;
 	struct proc *p;
@@ -250,45 +246,53 @@ ptrace_single_step(struct thread *td)
 	/*
 	 * Fetch what's at the current location.
 	 */
-	ptrace_read_int(td,  (off_t)locr0->pc, &curinstr);
+	error = ptrace_read_int(td, locr0->pc, &curinstr);
+	if (error)
+		goto out;
+
+	CTR3(KTR_PTRACE,
+	    "ptrace_single_step: tid %d, current instr at %#lx: %#08x",
+	    td->td_tid, locr0->pc, curinstr);
 
 	/* compute next address after current location */
-	if(curinstr != 0) {
+	if (locr0->cause & MIPS_CR_BR_DELAY) {
 		va = MipsEmulateBranch(locr0, locr0->pc, locr0->fsr,
 		    (uintptr_t)&curinstr);
 	} else {
 		va = locr0->pc + 4;
 	}
 	if (td->td_md.md_ss_addr) {
-		printf("SS %s (%d): breakpoint already set at %x (va %x)\n",
-		    p->p_comm, p->p_pid, td->td_md.md_ss_addr, va); /* XXX */
-		return (EFAULT);
+		printf("SS %s (%d): breakpoint already set at %p (va %p)\n",
+		    p->p_comm, p->p_pid, (void *)td->td_md.md_ss_addr,
+		    (void *)va); /* XXX */
+		error = EFAULT;
+		goto out;
 	}
 	td->td_md.md_ss_addr = va;
 	/*
 	 * Fetch what's at the current location.
 	 */
-	ptrace_read_int(td, (off_t)va, &td->td_md.md_ss_instr);
+	error = ptrace_read_int(td, (off_t)va, &td->td_md.md_ss_instr);
+	if (error)
+		goto out;
 
 	/*
 	 * Store breakpoint instruction at the "next" location now.
 	 */
-	i = ptrace_write_int (td, va, bpinstr);
+	error = ptrace_write_int(td, va, bpinstr);
 
 	/*
-	 * The sync'ing of I & D caches is done by procfs_domem()
-	 * through procfs_rwmem().
+	 * The sync'ing of I & D caches is done by proc_rwmem()
+	 * through proc_writemem().
 	 */
 
+out:
 	PROC_LOCK(p);
-	if (i < 0)
-		return (EFAULT);
-#if 0
-	printf("SS %s (%d): breakpoint set at %x: %x (pc %x) br %x\n",
-	    p->p_comm, p->p_pid, p->p_md.md_ss_addr,
-	    p->p_md.md_ss_instr, locr0->pc, curinstr); /* XXX */
-#endif
-	return (0);
+	if (error == 0)
+		CTR3(KTR_PTRACE,
+		    "ptrace_single_step: tid %d, break set at %#lx: (%#08x)",
+		    td->td_tid, va, td->td_md.md_ss_instr); 
+	return (error);
 }
 
 
@@ -404,7 +408,7 @@ set_fpregs(struct thread *td, struct fpreg *fpregs)
  * code by the MIPS elf abi).
  */
 void
-exec_setregs(struct thread *td, struct image_params *imgp, u_long stack)
+exec_setregs(struct thread *td, struct image_params *imgp, uintptr_t stack)
 {
 
 	bzero((caddr_t)td->td_frame, sizeof(struct trapframe));
@@ -437,10 +441,13 @@ exec_setregs(struct thread *td, struct image_params *imgp, u_long stack)
 	td->td_frame->t9 = imgp->entry_addr & ~3; /* abicall req */
 	td->td_frame->sr = MIPS_SR_KSU_USER | MIPS_SR_EXL | MIPS_SR_INT_IE |
 	    (mips_rd_status() & MIPS_SR_INT_MASK);
-#if defined(__mips_n32) 
+#if defined(__mips_n32) || defined(__mips_n64)
 	td->td_frame->sr |= MIPS_SR_PX;
-#elif  defined(__mips_n64)
-	td->td_frame->sr |= MIPS_SR_PX | MIPS_SR_UX | MIPS_SR_KX;
+#endif
+#if defined(__mips_n64)
+	if (SV_PROC_FLAG(td->td_proc, SV_LP64))
+		td->td_frame->sr |= MIPS_SR_UX;
+	td->td_frame->sr |= MIPS_SR_KX;
 #endif
 	/*
 	 * FREEBSD_DEVELOPERS_FIXME:
@@ -466,14 +473,22 @@ exec_setregs(struct thread *td, struct image_params *imgp, u_long stack)
 	    PCPU_SET(fpcurthread, (struct thread *)0);
 	td->td_md.md_ss_addr = 0;
 
-	td->td_md.md_tls_tcb_offset = TLS_TP_OFFSET + TLS_TCB_SIZE;
+	td->td_md.md_tls = NULL;
+#ifdef COMPAT_FREEBSD32
+	if (!SV_PROC_FLAG(td->td_proc, SV_LP64))
+		td->td_proc->p_md.md_tls_tcb_offset = TLS_TP_OFFSET +
+		    TLS_TCB_SIZE32;
+	else
+#endif
+		td->td_proc->p_md.md_tls_tcb_offset = TLS_TP_OFFSET +
+		    TLS_TCB_SIZE;
 }
 
 int
 ptrace_clear_single_step(struct thread *td)
 {
-	int i;
 	struct proc *p;
+	int error;
 
 	p = td->td_proc;
 	PROC_LOCK_ASSERT(p, MA_OWNED);
@@ -483,13 +498,20 @@ ptrace_clear_single_step(struct thread *td)
 	/*
 	 * Restore original instruction and clear BP
 	 */
-	i = ptrace_write_int (td, td->td_md.md_ss_addr, td->td_md.md_ss_instr);
+	PROC_UNLOCK(p);
+	CTR3(KTR_PTRACE,
+	    "ptrace_clear_single_step: tid %d, restore instr at %#lx: %#08x",
+	    td->td_tid, td->td_md.md_ss_addr, td->td_md.md_ss_instr);
+	error = ptrace_write_int(td, td->td_md.md_ss_addr,
+	    td->td_md.md_ss_instr);
+	PROC_LOCK(p);
 
-	/* The sync'ing of I & D caches is done by procfs_domem(). */
+	/* The sync'ing of I & D caches is done by proc_rwmem(). */
 
-	if (i < 0) {
-		log(LOG_ERR, "SS %s %d: can't restore instruction at %x: %x\n",
-		    p->p_comm, p->p_pid, td->td_md.md_ss_addr,
+	if (error != 0) {
+		log(LOG_ERR,
+		    "SS %s %d: can't restore instruction at %p: %x\n",
+		    p->p_comm, p->p_pid, (void *)td->td_md.md_ss_addr,
 		    td->td_md.md_ss_instr);
 	}
 	td->td_md.md_ss_addr = 0;

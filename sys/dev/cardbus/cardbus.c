@@ -1,8 +1,8 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2003-2008 M. Warner Losh.  All Rights Reserved.
  * Copyright (c) 2000,2001 Jonathan Chen.  All rights reserved.
+ * Copyright (c) 2003-2008 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -30,6 +30,7 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/eventhandler.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
@@ -56,7 +57,8 @@ __FBSDID("$FreeBSD$");
 #include "pcib_if.h"
 
 /* sysctl vars */
-static SYSCTL_NODE(_hw, OID_AUTO, cardbus, CTLFLAG_RD, 0, "CardBus parameters");
+static SYSCTL_NODE(_hw, OID_AUTO, cardbus, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "CardBus parameters");
 
 int    cardbus_debug = 0;
 SYSCTL_INT(_hw_cardbus, OID_AUTO, debug, CTLFLAG_RWTUN,
@@ -197,6 +199,7 @@ cardbus_attach_card(device_t cbdev)
 	domain = pcib_get_domain(cbdev);
 	bus = pcib_get_bus(cbdev);
 	slot = 0;
+	mtx_lock(&Giant);
 	/* For each function, set it up and try to attach a driver to it */
 	for (func = 0; func <= cardbusfunchigh; func++) {
 		struct cardbus_devinfo *dinfo;
@@ -230,6 +233,7 @@ cardbus_attach_card(device_t cbdev)
 		else
 			pci_cfg_save(dinfo->pci.cfg.dev, &dinfo->pci, 1);
 	}
+	mtx_unlock(&Giant);
 	if (cardattached > 0)
 		return (0);
 /*	POWER_DISABLE_SOCKET(brdev, cbdev); */

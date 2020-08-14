@@ -99,7 +99,7 @@ main(int argc, char *argv[])
 	dosyslog = 0;
 	outfn = NULL;
 	title = NULL;
-	while ((ch = getopt(argc, argv, "cfSp:P:ru:o:s:l:t:l:m:T:")) != -1) {
+	while ((ch = getopt(argc, argv, "cfSp:P:ru:o:s:l:t:l:m:R:T:")) != -1) {
 		switch (ch) {
 		case 'c':
 			nochdir = 0;
@@ -129,6 +129,11 @@ main(int argc, char *argv[])
 			break;
 		case 'r':
 			restart = 1;
+			break;
+		case 'R':
+			restart = strtol(optarg, &p, 0);
+			if (p == optarg || restart < 1)
+				errx(6, "invalid restart delay");
 			break;
 		case 's':
 			logpri = get_log_mapping(optarg, prioritynames);
@@ -354,12 +359,13 @@ restart:
 			}
 		}
 	}
+	if (restart && !terminate)
+		daemon_sleep(restart, 0);
 	if (sigprocmask(SIG_BLOCK, &mask_term, NULL)) {
 		warn("sigprocmask");
 		goto exit;
 	}
 	if (restart && !terminate) {
-		daemon_sleep(1, 0);
 		close(pfd[0]);
 		pfd[0] = -1;
 		goto restart;
@@ -379,7 +385,8 @@ static void
 daemon_sleep(time_t secs, long nsecs)
 {
 	struct timespec ts = { secs, nsecs };
-	while (nanosleep(&ts, &ts) == -1) {
+
+	while (!terminate && nanosleep(&ts, &ts) == -1) {
 		if (errno != EINTR)
 			err(1, "nanosleep");
 	}
@@ -558,7 +565,7 @@ usage(void)
 	    "usage: daemon [-cfrS] [-p child_pidfile] [-P supervisor_pidfile]\n"
 	    "              [-u user] [-o output_file] [-t title]\n"
 	    "              [-l syslog_facility] [-s syslog_priority]\n"
-	    "              [-T syslog_tag] [-m output_mask]\n"
+	    "              [-T syslog_tag] [-m output_mask] [-R restart_delay_secs]\n"
 	    "command arguments ...\n");
 	exit(1);
 }

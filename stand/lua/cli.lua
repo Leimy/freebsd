@@ -2,7 +2,6 @@
 -- SPDX-License-Identifier: BSD-2-Clause-FreeBSD
 --
 -- Copyright (c) 2018 Kyle Evans <kevans@FreeBSD.org>
--- All rights reserved.
 --
 -- Redistribution and use in source and binary forms, with or without
 -- modification, are permitted provided that the following conditions
@@ -114,6 +113,25 @@ function cli.autoboot(...)
 	local _, argv = cli.arguments(...)
 	local argstr = parseBootArgs(argv, false)
 	core.autoboot(argstr)
+end
+
+cli['boot-conf'] = function(...)
+	local _, argv = cli.arguments(...)
+	local kernel, argstr = parseBootArgs(argv)
+	if kernel ~= nil then
+		loader.perform("unload")
+		config.selectKernel(kernel)
+	end
+	core.autoboot(argstr)
+end
+
+cli['read-conf'] = function(...)
+	local _, argv = cli.arguments(...)
+	config.readConf(assert(core.popFrontTable(argv)))
+end
+
+cli['reload-conf'] = function(...)
+	config.reload()
 end
 
 -- Used for splitting cli varargs into cmd_name and the rest of argv

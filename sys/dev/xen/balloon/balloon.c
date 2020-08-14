@@ -79,7 +79,9 @@ static struct balloon_stats balloon_stats;
 #define bs balloon_stats
 
 SYSCTL_DECL(_dev_xen);
-static SYSCTL_NODE(_dev_xen, OID_AUTO, balloon, CTLFLAG_RD, NULL, "Balloon");
+static SYSCTL_NODE(_dev_xen, OID_AUTO, balloon,
+    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "Balloon");
 SYSCTL_ULONG(_dev_xen_balloon, OID_AUTO, current, CTLFLAG_RD,
     &bs.current_pages, 0, "Current allocation");
 SYSCTL_ULONG(_dev_xen_balloon, OID_AUTO, target, CTLFLAG_RD,
@@ -382,8 +384,7 @@ xenballoon_attach(device_t dev)
 
 	mtx_init(&balloon_mutex, "balloon_mutex", NULL, MTX_DEF);
 
-	bs.current_pages = xen_pv_domain() ?
-	    HYPERVISOR_start_info->nr_pages : realmem;
+	bs.current_pages = realmem;
 	bs.target_pages  = bs.current_pages;
 	bs.balloon_low   = 0;
 	bs.balloon_high  = 0;

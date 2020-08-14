@@ -98,6 +98,19 @@ static struct mtx unitmtx;
 
 MTX_SYSINIT(unit, &unitmtx, "unit# allocation", MTX_DEF);
 
+#ifdef UNR64_LOCKED
+uint64_t
+alloc_unr64(struct unrhdr64 *unr64)
+{
+	uint64_t item;
+
+	mtx_lock(&unitmtx);
+	item = unr64->counter++;
+	mtx_unlock(&unitmtx);
+	return (item);
+}
+#endif
+
 #else /* ...USERLAND */
 
 #include <bitstring.h>
@@ -129,7 +142,6 @@ _Malloc(size_t foo, int line)
 #define Free(foo) free(foo)
 
 struct unrhdr;
-
 
 struct mtx {
 	int	state;
@@ -212,7 +224,6 @@ ub_full(struct unrb *ub, int len)
 	return (first_clear == -1);
 }
 
-
 #if defined(DIAGNOSTIC) || !defined(_KERNEL)
 /*
  * Consistency check function.
@@ -262,7 +273,6 @@ check_unrhdr(struct unrhdr *uh __unused, int line __unused)
 }
 
 #endif
-
 
 /*
  * Userland memory management.  Just use calloc and keep track of how
@@ -1008,7 +1018,7 @@ main(int argc, char **argv)
 	long count = 10000;	/* Number of unrs to test */
 	long reps = 1, m;
 	int ch;
-	u_int i, j;
+	u_int i;
 
 	verbose = false;
 
@@ -1032,7 +1042,6 @@ main(int argc, char **argv)
 			exit(2);
 		}
 
-
 	}
 
 	setbuf(stdout, NULL);
@@ -1042,20 +1051,18 @@ main(int argc, char **argv)
 	a = calloc(count, sizeof(char));
 	if (a == NULL)
 		err(1, "calloc failed");
-	srandomdev();
 
 	printf("sizeof(struct unr) %zu\n", sizeof(struct unr));
 	printf("sizeof(struct unrb) %zu\n", sizeof(struct unrb));
 	printf("sizeof(struct unrhdr) %zu\n", sizeof(struct unrhdr));
 	printf("NBITS %lu\n", (unsigned long)NBITS);
 	for (m = 0; m < count * reps; m++) {
-		j = random();
-		i = (j >> 1) % count;
+		i = arc4random_uniform(count);
 #if 0
 		if (a[i] && (j & 1))
 			continue;
 #endif
-		if ((random() & 1) != 0)
+		if ((arc4random() & 1) != 0)
 			test_alloc_unr(uh, i, a);
 		else
 			test_alloc_unr_specific(uh, i, a);

@@ -20,7 +20,7 @@
  */
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2018 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Spectra Logic Corporation, All rights reserved.
  */
@@ -82,6 +82,13 @@ typedef enum dbuf_states {
 	DB_CACHED,
 	DB_EVICTING
 } dbuf_states_t;
+
+typedef enum dbuf_cached_state {
+	DB_NO_CACHE = -1,
+	DB_DBUF_CACHE,
+	DB_DBUF_METADATA_CACHE,
+	DB_CACHE_MAX
+} dbuf_cached_state_t;
 
 struct dnode;
 struct dmu_tx;
@@ -182,6 +189,13 @@ typedef struct dmu_buf_impl {
 	 */
 	struct dmu_buf_impl *db_hash_next;
 
+	/*
+	 * Our link on the owner dnodes's dn_dbufs list.
+	 * Protected by its dn_dbufs_mtx.  Should be on the same cache line
+	 * as db_level and db_blkid for the best avl_add() performance.
+	 */
+	avl_node_t db_link;
+
 	/* our block number */
 	uint64_t db_blkid;
 
@@ -212,7 +226,7 @@ typedef struct dmu_buf_impl {
 	 * If nonzero, the buffer can't be destroyed.
 	 * Protected by db_mtx.
 	 */
-	refcount_t db_holds;
+	zfs_refcount_t db_holds;
 
 	/* buffer holding our data */
 	arc_buf_t *db_buf;
@@ -223,16 +237,11 @@ typedef struct dmu_buf_impl {
 	/* pointer to most recent dirty record for this buffer */
 	dbuf_dirty_record_t *db_last_dirty;
 
-	/*
-	 * Our link on the owner dnodes's dn_dbufs list.
-	 * Protected by its dn_dbufs_mtx.
-	 */
-	avl_node_t db_link;
-
-	/*
-	 * Link in dbuf_cache.
-	 */
+	/* Link in dbuf_cache or dbuf_metadata_cache */
 	multilist_node_t db_cache_link;
+
+	/* Tells us which dbuf cache this dbuf is in, if any */
+	dbuf_cached_state_t db_caching_status;
 
 	/* Data which is unique to data (leaf) blocks: */
 
@@ -295,7 +304,7 @@ boolean_t dbuf_try_add_ref(dmu_buf_t *db, objset_t *os, uint64_t obj,
 uint64_t dbuf_refcount(dmu_buf_impl_t *db);
 
 void dbuf_rele(dmu_buf_impl_t *db, void *tag);
-void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag);
+void dbuf_rele_and_unlock(dmu_buf_impl_t *db, void *tag, boolean_t evicting);
 
 dmu_buf_impl_t *dbuf_find(struct objset *os, uint64_t object, uint8_t level,
     uint64_t blkid);
@@ -324,6 +333,9 @@ void dbuf_free_range(struct dnode *dn, uint64_t start, uint64_t end,
     struct dmu_tx *);
 
 void dbuf_new_size(dmu_buf_impl_t *db, int size, dmu_tx_t *tx);
+
+void dbuf_stats_init(dbuf_hash_table_t *hash);
+void dbuf_stats_destroy(void);
 
 #define	DB_DNODE(_db)		((_db)->db_dnode_handle->dnh_dnode)
 #define	DB_DNODE_LOCK(_db)	((_db)->db_dnode_handle->dnh_zrlock)

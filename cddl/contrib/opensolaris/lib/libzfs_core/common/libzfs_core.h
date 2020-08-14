@@ -20,9 +20,10 @@
  */
 
 /*
- * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2020 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Martin Matuska <mm@FreeBSD.org>. All rights reserved.
  * Copyright 2017 RackTop Systems.
+ * Copyright (c) 2017 Datto Inc.
  */
 
 #ifndef	_LIBZFS_CORE_H
@@ -31,6 +32,8 @@
 #include <libnvpair.h>
 #include <sys/param.h>
 #include <sys/types.h>
+#include <sys/fs/zfs.h>
+
 
 #ifdef	__cplusplus
 extern "C" {
@@ -56,6 +59,8 @@ int lzc_destroy_snaps(nvlist_t *, boolean_t, nvlist_t **);
 int lzc_bookmark(nvlist_t *, nvlist_t **);
 int lzc_get_bookmarks(const char *, nvlist_t *, nvlist_t **);
 int lzc_destroy_bookmarks(nvlist_t *, nvlist_t **);
+int lzc_initialize(const char *, pool_initialize_func_t, nvlist_t *,
+    nvlist_t **);
 
 int lzc_snaprange_space(const char *, const char *, uint64_t *);
 
@@ -87,11 +92,21 @@ boolean_t lzc_exists(const char *);
 int lzc_rollback(const char *, char *, int);
 int lzc_rollback_to(const char *, const char *);
 
+int lzc_sync(const char *, nvlist_t *, nvlist_t **);
+
+int lzc_rename(const char *, const char *);
+int lzc_destroy(const char *);
+
 int lzc_channel_program(const char *, const char *, uint64_t,
     uint64_t, nvlist_t *, nvlist_t **);
 int lzc_channel_program_nosync(const char *, const char *, uint64_t,
     uint64_t, nvlist_t *, nvlist_t **);
 
+int lzc_pool_checkpoint(const char *);
+int lzc_pool_checkpoint_discard(const char *);
+
+int lzc_set_bootenv(const char *, const char *);
+int lzc_get_bootenv(const char *, nvlist_t **);
 #ifdef	__cplusplus
 }
 #endif

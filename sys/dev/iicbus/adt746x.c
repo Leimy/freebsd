@@ -360,8 +360,8 @@ adt746x_fill_fan_prop(device_t dev)
 	child = ofw_bus_get_node(dev);
 
 	/* Fill the fan location property. */
-	location_len = OF_getprop_alloc(child, "hwctrl-location", 1, (void **)&location);
-	id_len = OF_getprop_alloc(child, "hwctrl-id", sizeof(cell_t), (void **)&id);
+	location_len = OF_getprop_alloc(child, "hwctrl-location", (void **)&location);
+	id_len = OF_getprop_alloc_multi(child, "hwctrl-id", sizeof(cell_t), (void **)&id);
 	if (location_len == -1 || id_len == -1) {
 		OF_prop_free(location);
 		OF_prop_free(id);
@@ -495,7 +495,7 @@ adt746x_attach_fans(device_t dev)
 	ctx = device_get_sysctl_ctx(dev);
 	fanroot_oid = SYSCTL_ADD_NODE(ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "fans",
-	    CTLFLAG_RD, 0, "ADT Fan Information");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "ADT Fan Information");
 
 	/* Now we can fill the properties into the allocated struct. */
 	sc->sc_nfans = adt746x_fill_fan_prop(dev);
@@ -517,12 +517,13 @@ adt746x_attach_fans(device_t dev)
 			adt746x_fan_get_pwm(&sc->sc_fans[i]);
 
 		oid = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(fanroot_oid),
-		    OID_AUTO, sysctl_name, CTLFLAG_RD, 0, "Fan Information");
+		    OID_AUTO, sysctl_name, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+		    "Fan Information");
 
 		/* I use i to pass the fan id. */
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
-				"pwm", CTLTYPE_INT | CTLFLAG_RW, dev, i,
-				adt746x_fanrpm_sysctl, "I", "Fan PWM in %");
+		    "pwm", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, dev,
+		    i, adt746x_fanrpm_sysctl, "I", "Fan PWM in %");
 	}
 
 	/* Dump fan location & type. */
@@ -621,7 +622,7 @@ adt746x_attach_sensors(device_t dev)
 	ctx = device_get_sysctl_ctx(dev);
 	sensroot_oid = SYSCTL_ADD_NODE(ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO, "sensors",
-	    CTLFLAG_RD, 0, "ADT Sensor Information");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "ADT Sensor Information");
 
 	/* Add the sysctl for the sensors. */
 	for (i = 0; i < sc->sc_nsensors; i++) {
@@ -632,9 +633,8 @@ adt746x_attach_sensors(device_t dev)
 		}
 		sysctl_name[j] = 0;
 		oid = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(sensroot_oid),
-				      OID_AUTO,
-				      sysctl_name, CTLFLAG_RD, 0,
-				      "Sensor Information");
+		    OID_AUTO, sysctl_name, CTLFLAG_RD | CTLFLAG_MPSAFE, 0, 
+		    "Sensor Information");
 		if (sc->sc_sensors[i].type == ADT746X_SENSOR_TEMP) {
 			unit = "temp";
 			desc = "sensor unit (C)";
@@ -647,10 +647,10 @@ adt746x_attach_sensors(device_t dev)
 		}
 		/* I use i to pass the sensor id. */
 		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(oid), OID_AUTO,
-				unit, CTLTYPE_INT | CTLFLAG_RD, dev, i,
-				adt746x_sensor_sysctl,
-				sc->sc_sensors[i].type == ADT746X_SENSOR_TEMP ?
-				"IK" : "I", desc);
+		    unit, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_NEEDGIANT, dev, i,
+		    adt746x_sensor_sysctl,
+		    sc->sc_sensors[i].type == ADT746X_SENSOR_TEMP ?
+		    "IK" : "I", desc);
 	}
 
 	/* Dump sensor location & type. */

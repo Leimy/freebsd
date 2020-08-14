@@ -36,14 +36,15 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
 #include <sys/bus.h>
-#include <sys/systm.h>
-#include <sys/types.h>
-#include <sys/module.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
-#include <sys/sysctl.h>
+#include <sys/lock.h>
+#include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/proc.h>	/* for curthread */
 #include <sys/sched.h>
+#include <sys/sysctl.h>
+#include <sys/systm.h>
 
 #include <machine/specialreg.h>
 #include <machine/cpufunc.h>
@@ -145,6 +146,9 @@ coretemp_probe(device_t dev)
 
 	device_set_desc(dev, "CPU On-Die Thermal Sensors");
 
+	if (!bootverbose && device_get_unit(dev) != 0)
+		device_quiet(dev);
+
 	return (BUS_PROBE_GENERIC);
 }
 
@@ -162,7 +166,7 @@ coretemp_attach(device_t dev)
 	sc->sc_dev = dev;
 	pdev = device_get_parent(dev);
 	cpu_model = CPUID_TO_MODEL(cpu_id);
-	cpu_stepping = cpu_id & CPUID_STEPPING;
+	cpu_stepping = CPUID_TO_STEPPING(cpu_id);
 
 	/*
 	 * Some CPUs, namely the PIII, don't have thermal sensors, but
@@ -270,7 +274,8 @@ coretemp_attach(device_t dev)
 
 	oid = SYSCTL_ADD_NODE(ctx,
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(pdev)), OID_AUTO,
-	    "coretemp", CTLFLAG_RD, NULL, "Per-CPU thermal information");
+	    "coretemp", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "Per-CPU thermal information");
 
 	/*
 	 * Add the MIBs to dev.cpu.N and dev.cpu.N.coretemp.

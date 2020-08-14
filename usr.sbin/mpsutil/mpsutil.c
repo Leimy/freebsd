@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2015 Netflix, Inc.
- * All rights reserved.
  * Written by: Scott Long <scottl@freebsd.org>
  *
  * Copyright (c) 2008 Yahoo!, Inc.
@@ -38,6 +37,8 @@ __RCSID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/errno.h>
 #include <err.h>
+#include <inttypes.h>
+#include <paths.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,9 +60,9 @@ usage(void)
 	fprintf(stderr, "usage: %s [-u unit] <command> ...\n\n", getprogname());
 	fprintf(stderr, "Commands include:\n");
 	SET_FOREACH(cmd, MPS_DATASET(usage)) {
-		if (*cmd == NULL)
+		if (*cmd == NULL) {
 			fprintf(stderr, "\n");
-		else
+		} else {
 			(*cmd)->handler(&args, &desc);
 			if (strncmp((*cmd)->set, "top", 3) == 0)
 				fprintf(stderr, "%s %-30s\t%s\n",
@@ -69,6 +70,7 @@ usage(void)
 			else
 				fprintf(stderr, "%s %s %-30s\t%s\n",
 				    (*cmd)->set, (*cmd)->name, args, desc);
+		}
 	}
 	exit(1);
 }
@@ -91,6 +93,8 @@ int
 main(int ac, char **av)
 {
 	struct mpsutil_command **cmd;
+	uintmax_t unit;
+	char *end;
 	int ch;
 
 	is_mps = !strcmp(getprogname(), "mpsutil");
@@ -98,7 +102,17 @@ main(int ac, char **av)
 	while ((ch = getopt(ac, av, "u:h?")) != -1) {
 		switch (ch) {
 		case 'u':
-			mps_unit = atoi(optarg);
+			if (strncmp(optarg, _PATH_DEV, strlen(_PATH_DEV)) == 0) {
+				optarg += strlen(_PATH_DEV);
+				if (strncmp(optarg, is_mps ? "mps" : "mpr", 3) != 0)
+					errx(1, "Invalid device: %s", optarg);
+			}
+			if (strncmp(optarg, is_mps ? "mps" : "mpr", 3) == 0)
+				optarg += 3;
+			unit = strtoumax(optarg, &end, 10);
+			if (*end != '\0' || unit == UINTMAX_MAX || unit > INT_MAX)
+				errx(1, "Invalid unit: %s", optarg);
+			mps_unit = unit;
 			break;
 		case 'h':
 		case '?':

@@ -41,6 +41,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/kernel.h>
 #include <sys/lock.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
 #include <sys/rman.h>
 
 #include <machine/bus.h>
@@ -141,6 +142,9 @@ syscon_generic_probe(device_t dev)
 		return (ENXIO);
 
 	device_set_desc(dev, "syscon");
+	if (!bootverbose)
+		device_quiet(dev);
+
 	return (BUS_PROBE_GENERIC);
 }
 

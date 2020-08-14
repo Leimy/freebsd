@@ -1235,12 +1235,12 @@ function zfs_zones_setup #zone_name zone_root zone_ip
 
 	# add our zvol to the zone
 	$ECHO "add device" >> $zone_conf
-	$ECHO "set match=/dev/zvol/dsk/$pool_name/zone_zvol" >> $zone_conf
+	$ECHO "set match=/dev/zvol/$pool_name/zone_zvol" >> $zone_conf
 	$ECHO "end" >> $zone_conf
 
-	# add a corresponding zvol rdsk to the zone
+	# add a corresponding zvol to the zone
 	$ECHO "add device" >> $zone_conf
-	$ECHO "set match=/dev/zvol/rdsk/$pool_name/zone_zvol" >> $zone_conf
+	$ECHO "set match=/dev/zvol/$pool_name/zone_zvol" >> $zone_conf
 	$ECHO "end" >> $zone_conf
 	
 	# once it's supported, we'll add our filesystem to the zone
@@ -1349,8 +1349,8 @@ function wait_for # timeout dt <method> [args...]
 function check_state # pool disk stateexpr
 {
 	typeset pool=$1
-	typeset disk=${2#/dev/dsk/}
-	disk=${disk#/dev/rdsk/}
+	typeset disk=${2#/dev/}
+	disk=${disk#/dev/}
 	disk=${disk#/dev/}
 	typeset stateexpr=$3
 
@@ -1561,8 +1561,8 @@ function check_version # <OS version>
 function check_hotspare_state # pool disk state{inuse,avail}
 {
 	typeset pool=$1
-	typeset disk=${2#/dev/dsk/}
-	disk=${disk#/dev/rdsk/}
+	typeset disk=${2#/dev/}
+	disk=${disk#/dev/}
 	disk=${disk#/dev/}
 	typeset state=$3
 
@@ -1582,8 +1582,8 @@ function check_hotspare_state # pool disk state{inuse,avail}
 function check_slog_state # pool disk state{online,offline,unavail}
 {
 	typeset pool=$1
-	typeset disk=${2#/dev/dsk/}
-	disk=${disk#/dev/rdsk/}
+	typeset disk=${2#/dev/}
+	disk=${disk#/dev/}
 	disk=${disk#/dev/}
 	typeset state=$3
 
@@ -1603,8 +1603,8 @@ function check_slog_state # pool disk state{online,offline,unavail}
 function check_vdev_state # pool disk state{online,offline,unavail}
 {
 	typeset pool=$1
-	typeset disk=${2#/dev/dsk/}
-	disk=${disk#/dev/rdsk/}
+	typeset disk=${2#/dev/}
+	disk=${disk#/dev/}
 	disk=${disk#/dev/}
 	typeset state=$3
 
@@ -2176,7 +2176,7 @@ function safe_to_destroy_pool { # $1 the pool name
 			$AWK '{print $1}')
 
 		# this is a list of the zvols that make up the pool
-		ZVOLPOOL=$($ZPOOL status -v $pool | $GREP "/dev/zvol/dsk/$1$" | \
+		ZVOLPOOL=$($ZPOOL status -v $pool | $GREP "/dev/zvol/$1$" | \
 			$AWK '{print $1}')
 
 		# also want to determine if it's a file-based pool using an
@@ -2676,8 +2676,7 @@ function gen_dataset_name
 #
 # Ensure that a given path has been synced, not just ZIL committed.
 #
-# XXX The implementation currently requires calling 'zpool history'.  On
-#     FreeBSD, the sync(8) command (via $SYNC) calls zfs_sync() which just
+# XXX On FreeBSD, the sync(8) command (via $SYNC) calls zfs_sync() which just
 #     does a zil_commit(), as opposed to a txg_wait_synced().  For things that
 #     require writing to their final destination (e.g. for intentional
 #     corruption purposes), zil_commit() is not good enough.
@@ -2686,10 +2685,8 @@ function force_sync_path # path
 {
 	typeset path="$1"
 
-	zfspath=$($DF $path 2>/dev/null | tail -1 | cut -d" " -f1 | cut -d/ -f1)
-	[ -z "$zfspath" ] && return false
-	log_note "Force syncing ${zfspath} for ${path} ..."
-	$ZPOOL history $zfspath >/dev/null 2>&1
+	log_must $ZPOOL export $TESTPOOL
+	log_must $ZPOOL import -d $path $TESTPOOL
 }
 
 #
@@ -2728,8 +2725,8 @@ function checksum
 function get_device_state #pool disk field("", "spares","logs")
 {
 	typeset pool=$1
-	typeset disk=${2#/dev/dsk/}
-	disk=${disk#/dev/rdsk/}
+	typeset disk=${2#/dev/}
+	disk=${disk#/dev/}
 	disk=${disk#/dev/}
 	typeset field=${3:-$pool}
 
@@ -3326,7 +3323,7 @@ function file_dva # dataset filepath [level] [offset] [dva_num]
 	# The inner match is for 'DVA[0]=<0:1b412600:200>', in which the
 	# text surrounding the actual DVA is a fixed size with 8 characters
 	# before it and 1 after.
-	$ZDB -P -vvvvv $dataset $inode | \
+	$ZDB -P -vvvvv "$dataset/" $inode | \
 	    $AWK -v level=${level} -v dva_num=${dva_num} '
 		BEGIN { stage = 0; }
 		(stage == 0) && ($1=="Object") { stage = 1; next; }

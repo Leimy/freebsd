@@ -31,6 +31,7 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/boot.h>
 #include <sys/conf.h>
 #include <sys/kernel.h>
 #include <sys/systm.h>
@@ -55,8 +56,10 @@ __FBSDID("$FreeBSD$");
 #include <sys/user.h>
 
 #include <vm/vm.h>
+#include <vm/vm_param.h>
 #include <vm/vm_object.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 
 #include <machine/atomic.h>
 #include <machine/cache.h>
@@ -72,7 +75,6 @@ __FBSDID("$FreeBSD$");
 #include <machine/pcpu.h>
 #include <machine/pte.h>
 #include <machine/trap.h>
-#include <machine/vmparam.h>
 
 #include <contrib/octeon-sdk/cvmx.h>
 #include <contrib/octeon-sdk/cvmx-bootmem.h>
@@ -95,8 +97,6 @@ struct octeon_feature_description {
 };
 
 extern int	*end;
-extern char cpu_model[];
-extern char cpu_board[];
 static char octeon_kenv[0x2000];
 
 static const struct octeon_feature_description octeon_feature_descriptions[] = {
@@ -444,8 +444,9 @@ sysctl_machdep_led_display(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
-SYSCTL_PROC(_machdep, OID_AUTO, led_display, CTLTYPE_STRING | CTLFLAG_WR,
-    NULL, 0, sysctl_machdep_led_display, "A",
+SYSCTL_PROC(_machdep, OID_AUTO, led_display,
+    CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_NEEDGIANT, NULL, 0,
+    sysctl_machdep_led_display, "A",
     "String to display on LED display");
 
 void
@@ -664,30 +665,6 @@ octeon_boot_params_init(register_t ptr)
 }
 /* impEND: This stuff should move back into the Cavium SDK */
 
-static void
-boothowto_parse(const char *v)
-{
-	if ((v == NULL) || (*v != '-'))
-		return;
-
-	while (*v != '\0') {
-		v++;
-		switch (*v) {
-		case 'a': boothowto |= RB_ASKNAME; break;
-		case 'C': boothowto |= RB_CDROM; break;
-		case 'd': boothowto |= RB_KDB; break;
-		case 'D': boothowto |= RB_MULTIPLE; break;
-		case 'm': boothowto |= RB_MUTE; break;
-		case 'g': boothowto |= RB_GDB; break;
-		case 'h': boothowto |= RB_SERIAL; break;
-		case 'p': boothowto |= RB_PAUSE; break;
-		case 'r': boothowto |= RB_DFLTROOT; break;
-		case 's': boothowto |= RB_SINGLE; break;
-		case 'v': boothowto |= RB_VERBOSE; break;
-		}
-	}
-}
-
 /*
  * The boot loader command line may specify kernel environment variables or
  * applicable boot flags of boot(8).
@@ -709,7 +686,7 @@ octeon_init_kenv(register_t ptr)
 		if (v == NULL)
 			continue;
 		if (*v == '-') {
-			boothowto_parse(v);
+			boothowto |= boot_parse_arg(v);
 			continue;
 		}
 		n = strsep(&v, "=");

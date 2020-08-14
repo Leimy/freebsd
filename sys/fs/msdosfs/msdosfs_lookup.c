@@ -234,7 +234,6 @@ msdosfs_lookup_(struct vnode *vdp, struct vnode **vpp,
 		}
 		error = bread(pmp->pm_devvp, bn, blsize, NOCRED, &bp);
 		if (error) {
-			brelse(bp);
 			return (error);
 		}
 		for (blkoff = 0; blkoff < blsize;
@@ -457,7 +456,7 @@ found:
 	 */
 	brelse(bp);
 	bp = NULL;
-	
+
 foundroot:
 	/*
 	 * If we entered at foundroot, then we are looking for the . or ..
@@ -681,7 +680,6 @@ createde(struct denode *dep, struct denode *ddep, struct denode **depp,
 				error = bread(pmp->pm_devvp, bn, blsize,
 					      NOCRED, &bp);
 				if (error) {
-					brelse(bp);
 					return error;
 				}
 				ndep = bptoep(pmp, bp, ddep->de_fndoffset);
@@ -747,7 +745,6 @@ dosdirempty(struct denode *dep)
 		}
 		error = bread(pmp->pm_devvp, bn, blsize, NOCRED, &bp);
 		if (error) {
-			brelse(bp);
 			return (0);
 		}
 		for (dentp = (struct direntry *)bp->b_data;
@@ -960,7 +957,6 @@ removede(struct denode *pdep, struct denode *dep)
 			return error;
 		error = bread(pmp->pm_devvp, bn, blsize, NOCRED, &bp);
 		if (error) {
-			brelse(bp);
 			return error;
 		}
 		ep = bptoep(pmp, bp, offset);
@@ -1013,7 +1009,7 @@ uniqdosname(struct denode *dep, struct componentname *cnp, u_char *cp)
 	daddr_t bn;
 	struct buf *bp;
 	int error;
-	
+
 	if (pmp->pm_flags & MSDOSFSMNT_SHORTNAME)
 		return (unix2dosfn((const u_char *)cnp->cn_nameptr, cp,
 		    cnp->cn_namelen, 0, pmp) ? 0 : EINVAL);
@@ -1037,7 +1033,6 @@ uniqdosname(struct denode *dep, struct componentname *cnp, u_char *cp)
 			}
 			error = bread(pmp->pm_devvp, bn, blsize, NOCRED, &bp);
 			if (error) {
-				brelse(bp);
 				return error;
 			}
 			for (dentp = (struct direntry *)bp->b_data;

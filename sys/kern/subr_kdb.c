@@ -77,7 +77,6 @@ static int	kdb_break_to_debugger = KDB_BREAK_TO_DEBUGGER;
 static int	kdb_alt_break_to_debugger = KDB_ALT_BREAK_TO_DEBUGGER;
 
 KDB_BACKEND(null, NULL, NULL, NULL, NULL);
-SET_DECLARE(kdb_dbbe_set, struct kdb_dbbe);
 
 static int kdb_sysctl_available(SYSCTL_HANDLER_ARGS);
 static int kdb_sysctl_current(SYSCTL_HANDLER_ARGS);
@@ -87,33 +86,43 @@ static int kdb_sysctl_trap(SYSCTL_HANDLER_ARGS);
 static int kdb_sysctl_trap_code(SYSCTL_HANDLER_ARGS);
 static int kdb_sysctl_stack_overflow(SYSCTL_HANDLER_ARGS);
 
-static SYSCTL_NODE(_debug, OID_AUTO, kdb, CTLFLAG_RW, NULL, "KDB nodes");
+static SYSCTL_NODE(_debug, OID_AUTO, kdb, CTLFLAG_RW | CTLFLAG_MPSAFE, NULL,
+    "KDB nodes");
 
-SYSCTL_PROC(_debug_kdb, OID_AUTO, available, CTLTYPE_STRING | CTLFLAG_RD, NULL,
-    0, kdb_sysctl_available, "A", "list of available KDB backends");
+SYSCTL_PROC(_debug_kdb, OID_AUTO, available,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_available, "A",
+    "list of available KDB backends");
 
-SYSCTL_PROC(_debug_kdb, OID_AUTO, current, CTLTYPE_STRING | CTLFLAG_RW, NULL,
-    0, kdb_sysctl_current, "A", "currently selected KDB backend");
+SYSCTL_PROC(_debug_kdb, OID_AUTO, current,
+    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_current, "A",
+    "currently selected KDB backend");
 
 SYSCTL_PROC(_debug_kdb, OID_AUTO, enter,
-    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE, NULL, 0,
-    kdb_sysctl_enter, "I", "set to enter the debugger");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_enter, "I",
+    "set to enter the debugger");
 
 SYSCTL_PROC(_debug_kdb, OID_AUTO, panic,
-    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE, NULL, 0,
-    kdb_sysctl_panic, "I", "set to panic the kernel");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_panic, "I",
+    "set to panic the kernel");
 
 SYSCTL_PROC(_debug_kdb, OID_AUTO, trap,
-    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE, NULL, 0,
-    kdb_sysctl_trap, "I", "set to cause a page fault via data access");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_trap, "I",
+    "set to cause a page fault via data access");
 
 SYSCTL_PROC(_debug_kdb, OID_AUTO, trap_code,
-    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE, NULL, 0,
-    kdb_sysctl_trap_code, "I", "set to cause a page fault via code access");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_trap_code, "I",
+    "set to cause a page fault via code access");
 
 SYSCTL_PROC(_debug_kdb, OID_AUTO, stack_overflow,
-    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE, NULL, 0,
-    kdb_sysctl_stack_overflow, "I", "set to cause a stack overflow");
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_SECURE | CTLFLAG_MPSAFE, NULL, 0,
+    kdb_sysctl_stack_overflow, "I",
+    "set to cause a stack overflow");
 
 SYSCTL_INT(_debug_kdb, OID_AUTO, break_to_debugger,
     CTLFLAG_RWTUN | CTLFLAG_SECURE,
@@ -258,7 +267,6 @@ kdb_sysctl_stack_overflow(SYSCTL_HANDLER_ARGS)
 	kdb_stack_overflow(&x);
 	return (0);
 }
-
 
 void
 kdb_panic(const char *msg)
@@ -434,9 +442,8 @@ kdb_backtrace_thread(struct thread *td)
 		struct stack st;
 
 		printf("KDB: stack backtrace of thread %d:\n", td->td_tid);
-		stack_zero(&st);
-		stack_save_td(&st, td);
-		stack_print_ddb(&st);
+		if (stack_save_td(&st, td) == 0)
+			stack_print_ddb(&st);
 	}
 #endif
 }
@@ -580,14 +587,12 @@ kdb_thr_first(void)
 	struct proc *p;
 	struct thread *thr;
 
-	p = LIST_FIRST(&allproc);
-	while (p != NULL) {
+	FOREACH_PROC_IN_SYSTEM(p) {
 		if (p->p_flag & P_INMEM) {
 			thr = FIRST_THREAD_IN_PROC(p);
 			if (thr != NULL)
 				return (thr);
 		}
-		p = LIST_NEXT(p, p_list);
 	}
 	return (NULL);
 }
@@ -597,11 +602,9 @@ kdb_thr_from_pid(pid_t pid)
 {
 	struct proc *p;
 
-	p = LIST_FIRST(&allproc);
-	while (p != NULL) {
+	FOREACH_PROC_IN_SYSTEM(p) {
 		if (p->p_flag & P_INMEM && p->p_pid == pid)
 			return (FIRST_THREAD_IN_PROC(p));
-		p = LIST_NEXT(p, p_list);
 	}
 	return (NULL);
 }
@@ -656,9 +659,7 @@ kdb_trap(int type, int code, struct trapframe *tf)
 	struct kdb_dbbe *be;
 	register_t intr;
 	int handled;
-#ifdef SMP
 	int did_stop_cpus;
-#endif
 
 	be = kdb_dbbe;
 	if (be == NULL || be->dbbe_trap == NULL)
@@ -670,16 +671,17 @@ kdb_trap(int type, int code, struct trapframe *tf)
 
 	intr = intr_disable();
 
-#ifdef SMP
 	if (!SCHEDULER_STOPPED()) {
+#ifdef SMP
 		other_cpus = all_cpus;
-		CPU_NAND(&other_cpus, &stopped_cpus);
+		CPU_ANDNOT(&other_cpus, &stopped_cpus);
 		CPU_CLR(PCPU_GET(cpuid), &other_cpus);
 		stop_cpus_hard(other_cpus);
+#endif
+		curthread->td_stopsched = 1;
 		did_stop_cpus = 1;
 	} else
 		did_stop_cpus = 0;
-#endif
 
 	kdb_active++;
 
@@ -707,11 +709,13 @@ kdb_trap(int type, int code, struct trapframe *tf)
 
 	kdb_active--;
 
+	if (did_stop_cpus) {
+		curthread->td_stopsched = 0;
 #ifdef SMP
-	CPU_AND(&other_cpus, &stopped_cpus);
-	if (did_stop_cpus)
+		CPU_AND(&other_cpus, &stopped_cpus);
 		restart_cpus(other_cpus);
 #endif
+	}
 
 	intr_restore(intr);
 

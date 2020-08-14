@@ -146,15 +146,18 @@ static int
 acpi_pci_link_probe(device_t dev)
 {
 	char descr[28], name[12];
+	int rv;
 
 	/*
 	 * We explicitly do not check _STA since not all systems set it to
 	 * sensible values.
 	 */
-	if (acpi_disabled("pci_link") ||
-	    ACPI_ID_PROBE(device_get_parent(dev), dev, pci_link_ids) == NULL)
-		return (ENXIO);
-
+	if (acpi_disabled("pci_link"))
+	    return (ENXIO);
+	rv = ACPI_ID_PROBE(device_get_parent(dev), dev, pci_link_ids, NULL);
+	if (rv > 0)
+	  return (rv);
+	
 	if (ACPI_SUCCESS(acpi_short_name(acpi_get_handle(dev), name,
 	    sizeof(name)))) {
 		snprintf(descr, sizeof(descr), "ACPI PCI Link %s", name);
@@ -162,7 +165,7 @@ acpi_pci_link_probe(device_t dev)
 	} else
 		device_set_desc(dev, "ACPI PCI Link");
 	device_quiet(dev);
-	return (0);
+	return (rv);
 }
 
 static ACPI_STATUS
@@ -577,6 +580,9 @@ acpi_pci_link_search_irq(int bus, int device, int pin)
 	uint8_t func, maxfunc;
 
 	/* See if we have a valid device at function 0. */
+	value = pci_cfgregread(bus, device, 0, PCIR_VENDOR, 2);
+	if (value == PCIV_INVALID)
+		return (PCI_INVALID_IRQ);
 	value = pci_cfgregread(bus, device, 0, PCIR_HDRTYPE, 1);
 	if ((value & PCIM_HDRTYPE) > PCI_MAXHDRTYPE)
 		return (PCI_INVALID_IRQ);
@@ -587,8 +593,8 @@ acpi_pci_link_search_irq(int bus, int device, int pin)
 
 	/* Scan all possible functions at this device. */
 	for (func = 0; func <= maxfunc; func++) {
-		value = pci_cfgregread(bus, device, func, PCIR_DEVVENDOR, 4);
-		if (value == 0xffffffff)
+		value = pci_cfgregread(bus, device, func, PCIR_VENDOR, 2);
+		if (value == PCIV_INVALID)
 			continue;
 		value = pci_cfgregread(bus, device, func, PCIR_INTPIN, 1);
 

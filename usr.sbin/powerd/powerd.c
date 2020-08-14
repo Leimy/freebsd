@@ -86,7 +86,7 @@ static const char *modes[] = {
 #define DEVDPIPE	"/var/run/devd.pipe"
 #define DEVCTL_MAXBUF	1024
 
-static int	read_usage_times(int *load);
+static int	read_usage_times(int *load, int nonice);
 static int	read_freqs(int *numfreqs, int **freqs, int **power,
 		    int minfreq, int maxfreq);
 static int	set_freq(int freq);
@@ -113,14 +113,16 @@ static int	vflag;
 
 static volatile sig_atomic_t exit_requested;
 static power_src_t acline_status;
-static enum {
+typedef enum {
 	ac_none,
 	ac_sysctl,
 	ac_acpi_devd,
 #ifdef USE_APM
 	ac_apm,
 #endif
-} acline_mode;
+} acline_mode_t;
+static acline_mode_t acline_mode;
+static acline_mode_t acline_mode_user = ac_none;
 #ifdef USE_APM
 static int	apm_fd = -1;
 #endif
@@ -133,15 +135,17 @@ static struct timeval tried_devd;
  * This function returns summary load of all CPUs.  It was made so
  * intentionally to not reduce performance in scenarios when several
  * threads are processing requests as a pipeline -- running one at
- * a time on different CPUs and waiting for each other.
+ * a time on different CPUs and waiting for each other.  If nonice
+ * is nonzero, only user+sys+intr time will be counted as load; any
+ * nice time will be treated as if idle.
  */
 static int
-read_usage_times(int *load)
+read_usage_times(int *load, int nonice)
 {
 	static long *cp_times = NULL, *cp_times_old = NULL;
 	static int ncpus = 0;
 	size_t cp_times_len;
-	int error, cpu, i, total;
+	int error, cpu, i, total, excl;
 
 	if (cp_times == NULL) {
 		cp_times_len = 0;
@@ -173,8 +177,12 @@ read_usage_times(int *load)
 			}
 			if (total == 0)
 				continue;
-			*load += 100 - (cp_times[cpu * CPUSTATES + CP_IDLE] -
-			    cp_times_old[cpu * CPUSTATES + CP_IDLE]) * 100 / total;
+			excl = cp_times[cpu * CPUSTATES + CP_IDLE] -
+			    cp_times_old[cpu * CPUSTATES + CP_IDLE];
+			if (nonice)
+				excl += cp_times[cpu * CPUSTATES + CP_NICE] -
+				    cp_times_old[cpu * CPUSTATES + CP_NICE];
+			*load += 100 - excl * 100 / total;
 		}
 	}
 
@@ -194,8 +202,10 @@ read_freqs(int *numfreqs, int **freqs, int **power, int minfreq, int maxfreq)
 		return (-1);
 	if ((freqstr = malloc(len)) == NULL)
 		return (-1);
-	if (sysctl(levels_mib, 4, freqstr, &len, NULL, 0))
+	if (sysctl(levels_mib, 4, freqstr, &len, NULL, 0)) {
+		free(freqstr);
 		return (-1);
+	}
 
 	*numfreqs = 1;
 	for (p = freqstr; *p != '\0'; p++)
@@ -286,21 +296,28 @@ get_freq_id(int freq, int *freqs, int numfreqs)
 static void
 acline_init(void)
 {
+	int skip_source_check;
+
 	acline_mib_len = 4;
 	acline_status = SRC_UNKNOWN;
+	skip_source_check = (acline_mode_user == ac_none ||
+			     acline_mode_user == ac_acpi_devd);
 
-	if (sysctlnametomib(ACPIAC, acline_mib, &acline_mib_len) == 0) {
+	if ((skip_source_check || acline_mode_user == ac_sysctl) &&
+	    sysctlnametomib(ACPIAC, acline_mib, &acline_mib_len) == 0) {
 		acline_mode = ac_sysctl;
 		if (vflag)
 			warnx("using sysctl for AC line status");
-#if __powerpc__
-	} else if (sysctlnametomib(PMUAC, acline_mib, &acline_mib_len) == 0) {
+#ifdef __powerpc__
+	} else if ((skip_source_check || acline_mode_user == ac_sysctl) &&
+		   sysctlnametomib(PMUAC, acline_mib, &acline_mib_len) == 0) {
 		acline_mode = ac_sysctl;
 		if (vflag)
 			warnx("using sysctl for AC line status");
 #endif
 #ifdef USE_APM
-	} else if ((apm_fd = open(APMDEV, O_RDONLY)) >= 0) {
+	} else if ((skip_source_check || acline_mode_user == ac_apm) &&
+		   (apm_fd = open(APMDEV, O_RDONLY)) >= 0) {
 		if (vflag)
 			warnx("using APM for AC line status");
 		acline_mode = ac_apm;
@@ -360,7 +377,17 @@ acline_read(void)
 	}
 #endif
 	/* try to (re)connect to devd */
-	if (acline_mode == ac_sysctl) {
+#ifdef USE_APM
+	if ((acline_mode == ac_sysctl &&
+	    (acline_mode_user == ac_none ||
+	     acline_mode_user == ac_acpi_devd)) ||
+	    (acline_mode == ac_apm &&
+	     acline_mode_user == ac_acpi_devd)) {
+#else
+	if (acline_mode == ac_sysctl &&
+	    (acline_mode_user == ac_none ||
+	     acline_mode_user == ac_acpi_devd)) {
+#endif
 		struct timeval now;
 
 		gettimeofday(&now, NULL);
@@ -426,6 +453,21 @@ parse_mode(char *arg, int *mode, int ch)
 }
 
 static void
+parse_acline_mode(char *arg, int ch)
+{
+	if (strcmp(arg, "sysctl") == 0)
+		acline_mode_user = ac_sysctl;
+	else if (strcmp(arg, "devd") == 0)
+		acline_mode_user = ac_acpi_devd;
+#ifdef USE_APM
+	else if (strcmp(arg, "apm") == 0)
+		acline_mode_user = ac_apm;
+#endif
+	else
+		errx(1, "bad option: -%c %s", (char)ch, optarg);
+}
+
+static void
 handle_sigs(int __unused sig)
 {
 
@@ -437,7 +479,7 @@ usage(void)
 {
 
 	fprintf(stderr,
-"usage: powerd [-v] [-a mode] [-b mode] [-i %%] [-m freq] [-M freq] [-n mode] [-p ival] [-r %%] [-P pidfile]\n");
+"usage: powerd [-v] [-a mode] [-b mode] [-i %%] [-m freq] [-M freq] [-N] [-n mode] [-p ival] [-r %%] [-s source] [-P pidfile]\n");
 	exit(1);
 }
 
@@ -454,6 +496,7 @@ main(int argc, char * argv[])
 	int ch, mode, mode_ac, mode_battery, mode_none, idle, to;
 	uint64_t mjoules_used;
 	size_t len;
+	int nonice;
 
 	/* Default mode for all AC states is adaptive. */
 	mode_ac = mode_none = MODE_HIADAPTIVE;
@@ -463,18 +506,22 @@ main(int argc, char * argv[])
 	poll_ival = DEFAULT_POLL_INTERVAL;
 	mjoules_used = 0;
 	vflag = 0;
+	nonice = 0;
 
 	/* User must be root to control frequencies. */
 	if (geteuid() != 0)
 		errx(1, "must be root to run");
 
-	while ((ch = getopt(argc, argv, "a:b:i:m:M:n:p:P:r:v")) != -1)
+	while ((ch = getopt(argc, argv, "a:b:i:m:M:Nn:p:P:r:s:v")) != -1)
 		switch (ch) {
 		case 'a':
 			parse_mode(optarg, &mode_ac, ch);
 			break;
 		case 'b':
 			parse_mode(optarg, &mode_battery, ch);
+			break;
+		case 's':
+			parse_acline_mode(optarg, ch);
 			break;
 		case 'i':
 			cpu_idle_mark = atoi(optarg);
@@ -499,6 +546,9 @@ main(int argc, char * argv[])
 				    maxfreq);
 				usage();
 			}
+			break;
+		case 'N':
+			nonice = 1;
 			break;
 		case 'n':
 			parse_mode(optarg, &mode_none, ch);
@@ -545,7 +595,7 @@ main(int argc, char * argv[])
 		err(1, "lookup freq_levels");
 
 	/* Check if we can read the load and supported freqs. */
-	if (read_usage_times(NULL))
+	if (read_usage_times(NULL, nonice))
 		err(1, "read_usage_times");
 	if (read_freqs(&numfreqs, &freqs, &mwatts, minfreq, maxfreq))
 		err(1, "error reading supported CPU frequencies");
@@ -727,7 +777,7 @@ main(int argc, char * argv[])
 		}
 
 		/* Adaptive mode; get the current CPU usage times. */
-		if (read_usage_times(&load)) {
+		if (read_usage_times(&load, nonice)) {
 			if (vflag)
 				warn("read_usage_times() failed");
 			continue;

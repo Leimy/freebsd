@@ -5,7 +5,7 @@ SYSDIR?=	${SRCTOP}/sys
 .PATH:		${SYSDIR}/cddl/contrib/opensolaris/uts/common/dtrace
 
 KMOD=		fasttrap
-SRCS=		fasttrap.c fasttrap_isa.c opt_compat.h
+SRCS=		fasttrap.c fasttrap_isa.c
 SRCS+=		vnode_if.h
 
 CFLAGS+=	-I${SYSDIR}/cddl/compat/opensolaris \
@@ -23,8 +23,6 @@ CFLAGS+=	-I${SYSDIR}/cddl/contrib/opensolaris/uts/powerpc
 
 .PATH:		${SYSDIR}/cddl/contrib/opensolaris/common/unicode
 SRCS+=		u8_textprep.c
-
-CFLAGS+=	-DSMP
 
 .include <bsd.kmod.mk>
 

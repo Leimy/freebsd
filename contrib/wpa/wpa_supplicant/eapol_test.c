@@ -14,6 +14,8 @@
 
 #include "common.h"
 #include "utils/ext_password.h"
+#include "common/version.h"
+#include "crypto/tls.h"
 #include "config.h"
 #include "eapol_supp/eapol_supp_sm.h"
 #include "eap_peer/eap.h"
@@ -192,7 +194,7 @@ static void ieee802_1x_encapsulate_radius(struct eapol_test_data *e,
 		return;
 	}
 
-	radius_msg_make_authenticator(msg, (u8 *) e, sizeof(*e));
+	radius_msg_make_authenticator(msg);
 
 	hdr = (const struct eap_hdr *) eap;
 	pos = (const u8 *) (hdr + 1);
@@ -254,6 +256,13 @@ static void ieee802_1x_encapsulate_radius(struct eapol_test_data *e,
 	    !radius_msg_add_attr_int32(msg, RADIUS_ATTR_NAS_PORT_TYPE,
 				       RADIUS_NAS_PORT_TYPE_IEEE_802_11)) {
 		printf("Could not add NAS-Port-Type\n");
+		goto fail;
+	}
+
+	if (!find_extra_attr(e->extra_attrs, RADIUS_ATTR_SERVICE_TYPE) &&
+	    !radius_msg_add_attr_int32(msg, RADIUS_ATTR_SERVICE_TYPE,
+				       RADIUS_SERVICE_TYPE_FRAMED)) {
+		printf("Could not add Service-Type\n");
 		goto fail;
 	}
 
@@ -489,45 +498,40 @@ static void eapol_test_eap_param_needed(void *ctx, enum wpa_ctrl_req_type field,
 #endif /* CONFIG_CTRL_IFACE || !CONFIG_NO_STDOUT_DEBUG */
 
 
-static void eapol_test_cert_cb(void *ctx, int depth, const char *subject,
-			       const char *altsubject[], int num_altsubject,
-			       const char *cert_hash,
-			       const struct wpabuf *cert)
+static void eapol_test_cert_cb(void *ctx, struct tls_cert_data *cert,
+			       const char *cert_hash)
 {
 	struct eapol_test_data *e = ctx;
+	int i;
 
 	wpa_msg(e->wpa_s, MSG_INFO, WPA_EVENT_EAP_PEER_CERT
 		"depth=%d subject='%s'%s%s",
-		depth, subject,
+		cert->depth, cert->subject,
 		cert_hash ? " hash=" : "",
 		cert_hash ? cert_hash : "");
 
-	if (cert) {
+	if (cert->cert) {
 		char *cert_hex;
-		size_t len = wpabuf_len(cert) * 2 + 1;
+		size_t len = wpabuf_len(cert->cert) * 2 + 1;
 		cert_hex = os_malloc(len);
 		if (cert_hex) {
-			wpa_snprintf_hex(cert_hex, len, wpabuf_head(cert),
-					 wpabuf_len(cert));
+			wpa_snprintf_hex(cert_hex, len, wpabuf_head(cert->cert),
+					 wpabuf_len(cert->cert));
 			wpa_msg_ctrl(e->wpa_s, MSG_INFO,
 				     WPA_EVENT_EAP_PEER_CERT
 				     "depth=%d subject='%s' cert=%s",
-				     depth, subject, cert_hex);
+				     cert->depth, cert->subject, cert_hex);
 			os_free(cert_hex);
 		}
 
 		if (e->server_cert_file)
 			eapol_test_write_cert(e->server_cert_file,
-					      subject, cert);
+					      cert->subject, cert->cert);
 	}
 
-	if (altsubject) {
-		int i;
-
-		for (i = 0; i < num_altsubject; i++)
-			wpa_msg(e->wpa_s, MSG_INFO, WPA_EVENT_EAP_PEER_ALT
-				"depth=%d %s", depth, altsubject[i]);
-	}
+	for (i = 0; i < cert->num_altsubject; i++)
+		wpa_msg(e->wpa_s, MSG_INFO, WPA_EVENT_EAP_PEER_ALT
+			"depth=%d %s", cert->depth, cert->altsubject[i]);
 }
 
 
@@ -703,7 +707,8 @@ static void send_eap_request_identity(void *eloop_ctx, void *timeout_ctx)
 
 	eap = (struct eap_hdr *) (hdr + 1);
 	eap->code = EAP_CODE_REQUEST;
-	eap->identifier = 0;
+	if (os_get_random((u8 *) &eap->identifier, sizeof(eap->identifier)) < 0)
+		eap->identifier = os_random() & 0xff;
 	eap->length = htons(5);
 	pos = (u8 *) (eap + 1);
 	*pos = EAP_TYPE_IDENTITY;
@@ -1239,7 +1244,7 @@ static void eapol_test_terminate(int sig, void *signal_ctx)
 static void usage(void)
 {
 	printf("usage:\n"
-	       "eapol_test [-enWS] -c<conf> [-a<AS IP>] [-p<AS port>] "
+	       "eapol_test [-enWSv] -c<conf> [-a<AS IP>] [-p<AS port>] "
 	       "[-s<AS secret>]\\\n"
 	       "           [-r<count>] [-t<timeout>] [-C<Connect-Info>] \\\n"
 	       "           [-M<client MAC address>] [-o<server cert file] \\\n"
@@ -1264,6 +1269,7 @@ static void usage(void)
 	       "  -W = wait for a control interface monitor before starting\n"
 	       "  -S = save configuration after authentication\n"
 	       "  -n = no MPPE keys expected\n"
+	       "  -v = show version\n"
 	       "  -t<timeout> = sets timeout in seconds (default: 30 s)\n"
 	       "  -C<Connect-Info> = RADIUS Connect-Info (default: "
 	       "CONNECT 11Mbps 802.11b)\n"
@@ -1317,7 +1323,7 @@ int main(int argc, char *argv[])
 	wpa_debug_show_keys = 1;
 
 	for (;;) {
-		c = getopt(argc, argv, "a:A:c:C:ei:M:nN:o:p:P:r:R:s:St:T:W");
+		c = getopt(argc, argv, "a:A:c:C:ei:M:nN:o:p:P:r:R:s:St:T:vW");
 		if (c < 0)
 			break;
 		switch (c) {
@@ -1383,6 +1389,9 @@ int main(int argc, char *argv[])
 			ctrl_iface = optarg;
 			eapol_test.ctrl_iface = 1;
 			break;
+		case 'v':
+			printf("eapol_test v" VERSION_STR "\n");
+			return 0;
 		case 'W':
 			wait_for_monitor++;
 			break;

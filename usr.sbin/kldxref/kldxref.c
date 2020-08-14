@@ -46,6 +46,7 @@
 #include <sys/module.h>
 #define FREEBSD_ELF
 
+#include <ctype.h>
 #include <err.h>
 #include <errno.h>
 #include <fts.h>
@@ -259,6 +260,9 @@ parse_pnp_list(const char *desc, char **new_desc, pnp_list *list)
 			strncpy(key, colon + 1, semi - colon - 1);
 			key[semi - colon - 1] = '\0';
 			walker = semi + 1;
+			/* Fail safe if we have spaces after ; */
+			while (walker < ep && isspace(*walker))
+				walker++;
 		} else {
 			if (strlen(colon + 1) >= sizeof(key))
 				goto err;
@@ -420,7 +424,7 @@ parse_entry(struct mod_metadata *md, const char *cval,
 		break;
 	case MDT_PNP_INFO:
 		check(EF_SEG_READ_REL(ef, data, sizeof(pnp), &pnp));
-		check(EF_SEG_READ(ef, (Elf_Off)pnp.descr, sizeof(descr), descr));
+		check(EF_SEG_READ_STRING(ef, (Elf_Off)pnp.descr, sizeof(descr), descr));
 		descr[sizeof(descr) - 1] = '\0';
 		if (dflag) {
 			printf("  pnp info for bus %s format %s %d entries of %d bytes\n",
@@ -510,7 +514,7 @@ parse_entry(struct mod_metadata *md, const char *cval,
 							ptr = *(char **)(walker + elt->pe_offset);
 							buffer[0] = '\0';
 							if (ptr != NULL) {
-								EF_SEG_READ(ef, (Elf_Off)ptr,
+								EF_SEG_READ_STRING(ef, (Elf_Off)ptr,
 								    sizeof(buffer), buffer);
 								buffer[sizeof(buffer) - 1] = '\0';
 							}
@@ -545,9 +549,9 @@ read_kld(char *filename, char *kldname)
 {
 	struct mod_metadata md;
 	struct elf_file ef;
-	void **p, **orgp;
+	void **p;
 	int error, eftype;
-	long start, finish, entries;
+	long start, finish, entries, i;
 	char cval[MAXMODNAME + 1];
 
 	if (verbose || dflag)
@@ -571,18 +575,53 @@ read_kld(char *filename, char *kldname)
 		    &entries));
 		check(EF_SEG_READ_ENTRY_REL(&ef, start, sizeof(*p) * entries,
 		    (void *)&p));
-		orgp = p;
-		while(entries--) {
-			check(EF_SEG_READ_REL(&ef, (Elf_Off)*p, sizeof(md),
+		/*
+		 * Do a first pass to find MDT_MODULE.  It is required to be
+		 * ordered first in the output linker.hints stream because it
+		 * serves as an implicit record boundary between distinct klds
+		 * in the stream.  Other MDTs only make sense in the context of
+		 * a specific MDT_MODULE.
+		 *
+		 * Some compilers (e.g., GCC 6.4.0 xtoolchain) or binutils
+		 * (e.g., GNU binutils 2.32 objcopy/ld.bfd) can reorder
+		 * MODULE_METADATA set entries relative to the source ordering.
+		 * This is permitted by the C standard; memory layout of
+		 * file-scope objects is left implementation-defined.  There is
+		 * no requirement that source code ordering is retained.
+		 *
+		 * Handle that here by taking two passes to ensure MDT_MODULE
+		 * records are emitted to linker.hints before other MDT records
+		 * in the same kld.
+		 */
+		for (i = 0; i < entries; i++) {
+			check(EF_SEG_READ_REL(&ef, (Elf_Off)p[i], sizeof(md),
 			    &md));
-			p++;
 			check(EF_SEG_READ_STRING(&ef, (Elf_Off)md.md_cval,
 			    sizeof(cval), cval));
-			parse_entry(&md, cval, &ef, kldname);
+			if (md.md_type == MDT_MODULE) {
+				parse_entry(&md, cval, &ef, kldname);
+				break;
+			}
+		}
+		if (error != 0) {
+			warnc(error, "error while reading %s", filename);
+			break;
+		}
+
+		/*
+		 * Second pass for all !MDT_MODULE entries.
+		 */
+		for (i = 0; i < entries; i++) {
+			check(EF_SEG_READ_REL(&ef, (Elf_Off)p[i], sizeof(md),
+			    &md));
+			check(EF_SEG_READ_STRING(&ef, (Elf_Off)md.md_cval,
+			    sizeof(cval), cval));
+			if (md.md_type != MDT_MODULE)
+				parse_entry(&md, cval, &ef, kldname);
 		}
 		if (error != 0)
 			warnc(error, "error while reading %s", filename);
-		free(orgp);
+		free(p);
 	} while(0);
 	EF_CLOSE(&ef);
 	return (error);

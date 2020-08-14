@@ -57,7 +57,6 @@ __FBSDID("$FreeBSD$");
 
 #include <machine/bus.h>
 
-#include <arm/ti/ti_prcm.h>
 #include <arm/ti/usb/omap_usb.h>
 
 #include <arm/ti/omap4/pandaboard/pandaboard.h>
@@ -469,4 +468,4 @@ static driver_t ehci_driver = {
 
 static devclass_t ehci_devclass;
 
-DRIVER_MODULE(ehci, omap_uhh, ehci_driver, ehci_devclass, 0, 0);
+DRIVER_MODULE(omap_ehci, omap_uhh, ehci_driver, ehci_devclass, 0, 0);

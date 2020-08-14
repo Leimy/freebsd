@@ -21,7 +21,9 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2016 by Delphix. All rights reserved.
+ * Copyright (c) 2012, 2020 by Delphix. All rights reserved.
+ * Copyright (c) 2017, Intel Corporation.
+ * Copyright 2019 Joyent, Inc.
  */
 
 /*
@@ -33,15 +35,15 @@
  *	1. Uniquely identify this device as part of a ZFS pool and confirm its
  *	   identity within the pool.
  *
- * 	2. Verify that all the devices given in a configuration are present
+ *	2. Verify that all the devices given in a configuration are present
  *         within the pool.
  *
- * 	3. Determine the uberblock for the pool.
+ *	3. Determine the uberblock for the pool.
  *
- * 	4. In case of an import operation, determine the configuration of the
+ *	4. In case of an import operation, determine the configuration of the
  *         toplevel vdev of which it is a part.
  *
- * 	5. If an import operation cannot find all the devices in the pool,
+ *	5. If an import operation cannot find all the devices in the pool,
  *         provide enough information to the administrator to determine which
  *         devices are missing.
  *
@@ -77,9 +79,9 @@
  * In order to identify which labels are valid, the labels are written in the
  * following manner:
  *
- * 	1. For each vdev, update 'L1' to the new label
- * 	2. Update the uberblock
- * 	3. For each vdev, update 'L2' to the new label
+ *	1. For each vdev, update 'L1' to the new label
+ *	2. Update the uberblock
+ *	3. For each vdev, update 'L2' to the new label
  *
  * Given arbitrary failure, we can determine the correct label to use based on
  * the transaction group.  If we fail after updating L1 but before updating the
@@ -117,19 +119,19 @@
  *
  * The nvlist describing the pool and vdev contains the following elements:
  *
- * 	version		ZFS on-disk version
- * 	name		Pool name
- * 	state		Pool state
- * 	txg		Transaction group in which this label was written
- * 	pool_guid	Unique identifier for this pool
- * 	vdev_tree	An nvlist describing vdev tree.
+ *	version		ZFS on-disk version
+ *	name		Pool name
+ *	state		Pool state
+ *	txg		Transaction group in which this label was written
+ *	pool_guid	Unique identifier for this pool
+ *	vdev_tree	An nvlist describing vdev tree.
  *	features_for_read
  *			An nvlist of the features necessary for reading the MOS.
  *
  * Each leaf device label also contains the following:
  *
- * 	top_guid	Unique ID for top-level vdev in which this is contained
- * 	guid		Unique ID for the leaf vdev
+ *	top_guid	Unique ID for top-level vdev in which this is contained
+ *	guid		Unique ID for the leaf vdev
  *
  * The 'vs' configuration follows the format described in 'spa_config.c'.
  */
@@ -152,7 +154,7 @@
 
 static boolean_t vdev_trim_on_init = B_TRUE;
 SYSCTL_DECL(_vfs_zfs_vdev);
-SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, trim_on_init, CTLFLAG_RW,
+SYSCTL_INT(_vfs_zfs_vdev, OID_AUTO, trim_on_init, CTLFLAG_RWTUN,
     &vdev_trim_on_init, 0, "Enable/disable full vdev trim on initialisation");
 
 /*
@@ -189,8 +191,9 @@ static void
 vdev_label_read(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t offset,
     uint64_t size, zio_done_func_t *done, void *private, int flags)
 {
-	ASSERT(spa_config_held(zio->io_spa, SCL_STATE_ALL, RW_WRITER) ==
-	    SCL_STATE_ALL);
+	ASSERT(
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_READER) == SCL_STATE ||
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_WRITER) == SCL_STATE);
 	ASSERT(flags & ZIO_FLAG_CONFIG_WRITER);
 
 	zio_nowait(zio_read_phys(zio, vd,
@@ -199,20 +202,50 @@ vdev_label_read(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t offset,
 	    ZIO_PRIORITY_SYNC_READ, flags, B_TRUE));
 }
 
-static void
+void
 vdev_label_write(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t offset,
     uint64_t size, zio_done_func_t *done, void *private, int flags)
 {
-	ASSERT(spa_config_held(zio->io_spa, SCL_ALL, RW_WRITER) == SCL_ALL ||
-	    (spa_config_held(zio->io_spa, SCL_CONFIG | SCL_STATE, RW_READER) ==
-	    (SCL_CONFIG | SCL_STATE) &&
-	    dsl_pool_sync_context(spa_get_dsl(zio->io_spa))));
+	ASSERT(
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_READER) == SCL_STATE ||
+	    spa_config_held(zio->io_spa, SCL_STATE, RW_WRITER) == SCL_STATE);
 	ASSERT(flags & ZIO_FLAG_CONFIG_WRITER);
 
 	zio_nowait(zio_write_phys(zio, vd,
 	    vdev_label_offset(vd->vdev_psize, l, offset),
 	    size, buf, ZIO_CHECKSUM_LABEL, done, private,
 	    ZIO_PRIORITY_SYNC_WRITE, flags, B_TRUE));
+}
+
+static void
+root_vdev_actions_getprogress(vdev_t *vd, nvlist_t *nvl)
+{
+	spa_t *spa = vd->vdev_spa;
+
+	if (vd != spa->spa_root_vdev)
+		return;
+
+	/* provide either current or previous scan information */
+	pool_scan_stat_t ps;
+	if (spa_scan_get_stats(spa, &ps) == 0) {
+		fnvlist_add_uint64_array(nvl,
+		    ZPOOL_CONFIG_SCAN_STATS, (uint64_t *)&ps,
+		    sizeof (pool_scan_stat_t) / sizeof (uint64_t));
+	}
+
+	pool_removal_stat_t prs;
+	if (spa_removal_get_stats(spa, &prs) == 0) {
+		fnvlist_add_uint64_array(nvl,
+		    ZPOOL_CONFIG_REMOVAL_STATS, (uint64_t *)&prs,
+		    sizeof (prs) / sizeof (uint64_t));
+	}
+
+	pool_checkpoint_stat_t pcs;
+	if (spa_checkpoint_get_stats(spa, &pcs) == 0) {
+		fnvlist_add_uint64_array(nvl,
+		    ZPOOL_CONFIG_CHECKPOINT_STATS, (uint64_t *)&pcs,
+		    sizeof (pcs) / sizeof (uint64_t));
+	}
 }
 
 /*
@@ -291,6 +324,28 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_REMOVING,
 			    vd->vdev_removing);
 		}
+
+		/* zpool command expects alloc class data */
+		if (getstats && vd->vdev_alloc_bias != VDEV_BIAS_NONE) {
+			const char *bias = NULL;
+
+			switch (vd->vdev_alloc_bias) {
+			case VDEV_BIAS_LOG:
+				bias = VDEV_ALLOC_BIAS_LOG;
+				break;
+			case VDEV_BIAS_SPECIAL:
+				bias = VDEV_ALLOC_BIAS_SPECIAL;
+				break;
+			case VDEV_BIAS_DEDUP:
+				bias = VDEV_ALLOC_BIAS_DEDUP;
+				break;
+			default:
+				ASSERT3U(vd->vdev_alloc_bias, ==,
+				    VDEV_BIAS_NONE);
+			}
+			fnvlist_add_string(nv, ZPOOL_CONFIG_ALLOCATION_BIAS,
+			    bias);
+		}
 	}
 
 	if (vd->vdev_dtl_sm != NULL) {
@@ -337,20 +392,7 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 		fnvlist_add_uint64_array(nv, ZPOOL_CONFIG_VDEV_STATS,
 		    (uint64_t *)&vs, sizeof (vs) / sizeof (uint64_t));
 
-		/* provide either current or previous scan information */
-		pool_scan_stat_t ps;
-		if (spa_scan_get_stats(spa, &ps) == 0) {
-			fnvlist_add_uint64_array(nv,
-			    ZPOOL_CONFIG_SCAN_STATS, (uint64_t *)&ps,
-			    sizeof (pool_scan_stat_t) / sizeof (uint64_t));
-		}
-
-		pool_removal_stat_t prs;
-		if (spa_removal_get_stats(spa, &prs) == 0) {
-			fnvlist_add_uint64_array(nv,
-			    ZPOOL_CONFIG_REMOVAL_STATS, (uint64_t *)&prs,
-			    sizeof (prs) / sizeof (uint64_t));
-		}
+		root_vdev_actions_getprogress(vd, nv);
 
 		/*
 		 * Note: this can be called from open context
@@ -378,22 +420,33 @@ vdev_config_generate(spa_t *spa, vdev_t *vd, boolean_t getstats,
 			 * histograms.
 			 */
 			uint64_t seg_count = 0;
+			uint64_t to_alloc = vd->vdev_stat.vs_alloc;
 
 			/*
 			 * There are the same number of allocated segments
 			 * as free segments, so we will have at least one
-			 * entry per free segment.
+			 * entry per free segment.  However, small free
+			 * segments (smaller than vdev_removal_max_span)
+			 * will be combined with adjacent allocated segments
+			 * as a single mapping.
 			 */
 			for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
-				seg_count += vd->vdev_mg->mg_histogram[i];
+				if (1ULL << (i + 1) < vdev_removal_max_span) {
+					to_alloc +=
+					    vd->vdev_mg->mg_histogram[i] <<
+					    i + 1;
+				} else {
+					seg_count +=
+					    vd->vdev_mg->mg_histogram[i];
+				}
 			}
 
 			/*
-			 * The maximum length of a mapping is SPA_MAXBLOCKSIZE,
-			 * so we need at least one entry per SPA_MAXBLOCKSIZE
-			 * of allocated data.
+			 * The maximum length of a mapping is
+			 * zfs_remove_max_segment, so we need at least one entry
+			 * per zfs_remove_max_segment of allocated data.
 			 */
-			seg_count += vd->vdev_stat.vs_alloc / SPA_MAXBLOCKSIZE;
+			seg_count += to_alloc / zfs_remove_max_segment;
 
 			fnvlist_add_uint64(nv, ZPOOL_CONFIG_INDIRECT_SIZE,
 			    seg_count *
@@ -528,6 +581,7 @@ vdev_label_read_config(vdev_t *vd, uint64_t txg)
 	abd_t *vp_abd;
 	zio_t *zio;
 	uint64_t best_txg = 0;
+	uint64_t label_txg = 0;
 	int error = 0;
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
 	    ZIO_FLAG_SPECULATIVE;
@@ -553,8 +607,6 @@ retry:
 		if (zio_wait(zio) == 0 &&
 		    nvlist_unpack(vp->vp_nvlist, sizeof (vp->vp_nvlist),
 		    &label, 0) == 0) {
-			uint64_t label_txg = 0;
-
 			/*
 			 * Auxiliary vdevs won't have txg values in their
 			 * labels and newly added vdevs may not have been
@@ -583,6 +635,15 @@ retry:
 	if (config == NULL && !(flags & ZIO_FLAG_TRYHARD)) {
 		flags |= ZIO_FLAG_TRYHARD;
 		goto retry;
+	}
+
+	/*
+	 * We found a valid label but it didn't pass txg restrictions.
+	 */
+	if (config == NULL && label_txg != 0) {
+		vdev_dbgmsg(vd, "label discarded as txg is too large "
+		    "(%llu > %llu)", (u_longlong_t)label_txg,
+		    (u_longlong_t)txg);
 	}
 
 	abd_free(vp_abd);
@@ -720,7 +781,7 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	nvlist_t *label;
 	vdev_phys_t *vp;
 	abd_t *vp_abd;
-	abd_t *pad2;
+	abd_t *bootenv;
 	uberblock_t *ub;
 	abd_t *ub_abd;
 	zio_t *zio;
@@ -895,8 +956,8 @@ vdev_label_init(vdev_t *vd, uint64_t crtxg, vdev_labeltype_t reason)
 	ub->ub_txg = 0;
 
 	/* Initialize the 2nd padding area. */
-	pad2 = abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE);
-	abd_zero(pad2, VDEV_PAD_SIZE);
+	bootenv = abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE);
+	abd_zero(bootenv, VDEV_PAD_SIZE);
 
 	/*
 	 * Write everything in parallel.
@@ -915,8 +976,8 @@ retry:
 		 * Zero out the 2nd padding area where it might have
 		 * left over data from previous filesystem format.
 		 */
-		vdev_label_write(zio, vd, l, pad2,
-		    offsetof(vdev_label_t, vl_pad2),
+		vdev_label_write(zio, vd, l, bootenv,
+		    offsetof(vdev_label_t, vl_be),
 		    VDEV_PAD_SIZE, NULL, NULL, flags);
 
 		vdev_label_write(zio, vd, l, ub_abd,
@@ -932,7 +993,7 @@ retry:
 	}
 
 	nvlist_free(label);
-	abd_free(pad2);
+	abd_free(bootenv);
 	abd_free(ub_abd);
 	abd_free(vp_abd);
 
@@ -952,6 +1013,148 @@ retry:
 	    spa_l2cache_exists(vd->vdev_guid, NULL)))
 		spa_l2cache_add(vd);
 
+	return (error);
+}
+
+/*
+ * Done callback for vdev_label_read_bootenv_impl. If this is the first
+ * callback to finish, store our abd in the callback pointer. Otherwise, we
+ * just free our abd and return.
+ */
+static void
+vdev_label_read_bootenv_done(zio_t *zio)
+{
+	zio_t *rio = zio->io_private;
+	abd_t **cbp = rio->io_private;
+
+	ASSERT3U(zio->io_size, ==, VDEV_PAD_SIZE);
+
+ 	if (zio->io_error == 0) {
+		mutex_enter(&rio->io_lock);
+		if (*cbp == NULL) {
+			/* Will free this buffer in vdev_label_read_bootenv. */
+			*cbp = zio->io_abd;
+		} else {
+			abd_free(zio->io_abd);
+		}
+		mutex_exit(&rio->io_lock);
+	} else {
+		abd_free(zio->io_abd);
+	}
+}
+
+static void
+vdev_label_read_bootenv_impl(zio_t *zio, vdev_t *vd, int flags)
+{
+	for (int c = 0; c < vd->vdev_children; c++)
+		vdev_label_read_bootenv_impl(zio, vd->vdev_child[c], flags);
+
+	/*
+	 * We just use the first label that has a correct checksum; the
+	 * bootloader should have rewritten them all to be the same on boot,
+	 * and any changes we made since boot have been the same across all
+	 * labels.
+	 *
+	 * While grub supports writing to all four labels, other bootloaders
+	 * don't, so we only use the first two labels to store boot
+	 * information.
+	 */
+	if (vd->vdev_ops->vdev_op_leaf && vdev_readable(vd)) {
+		for (int l = 0; l < VDEV_LABELS / 2; l++) {
+			vdev_label_read(zio, vd, l,
+			    abd_alloc_linear(VDEV_PAD_SIZE, B_FALSE),
+			    offsetof(vdev_label_t, vl_be), VDEV_PAD_SIZE,
+			    vdev_label_read_bootenv_done, zio, flags);
+		}
+	}
+}
+
+int
+vdev_label_read_bootenv(vdev_t *rvd, nvlist_t *command)
+{
+	spa_t *spa = rvd->vdev_spa;
+	abd_t *abd = NULL;
+	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL |
+	    ZIO_FLAG_SPECULATIVE | ZIO_FLAG_TRYHARD;
+
+	ASSERT(command);
+	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+
+	zio_t *zio = zio_root(spa, NULL, &abd, flags);
+	vdev_label_read_bootenv_impl(zio, rvd, flags);
+	int err = zio_wait(zio);
+
+	if (abd != NULL) {
+		vdev_boot_envblock_t *vbe = abd_to_buf(abd);
+		if (vbe->vbe_version != VB_RAW) {
+			abd_free(abd);
+			return (SET_ERROR(ENOTSUP));
+		}
+		vbe->vbe_bootenv[sizeof (vbe->vbe_bootenv) - 1] = '\0';
+		fnvlist_add_string(command, "envmap", vbe->vbe_bootenv);
+		/* abd was allocated in vdev_label_read_bootenv_impl() */
+		abd_free(abd);
+		/* If we managed to read any successfully, return success. */
+		return (0);
+	}
+	return (err);
+}
+
+int
+vdev_label_write_bootenv(vdev_t *vd, char *envmap)
+{
+	zio_t *zio;
+	spa_t *spa = vd->vdev_spa;
+	vdev_boot_envblock_t *bootenv;
+	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL;
+	int error = ENXIO;
+
+	if (strlen(envmap) >= sizeof (bootenv->vbe_bootenv)) {
+		return (SET_ERROR(E2BIG));
+	}
+
+	ASSERT(spa_config_held(spa, SCL_ALL, RW_WRITER) == SCL_ALL);
+
+	for (int c = 0; c < vd->vdev_children; c++) {
+		int child_err = vdev_label_write_bootenv(vd->vdev_child[c],
+		    envmap);
+		/*
+		 * As long as any of the disks managed to write all of their
+		 * labels successfully, return success.
+		 */
+		if (child_err == 0)
+			error = child_err;
+	}
+
+	if (!vd->vdev_ops->vdev_op_leaf || vdev_is_dead(vd) ||
+	    !vdev_writeable(vd)) {
+		return (error);
+	}
+	ASSERT3U(sizeof (*bootenv), ==, VDEV_PAD_SIZE);
+	abd_t *abd = abd_alloc_for_io(VDEV_PAD_SIZE, B_TRUE);
+	abd_zero(abd, VDEV_PAD_SIZE);
+	bootenv = abd_borrow_buf_copy(abd, VDEV_PAD_SIZE);
+
+	char *buf = bootenv->vbe_bootenv;
+	(void) strlcpy(buf, envmap, sizeof (bootenv->vbe_bootenv));
+	bootenv->vbe_version = VB_RAW;
+	abd_return_buf_copy(abd, bootenv, VDEV_PAD_SIZE);
+
+retry:
+	zio = zio_root(spa, NULL, NULL, flags);
+	for (int l = 0; l < VDEV_LABELS / 2; l++) {
+		vdev_label_write(zio, vd, l, abd,
+		    offsetof(vdev_label_t, vl_be),
+		    VDEV_PAD_SIZE, NULL, NULL, flags);
+	}
+
+	error = zio_wait(zio);
+	if (error != 0 && !(flags & ZIO_FLAG_TRYHARD)) {
+		flags |= ZIO_FLAG_TRYHARD;
+		goto retry;
+	}
+
+	abd_free(abd);
 	return (error);
 }
 
@@ -981,7 +1184,7 @@ vdev_label_write_pad2(vdev_t *vd, const char *buf, size_t size)
 retry:
 	zio = zio_root(spa, NULL, NULL, flags);
 	vdev_label_write(zio, vd, 0, pad2,
-	    offsetof(vdev_label_t, vl_pad2),
+	    offsetof(vdev_label_t, vl_be),
 	    VDEV_PAD_SIZE, NULL, NULL, flags);
 	error = zio_wait(zio);
 	if (error != 0 && !(flags & ZIO_FLAG_TRYHARD)) {
@@ -1010,19 +1213,38 @@ retry:
  * among uberblocks with equal txg, choose the one with the latest timestamp.
  */
 static int
-vdev_uberblock_compare(uberblock_t *ub1, uberblock_t *ub2)
+vdev_uberblock_compare(const uberblock_t *ub1, const uberblock_t *ub2)
 {
-	if (ub1->ub_txg < ub2->ub_txg)
-		return (-1);
-	if (ub1->ub_txg > ub2->ub_txg)
-		return (1);
+	int cmp = AVL_CMP(ub1->ub_txg, ub2->ub_txg);
 
-	if (ub1->ub_timestamp < ub2->ub_timestamp)
-		return (-1);
-	if (ub1->ub_timestamp > ub2->ub_timestamp)
-		return (1);
+	if (likely(cmp))
+		return (cmp);
 
-	return (0);
+	cmp = AVL_CMP(ub1->ub_timestamp, ub2->ub_timestamp);
+	if (likely(cmp))
+		return (cmp);
+
+	/*
+	 * If MMP_VALID(ub) && MMP_SEQ_VALID(ub) then the host has an MMP-aware
+	 * ZFS, e.g. zfsonlinux >= 0.7.
+	 *
+	 * If one ub has MMP and the other does not, they were written by
+	 * different hosts, which matters for MMP.  So we treat no MMP/no SEQ as
+	 * a 0 value.
+	 *
+	 * Since timestamp and txg are the same if we get this far, either is
+	 * acceptable for importing the pool.
+	 */
+	unsigned int seq1 = 0;
+	unsigned int seq2 = 0;
+
+	if (MMP_VALID(ub1) && MMP_SEQ_VALID(ub1))
+		seq1 = MMP_SEQ(ub1);
+
+	if (MMP_VALID(ub2) && MMP_SEQ_VALID(ub2))
+		seq2 = MMP_SEQ(ub2);
+
+	return (AVL_CMP(seq1, seq2));
 }
 
 struct ubl_cbdata {
@@ -1149,10 +1371,13 @@ vdev_uberblock_sync_done(zio_t *zio)
  * Write the uberblock to all labels of all leaves of the specified vdev.
  */
 static void
-vdev_uberblock_sync(zio_t *zio, uberblock_t *ub, vdev_t *vd, int flags)
+vdev_uberblock_sync(zio_t *zio, uint64_t *good_writes,
+    uberblock_t *ub, vdev_t *vd, int flags)
 {
-	for (uint64_t c = 0; c < vd->vdev_children; c++)
-		vdev_uberblock_sync(zio, ub, vd->vdev_child[c], flags);
+	for (uint64_t c = 0; c < vd->vdev_children; c++) {
+		vdev_uberblock_sync(zio, good_writes,
+		    ub, vd->vdev_child[c], flags);
+	}
 
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return;
@@ -1160,7 +1385,8 @@ vdev_uberblock_sync(zio_t *zio, uberblock_t *ub, vdev_t *vd, int flags)
 	if (!vdev_writeable(vd))
 		return;
 
-	int n = ub->ub_txg & (VDEV_UBERBLOCK_COUNT(vd) - 1);
+	int m = spa_multihost(vd->vdev_spa) ? MMP_BLOCKS_PER_LABEL : 0;
+	int n = ub->ub_txg % (VDEV_UBERBLOCK_COUNT(vd) - m);
 
 	/* Copy the uberblock_t into the ABD */
 	abd_t *ub_abd = abd_alloc_for_io(VDEV_UBERBLOCK_SIZE(vd), B_TRUE);
@@ -1170,7 +1396,7 @@ vdev_uberblock_sync(zio_t *zio, uberblock_t *ub, vdev_t *vd, int flags)
 	for (int l = 0; l < VDEV_LABELS; l++)
 		vdev_label_write(zio, vd, l, ub_abd,
 		    VDEV_UBERBLOCK_OFFSET(vd, n), VDEV_UBERBLOCK_SIZE(vd),
-		    vdev_uberblock_sync_done, zio->io_private,
+		    vdev_uberblock_sync_done, good_writes,
 		    flags | ZIO_FLAG_DONT_PROPAGATE);
 
 	abd_free(ub_abd);
@@ -1184,10 +1410,10 @@ vdev_uberblock_sync_list(vdev_t **svd, int svdcount, uberblock_t *ub, int flags)
 	zio_t *zio;
 	uint64_t good_writes = 0;
 
-	zio = zio_root(spa, NULL, &good_writes, flags);
+	zio = zio_root(spa, NULL, NULL, flags);
 
 	for (int v = 0; v < svdcount; v++)
-		vdev_uberblock_sync(zio, ub, svd[v], flags);
+		vdev_uberblock_sync(zio, &good_writes, ub, svd[v], flags);
 
 	(void) zio_wait(zio);
 
@@ -1248,7 +1474,8 @@ vdev_label_sync_ignore_done(zio_t *zio)
  * Write all even or odd labels to all leaves of the specified vdev.
  */
 static void
-vdev_label_sync(zio_t *zio, vdev_t *vd, int l, uint64_t txg, int flags)
+vdev_label_sync(zio_t *zio, uint64_t *good_writes,
+    vdev_t *vd, int l, uint64_t txg, int flags)
 {
 	nvlist_t *label;
 	vdev_phys_t *vp;
@@ -1256,8 +1483,10 @@ vdev_label_sync(zio_t *zio, vdev_t *vd, int l, uint64_t txg, int flags)
 	char *buf;
 	size_t buflen;
 
-	for (int c = 0; c < vd->vdev_children; c++)
-		vdev_label_sync(zio, vd->vdev_child[c], l, txg, flags);
+	for (int c = 0; c < vd->vdev_children; c++) {
+		vdev_label_sync(zio, good_writes,
+		    vd->vdev_child[c], l, txg, flags);
+	}
 
 	if (!vd->vdev_ops->vdev_op_leaf)
 		return;
@@ -1282,7 +1511,7 @@ vdev_label_sync(zio_t *zio, vdev_t *vd, int l, uint64_t txg, int flags)
 			vdev_label_write(zio, vd, l, vp_abd,
 			    offsetof(vdev_label_t, vl_vdev_phys),
 			    sizeof (vdev_phys_t),
-			    vdev_label_sync_done, zio->io_private,
+			    vdev_label_sync_done, good_writes,
 			    flags | ZIO_FLAG_DONT_PROPAGATE);
 		}
 	}
@@ -1314,7 +1543,7 @@ vdev_label_sync_list(spa_t *spa, int l, uint64_t txg, int flags)
 		    (vd->vdev_islog || vd->vdev_aux != NULL) ?
 		    vdev_label_sync_ignore_done : vdev_label_sync_top_done,
 		    good_writes, flags);
-		vdev_label_sync(vio, vd, l, txg, flags);
+		vdev_label_sync(vio, good_writes, vd, l, txg, flags);
 		zio_nowait(vio);
 	}
 
@@ -1349,11 +1578,10 @@ vdev_config_sync(vdev_t **svd, int svdcount, uint64_t txg)
 {
 	spa_t *spa = svd[0]->vdev_spa;
 	uberblock_t *ub = &spa->spa_uberblock;
-	vdev_t *vd;
-	zio_t *zio;
 	int error = 0;
 	int flags = ZIO_FLAG_CONFIG_WRITER | ZIO_FLAG_CANFAIL;
 
+	ASSERT(svdcount != 0);
 retry:
 	/*
 	 * Normally, we don't want to try too hard to write every label and
@@ -1376,10 +1604,13 @@ retry:
 	 * and the vdev configuration hasn't changed,
 	 * then there's nothing to do.
 	 */
-	if (ub->ub_txg < txg &&
-	    uberblock_update(ub, spa->spa_root_vdev, txg) == B_FALSE &&
-	    list_is_empty(&spa->spa_config_dirty_list))
-		return (0);
+	if (ub->ub_txg < txg) {
+		boolean_t changed = uberblock_update(ub, spa->spa_root_vdev,
+		    txg, spa->spa_mmp.mmp_delay);
+
+		if (!changed && list_is_empty(&spa->spa_config_dirty_list))
+			return (0);
+	}
 
 	if (txg > spa_freeze_txg(spa))
 		return (0);
@@ -1392,9 +1623,10 @@ retry:
 	 * written in this txg will be committed to stable storage
 	 * before any uberblock that references them.
 	 */
-	zio = zio_root(spa, NULL, NULL, flags);
+	zio_t *zio = zio_root(spa, NULL, NULL, flags);
 
-	for (vd = txg_list_head(&spa->spa_vdev_txg_list, TXG_CLEAN(txg)); vd;
+	for (vdev_t *vd =
+	    txg_list_head(&spa->spa_vdev_txg_list, TXG_CLEAN(txg)); vd != NULL;
 	    vd = txg_list_next(&spa->spa_vdev_txg_list, vd, TXG_CLEAN(txg)))
 		zio_flush(zio, vd);
 
@@ -1409,8 +1641,14 @@ retry:
 	 * the new labels to disk to ensure that all even-label updates
 	 * are committed to stable storage before the uberblock update.
 	 */
-	if ((error = vdev_label_sync_list(spa, 0, txg, flags)) != 0)
+	if ((error = vdev_label_sync_list(spa, 0, txg, flags)) != 0) {
+		if ((flags & ZIO_FLAG_TRYHARD) != 0) {
+			zfs_dbgmsg("vdev_label_sync_list() returned error %d "
+			    "for pool '%s' when syncing out the even labels "
+			    "of dirty vdevs", error, spa_name(spa));
+		}
 		goto retry;
+	}
 
 	/*
 	 * Sync the uberblocks to all vdevs in svd[].
@@ -1427,8 +1665,16 @@ retry:
 	 *	been successfully committed) will be valid with respect
 	 *	to the new uberblocks.
 	 */
-	if ((error = vdev_uberblock_sync_list(svd, svdcount, ub, flags)) != 0)
+	if ((error = vdev_uberblock_sync_list(svd, svdcount, ub, flags)) != 0) {
+		if ((flags & ZIO_FLAG_TRYHARD) != 0) {
+			zfs_dbgmsg("vdev_uberblock_sync_list() returned error "
+			    "%d for pool '%s'", error, spa_name(spa));
+		}
 		goto retry;
+	}
+
+	if (spa_multihost(spa))
+		mmp_update_uberblock(spa, ub);
 
 	/*
 	 * Sync out odd labels for every dirty vdev.  If the system dies
@@ -1440,8 +1686,14 @@ retry:
 	 * to disk to ensure that all odd-label updates are committed to
 	 * stable storage before the next transaction group begins.
 	 */
-	if ((error = vdev_label_sync_list(spa, 1, txg, flags)) != 0)
+	if ((error = vdev_label_sync_list(spa, 1, txg, flags)) != 0) {
+		if ((flags & ZIO_FLAG_TRYHARD) != 0) {
+			zfs_dbgmsg("vdev_label_sync_list() returned error %d "
+			    "for pool '%s' when syncing out the odd labels of "
+			    "dirty vdevs", error, spa_name(spa));
+		}
 		goto retry;;
+	}
 
 	trim_thread_wakeup(spa);
 

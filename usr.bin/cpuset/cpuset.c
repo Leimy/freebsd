@@ -42,6 +42,7 @@ __FBSDID("$FreeBSD$");
 #include <ctype.h>
 #include <err.h>
 #include <errno.h>
+#include <jail.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,10 +80,11 @@ static struct numa_policy policies[] = {
 	{ "first-touch", DOMAINSET_POLICY_FIRSTTOUCH },
 	{ "ft", DOMAINSET_POLICY_FIRSTTOUCH },
 	{ "prefer", DOMAINSET_POLICY_PREFER },
+	{ "interleave", DOMAINSET_POLICY_INTERLEAVE},
+	{ "il", DOMAINSET_POLICY_INTERLEAVE},
 	{ NULL, DOMAINSET_POLICY_INVALID }
 };
 
-BITSET_DEFINE(bitset, 1);
 static void printset(struct bitset *mask, int size);
 
 static void
@@ -98,10 +100,10 @@ parselist(char *list, struct bitset *mask, int size)
 	for (l = list; *l != '\0';) {
 		if (isdigit(*l)) {
 			curnum = atoi(l);
-			if (curnum > size)
+			if (curnum >= size)
 				errx(EXIT_FAILURE,
 				    "List entry %d exceeds maximum of %d",
-				    curnum, size);
+				    curnum, size - 1);
 			while (isdigit(*l))
 				l++;
 			switch (state) {
@@ -237,7 +239,7 @@ static const char *whichnames[] = { NULL, "tid", "pid", "cpuset", "irq", "jail",
 				    "domain" };
 static const char *levelnames[] = { NULL, " root", " cpuset", "" };
 static const char *policynames[] = { "invalid", "round-robin", "first-touch",
-				    "prefer" };
+				    "prefer", "interleave" };
 
 static void
 printaffinity(void)
@@ -319,7 +321,9 @@ main(int argc, char *argv[])
 		case 'j':
 			jflag = 1;
 			which = CPU_WHICH_JAIL;
-			id = atoi(optarg);
+			id = jail_getid(optarg);
+			if (id < 0)
+				errx(EXIT_FAILURE, "%s", jail_errmsg);
 			break;
 		case 'l':
 			lflag = 1;

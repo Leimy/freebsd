@@ -39,11 +39,6 @@
 #ifndef _NETIPSEC_IPSEC_H_
 #define _NETIPSEC_IPSEC_H_
 
-#if defined(_KERNEL) && !defined(_LKM) && !defined(KLD_MODULE)
-#include "opt_inet.h"
-#include "opt_ipsec.h"
-#endif
-
 #include <net/pfkeyv2.h>
 #include <netipsec/keydb.h>
 
@@ -219,8 +214,9 @@ struct ipsecstat {
 	uint64_t ips_out_inval;		/* output: generic error */
 	uint64_t ips_out_bundlesa;	/* output: bundled SA processed */
 
-	uint64_t ips_mbcoalesced;	/* mbufs coalesced during clone */
-	uint64_t ips_clcoalesced;	/* clusters coalesced during clone */
+	uint64_t ips_spdcache_hits;	/* SPD cache hits */
+	uint64_t ips_spdcache_misses;	/* SPD cache misses */
+
 	uint64_t ips_clcopied;		/* clusters copied during clone */
 	uint64_t ips_mbinserted;	/* mbufs inserted during makespace */
 	/* 
@@ -331,7 +327,7 @@ int udp_ipsec_pcbctl(struct inpcb *, struct sockopt *);
 
 int ipsec_chkreplay(uint32_t, struct secasvar *);
 int ipsec_updatereplay(uint32_t, struct secasvar *);
-int ipsec_updateid(struct secasvar *, uint64_t *, uint64_t *);
+int ipsec_updateid(struct secasvar *, crypto_session_t *, crypto_session_t *);
 int ipsec_initialized(void);
 
 void ipsec_setspidx_inpcb(struct inpcb *, struct secpolicyindex *, u_int);

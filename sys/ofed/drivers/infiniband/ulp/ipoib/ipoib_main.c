@@ -34,7 +34,11 @@
  * SOFTWARE.
  */
 
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
+
 #include "ipoib.h"
+#include <sys/eventhandler.h>
 
 static	int ipoib_resolvemulti(struct ifnet *, struct sockaddr **,
 		struct sockaddr *);
@@ -50,6 +54,8 @@ static	int ipoib_resolvemulti(struct ifnet *, struct sockaddr **,
 #include <linux/if_vlan.h>
 #include <net/ip.h>
 #include <net/ipv6.h>
+
+#include <rdma/ib_cache.h>
 
 MODULE_AUTHOR("Roland Dreier");
 MODULE_DESCRIPTION("IP-over-InfiniBand net driver");
@@ -87,6 +93,10 @@ struct ib_sa_client ipoib_sa_client;
 
 static void ipoib_add_one(struct ib_device *device);
 static void ipoib_remove_one(struct ib_device *device, void *client_data);
+static struct net_device *ipoib_get_net_dev_by_params(
+		struct ib_device *dev, u8 port, u16 pkey,
+		const union ib_gid *gid, const struct sockaddr *addr,
+		void *client_data);
 static void ipoib_start(struct ifnet *dev);
 static int ipoib_output(struct ifnet *ifp, struct mbuf *m,
 	    const struct sockaddr *dst, struct route *ro);
@@ -160,7 +170,8 @@ ipoib_mtap_proto(struct ifnet *ifp, struct mbuf *mb, uint16_t proto)
 static struct ib_client ipoib_client = {
 	.name   = "ipoib",
 	.add    = ipoib_add_one,
-	.remove = ipoib_remove_one
+	.remove = ipoib_remove_one,
+	.get_net_dev_by_params = ipoib_get_net_dev_by_params,
 };
 
 int
@@ -247,10 +258,34 @@ ipoib_stop(struct ipoib_dev_priv *priv)
 	return 0;
 }
 
-int
-ipoib_change_mtu(struct ipoib_dev_priv *priv, int new_mtu)
+static int
+ipoib_propagate_ifnet_mtu(struct ipoib_dev_priv *priv, int new_mtu,
+    bool propagate)
 {
-	struct ifnet *dev = priv->dev;
+	struct ifnet *ifp;
+	struct ifreq ifr;
+	int error;
+
+	ifp = priv->dev;
+	if (ifp->if_mtu == new_mtu)
+		return (0);
+	if (propagate) {
+		strlcpy(ifr.ifr_name, if_name(ifp), IFNAMSIZ);
+		ifr.ifr_mtu = new_mtu;
+		CURVNET_SET(ifp->if_vnet);
+		error = ifhwioctl(SIOCSIFMTU, ifp, (caddr_t)&ifr, curthread);
+		CURVNET_RESTORE();
+	} else {
+		ifp->if_mtu = new_mtu;
+		error = 0;
+	}
+	return (error);
+}
+
+int
+ipoib_change_mtu(struct ipoib_dev_priv *priv, int new_mtu, bool propagate)
+{
+	int error, prev_admin_mtu;
 
 	/* dev->if_mtu > 2K ==> connected mode */
 	if (ipoib_cm_admin_enabled(priv)) {
@@ -261,20 +296,23 @@ ipoib_change_mtu(struct ipoib_dev_priv *priv, int new_mtu)
 			ipoib_warn(priv, "mtu > %d will cause multicast packet drops.\n",
 				   priv->mcast_mtu);
 
-		dev->if_mtu = new_mtu;
-		return 0;
+		return (ipoib_propagate_ifnet_mtu(priv, new_mtu, propagate));
 	}
 
 	if (new_mtu > IPOIB_UD_MTU(priv->max_ib_mtu))
 		return -EINVAL;
 
+	prev_admin_mtu = priv->admin_mtu;
 	priv->admin_mtu = new_mtu;
-
-	dev->if_mtu = min(priv->mcast_mtu, priv->admin_mtu);
-
-	queue_work(ipoib_workqueue, &priv->flush_light);
-
-	return 0;
+	error = ipoib_propagate_ifnet_mtu(priv, min(priv->mcast_mtu,
+	    priv->admin_mtu), propagate);
+	if (error == 0) {
+		/* check for MTU change to avoid infinite loop */
+		if (prev_admin_mtu != new_mtu)
+			queue_work(ipoib_workqueue, &priv->flush_light);
+	} else
+		priv->admin_mtu = prev_admin_mtu;
+	return (error);
 }
 
 static int
@@ -320,20 +358,15 @@ ipoib_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 		break;
 
 	case SIOCGIFADDR:
-		{
-			struct sockaddr *sa;
-
-			sa = (struct sockaddr *) & ifr->ifr_data;
-			bcopy(IF_LLADDR(ifp),
-			      (caddr_t) sa->sa_data, INFINIBAND_ALEN);
-		}
+			bcopy(IF_LLADDR(ifp), &ifr->ifr_addr.sa_data[0],
+                            INFINIBAND_ALEN);
 		break;
 
 	case SIOCSIFMTU:
 		/*
 		 * Set the interface MTU.
 		 */
-		error = -ipoib_change_mtu(priv, ifr->ifr_mtu);
+		error = -ipoib_change_mtu(priv, ifr->ifr_mtu, false);
 		break;
 	default:
 		error = EINVAL;
@@ -522,6 +555,7 @@ path_rec_completion(int status, struct ib_sa_path_rec *pathrec, void *path_ptr)
 	struct ifnet *dev = priv->dev;
 	struct ipoib_ah *ah = NULL;
 	struct ipoib_ah *old_ah = NULL;
+	struct epoch_tracker et;
 	struct ifqueue mbqueue;
 	struct mbuf *mb;
 	unsigned long flags;
@@ -576,6 +610,7 @@ path_rec_completion(int status, struct ib_sa_path_rec *pathrec, void *path_ptr)
 	if (old_ah)
 		ipoib_put_ah(old_ah);
 
+	NET_EPOCH_ENTER(et);
 	for (;;) {
 		_IF_DEQUEUE(&mbqueue, mb);
 		if (mb == NULL)
@@ -585,6 +620,7 @@ path_rec_completion(int status, struct ib_sa_path_rec *pathrec, void *path_ptr)
 			ipoib_warn(priv, "dev_queue_xmit failed "
 				   "to requeue packet\n");
 	}
+	NET_EPOCH_EXIT(et);
 }
 
 static struct ipoib_path *
@@ -695,7 +731,6 @@ ipoib_unicast_send(struct mbuf *mb, struct ipoib_dev_priv *priv, struct ipoib_he
 			}
 
 			if (!path->query && path_rec_start(priv, path)) {
-				spin_unlock_irqrestore(&priv->lock, flags);
 				if (new_path)
 					ipoib_path_free(priv, path);
 				return;
@@ -740,17 +775,13 @@ ipoib_send_one(struct ipoib_dev_priv *priv, struct mbuf *mb)
 	return 0;
 }
 
-
-static void
-_ipoib_start(struct ifnet *dev, struct ipoib_dev_priv *priv)
+void
+ipoib_start_locked(struct ifnet *dev, struct ipoib_dev_priv *priv)
 {
 	struct mbuf *mb;
 
-	if ((dev->if_drv_flags & (IFF_DRV_RUNNING|IFF_DRV_OACTIVE)) !=
-	    IFF_DRV_RUNNING)
-		return;
+	assert_spin_locked(&priv->lock);
 
-	spin_lock(&priv->lock);
 	while (!IFQ_DRV_IS_EMPTY(&dev->if_snd) &&
 	    (dev->if_drv_flags & IFF_DRV_OACTIVE) == 0) {
 		IFQ_DRV_DEQUEUE(&dev->if_snd, mb);
@@ -759,6 +790,18 @@ _ipoib_start(struct ifnet *dev, struct ipoib_dev_priv *priv)
 		IPOIB_MTAP(dev, mb);
 		ipoib_send_one(priv, mb);
 	}
+}
+
+static void
+_ipoib_start(struct ifnet *dev, struct ipoib_dev_priv *priv)
+{
+
+	if ((dev->if_drv_flags & (IFF_DRV_RUNNING|IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING)
+		return;
+
+	spin_lock(&priv->lock);
+	ipoib_start_locked(dev, priv);
 	spin_unlock(&priv->lock);
 }
 
@@ -1115,18 +1158,172 @@ ipoib_remove_one(struct ib_device *device, void *client_data)
 	kfree(dev_list);
 }
 
+static int
+ipoib_match_dev_addr(const struct sockaddr *addr, struct net_device *dev)
+{
+	struct epoch_tracker et;
+	struct ifaddr *ifa;
+	int retval = 0;
+
+	CURVNET_SET(dev->if_vnet);
+	NET_EPOCH_ENTER(et);
+	CK_STAILQ_FOREACH(ifa, &dev->if_addrhead, ifa_link) {
+		if (ifa->ifa_addr == NULL ||
+		    ifa->ifa_addr->sa_family != addr->sa_family ||
+		    ifa->ifa_addr->sa_len != addr->sa_len) {
+			continue;
+		}
+		if (memcmp(ifa->ifa_addr, addr, addr->sa_len) == 0) {
+			retval = 1;
+			break;
+		}
+	}
+	NET_EPOCH_EXIT(et);
+	CURVNET_RESTORE();
+
+	return (retval);
+}
+
+/*
+ * ipoib_match_gid_pkey_addr - returns the number of IPoIB netdevs on
+ * top a given ipoib device matching a pkey_index and address, if one
+ * exists.
+ *
+ * @found_net_dev: contains a matching net_device if the return value
+ * >= 1, with a reference held.
+ */
+static int
+ipoib_match_gid_pkey_addr(struct ipoib_dev_priv *priv,
+    const union ib_gid *gid, u16 pkey_index, const struct sockaddr *addr,
+    struct net_device **found_net_dev)
+{
+	struct ipoib_dev_priv *child_priv;
+	int matches = 0;
+
+	if (priv->pkey_index == pkey_index &&
+	    (!gid || !memcmp(gid, &priv->local_gid, sizeof(*gid)))) {
+		if (addr == NULL || ipoib_match_dev_addr(addr, priv->dev) != 0) {
+			if (*found_net_dev == NULL) {
+				struct net_device *net_dev;
+
+				if (priv->parent != NULL)
+					net_dev = priv->parent;
+				else
+					net_dev = priv->dev;
+				*found_net_dev = net_dev;
+				dev_hold(net_dev);
+			}
+			matches++;
+		}
+	}
+
+	/* Check child interfaces */
+	mutex_lock(&priv->vlan_mutex);
+	list_for_each_entry(child_priv, &priv->child_intfs, list) {
+		matches += ipoib_match_gid_pkey_addr(child_priv, gid,
+		    pkey_index, addr, found_net_dev);
+		if (matches > 1)
+			break;
+	}
+	mutex_unlock(&priv->vlan_mutex);
+
+	return matches;
+}
+
+/*
+ * __ipoib_get_net_dev_by_params - returns the number of matching
+ * net_devs found (between 0 and 2). Also return the matching
+ * net_device in the @net_dev parameter, holding a reference to the
+ * net_device, if the number of matches >= 1
+ */
+static int
+__ipoib_get_net_dev_by_params(struct list_head *dev_list, u8 port,
+    u16 pkey_index, const union ib_gid *gid,
+    const struct sockaddr *addr, struct net_device **net_dev)
+{
+	struct ipoib_dev_priv *priv;
+	int matches = 0;
+
+	*net_dev = NULL;
+
+	list_for_each_entry(priv, dev_list, list) {
+		if (priv->port != port)
+			continue;
+
+		matches += ipoib_match_gid_pkey_addr(priv, gid, pkey_index,
+		    addr, net_dev);
+
+		if (matches > 1)
+			break;
+	}
+
+	return matches;
+}
+
+static struct net_device *
+ipoib_get_net_dev_by_params(struct ib_device *dev, u8 port, u16 pkey,
+    const union ib_gid *gid, const struct sockaddr *addr, void *client_data)
+{
+	struct net_device *net_dev;
+	struct list_head *dev_list = client_data;
+	u16 pkey_index;
+	int matches;
+	int ret;
+
+	if (!rdma_protocol_ib(dev, port))
+		return NULL;
+
+	ret = ib_find_cached_pkey(dev, port, pkey, &pkey_index);
+	if (ret)
+		return NULL;
+
+	if (!dev_list)
+		return NULL;
+
+	/* See if we can find a unique device matching the L2 parameters */
+	matches = __ipoib_get_net_dev_by_params(dev_list, port, pkey_index,
+						gid, NULL, &net_dev);
+
+	switch (matches) {
+	case 0:
+		return NULL;
+	case 1:
+		return net_dev;
+	}
+
+	dev_put(net_dev);
+
+	/* Couldn't find a unique device with L2 parameters only. Use L3
+	 * address to uniquely match the net device */
+	matches = __ipoib_get_net_dev_by_params(dev_list, port, pkey_index,
+						gid, addr, &net_dev);
+	switch (matches) {
+	case 0:
+		return NULL;
+	default:
+		dev_warn_ratelimited(&dev->dev,
+				     "duplicate IP address detected\n");
+		/* Fall through */
+	case 1:
+		return net_dev;
+	}
+}
+
 static void
 ipoib_config_vlan(void *arg, struct ifnet *ifp, u_int16_t vtag)
 {
 	struct ipoib_dev_priv *parent;
 	struct ipoib_dev_priv *priv;
+	struct epoch_tracker et;
 	struct ifnet *dev;
 	uint16_t pkey;
 	int error;
 
 	if (ifp->if_type != IFT_INFINIBAND)
 		return;
+	NET_EPOCH_ENTER(et);
 	dev = VLAN_DEVAT(ifp, vtag);
+	NET_EPOCH_EXIT(et);
 	if (dev == NULL)
 		return;
 	priv = NULL;
@@ -1188,13 +1385,16 @@ ipoib_unconfig_vlan(void *arg, struct ifnet *ifp, u_int16_t vtag)
 {
 	struct ipoib_dev_priv *parent;
 	struct ipoib_dev_priv *priv;
+	struct epoch_tracker et;
 	struct ifnet *dev;
 	uint16_t pkey;
 
 	if (ifp->if_type != IFT_INFINIBAND)
 		return;
 
+	NET_EPOCH_ENTER(et);
 	dev = VLAN_DEVAT(ifp, vtag);
+	NET_EPOCH_EXIT(et);
 	if (dev)
 		VLAN_SETCOOKIE(dev, NULL);
 	pkey = vtag | 0x8000;
@@ -1290,6 +1490,8 @@ ipoib_output(struct ifnet *ifp, struct mbuf *m,
 	struct ipoib_header *eh;
 	int error = 0, is_gw = 0;
 	short type;
+
+	NET_EPOCH_ASSERT();
 
 	if (ro != NULL)
 		is_gw = (ro->ro_flags & RT_HAS_GW) != 0;
@@ -1399,6 +1601,7 @@ bad:
 void
 ipoib_demux(struct ifnet *ifp, struct mbuf *m, u_short proto)
 {
+	struct epoch_tracker et;
 	int isr;
 
 #ifdef MAC
@@ -1440,7 +1643,9 @@ ipoib_demux(struct ifnet *ifp, struct mbuf *m, u_short proto)
 	default:
 		goto discard;
 	}
+	NET_EPOCH_ENTER(et);
 	netisr_dispatch(isr, m);
+	NET_EPOCH_EXIT(et);
 	return;
 
 discard:
@@ -1548,18 +1753,18 @@ ipoib_resolvemulti(struct ifnet *ifp, struct sockaddr **llsa,
 	}
 }
 
-module_init(ipoib_init_module);
-module_exit(ipoib_cleanup_module);
+module_init_order(ipoib_init_module, SI_ORDER_FIFTH);
+module_exit_order(ipoib_cleanup_module, SI_ORDER_FIFTH);
 
 static int
 ipoib_evhand(module_t mod, int event, void *arg)
 {
-	                return (0);
+	return (0);
 }
 
 static moduledata_t ipoib_mod = {
-	                .name = "ipoib",
-			                .evhand = ipoib_evhand,
+	.name = "ipoib",
+	.evhand = ipoib_evhand,
 };
 
 DECLARE_MODULE(ipoib, ipoib_mod, SI_SUB_LAST, SI_ORDER_ANY);

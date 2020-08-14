@@ -79,13 +79,13 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/ioccom.h>
 #include <sys/filio.h>
-#include <sys/tty.h>
 #include <sys/mouse.h>
 
 #ifdef USB_DEBUG
 static int ums_debug = 0;
 
-static SYSCTL_NODE(_hw_usb, OID_AUTO, ums, CTLFLAG_RW, 0, "USB ums");
+static SYSCTL_NODE(_hw_usb, OID_AUTO, ums, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "USB ums");
 SYSCTL_INT(_hw_usb_ums, OID_AUTO, debug, CTLFLAG_RWTUN,
     &ums_debug, 0, "Debug level");
 #endif
@@ -751,9 +751,10 @@ ums_attach(device_t dev)
 
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
-	    OID_AUTO, "parseinfo", CTLTYPE_STRING|CTLFLAG_RD,
-	    sc, 0, ums_sysctl_handler_parseinfo,
-	    "", "Dump of parsed HID report descriptor");
+	    OID_AUTO, "parseinfo",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, 0, ums_sysctl_handler_parseinfo, "",
+	    "Dump of parsed HID report descriptor");
 
 	return (0);
 
@@ -950,9 +951,9 @@ ums_reset_buf(struct ums_softc *sc)
 
 #ifdef EVDEV_SUPPORT
 static int
-ums_ev_open(struct evdev_dev *evdev, void *ev_softc)
+ums_ev_open(struct evdev_dev *evdev)
 {
-	struct ums_softc *sc = (struct ums_softc *)ev_softc;
+	struct ums_softc *sc = evdev_get_softc(evdev);
 
 	mtx_assert(&sc->sc_mtx, MA_OWNED);
 
@@ -966,10 +967,10 @@ ums_ev_open(struct evdev_dev *evdev, void *ev_softc)
 	return (0);
 }
 
-static void
-ums_ev_close(struct evdev_dev *evdev, void *ev_softc)
+static int
+ums_ev_close(struct evdev_dev *evdev)
 {
-	struct ums_softc *sc = (struct ums_softc *)ev_softc;
+	struct ums_softc *sc = evdev_get_softc(evdev);
 
 	mtx_assert(&sc->sc_mtx, MA_OWNED);
 
@@ -977,6 +978,8 @@ ums_ev_close(struct evdev_dev *evdev, void *ev_softc)
 
 	if (sc->sc_fflags == 0)
 		ums_stop_rx(sc);
+
+	return (0);
 }
 #endif
 

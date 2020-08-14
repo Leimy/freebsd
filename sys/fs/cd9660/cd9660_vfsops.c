@@ -101,16 +101,14 @@ static int
 cd9660_cmount(struct mntarg *ma, void *data, uint64_t flags)
 {
 	struct iso_args args;
-	struct export_args exp;
 	int error;
 
 	error = copyin(data, &args, sizeof args);
 	if (error)
 		return (error);
-	vfs_oexport_conv(&args.export, &exp);
 
 	ma = mount_argsu(ma, "from", args.fspec, MAXPATHLEN);
-	ma = mount_arg(ma, "export", &exp, sizeof(exp));
+	ma = mount_arg(ma, "export", &args.export, sizeof(args.export));
 	ma = mount_argsu(ma, "cs_disk", args.cs_disk, 64);
 	ma = mount_argsu(ma, "cs_local", args.cs_local, 64);
 	ma = mount_argf(ma, "ssector", "%u", args.ssector);
@@ -235,7 +233,7 @@ iso_mountfs(devvp, mp)
 	if (error == 0)
 		g_getattr("MNT::verified", cp, &isverified);
 	g_topology_unlock();
-	VOP_UNLOCK(devvp, 0);
+	VOP_UNLOCK(devvp);
 	if (error)
 		goto out;
 	if (devvp->v_rdev->si_iosize_max != 0)
@@ -363,7 +361,7 @@ iso_mountfs(devvp, mp)
 	 * filehandle validation.
 	 */
 	isomp->volume_space_size += ssector;
-	bcopy (rootp, isomp->root, sizeof isomp->root);
+	memcpy(isomp->root, rootp, sizeof isomp->root);
 	isomp->root_extent = isonum_733 (rootp->extent);
 	isomp->root_size = isonum_733 (rootp->size);
 
@@ -465,7 +463,7 @@ iso_mountfs(devvp, mp)
 			    joliet_level);
 		rootp = (struct iso_directory_record *)
 			sup->root_directory_record;
-		bcopy (rootp, isomp->root, sizeof isomp->root);
+		memcpy(isomp->root, rootp, sizeof isomp->root);
 		isomp->root_extent = isonum_733 (rootp->extent);
 		isomp->root_size = isonum_733 (rootp->size);
 		isomp->joliet_level = joliet_level;
@@ -753,7 +751,6 @@ cd9660_vget_internal(mp, ino, flags, vpp, relocated, isodir)
 			      imp->logical_block_size, NOCRED, &bp);
 		if (error) {
 			vput(vp);
-			brelse(bp);
 			printf("fhtovp: bread error %d\n",error);
 			return (error);
 		}

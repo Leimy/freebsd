@@ -86,7 +86,7 @@ __FBSDID("$FreeBSD$");
 static char da[] = "da";
 
 enum x_stats { X_SUM, X_HZ, X_STATHZ, X_NCHSTATS, X_INTRNAMES, X_SINTRNAMES,
-    X_INTRCNT, X_SINTRCNT, X_DEFICIT, X_REC, X_PGIN, X_XSTATS };
+    X_INTRCNT, X_SINTRCNT, X_NINTRCNT };
 
 static struct nlist namelist[] = {
 	[X_SUM] = { .n_name = "_vm_cnt", },
@@ -97,12 +97,7 @@ static struct nlist namelist[] = {
 	[X_SINTRNAMES] = { .n_name = "_sintrnames", },
 	[X_INTRCNT] = { .n_name = "_intrcnt", },
 	[X_SINTRCNT] = { .n_name = "_sintrcnt", },
-#ifdef notyet
-	[X_DEFICIT] = { .n_name = "_deficit", },
-	[X_REC] = { .n_name = "_rectime", },
-	[X_PGIN] = { .n_name = "_pgintime", },
-	[X_XSTATS] = { .n_name = "_xstats", },
-#endif
+	[X_NINTRCNT] = { .n_name = "_nintrcnt", },
 	{ .n_name = NULL, },
 };
 
@@ -161,6 +156,7 @@ static struct __vmmeter {
 	u_int v_free_min;
 	u_int v_free_count;
 	u_int v_wire_count;
+	u_long v_user_wire_count;
 	u_int v_active_count;
 	u_int v_inactive_target;
 	u_int v_inactive_count;
@@ -202,6 +198,7 @@ static void	domemstat_malloc(void);
 static void	domemstat_zone(void);
 static void	kread(int, void *, size_t);
 static void	kreado(int, void *, size_t, size_t);
+static void	kreadptr(uintptr_t, void *, size_t);
 static void	needhdr(int);
 static void	needresize(int);
 static void	doresize(void);
@@ -218,7 +215,8 @@ main(int argc, char *argv[])
 {
 	char *bp, *buf, *memf, *nlistf;
 	float f;
-	int bufsize, c, len, reps, todo;
+	int bufsize, c, reps, todo;
+	size_t len;
 	unsigned int interval;
 	char errbuf[_POSIX2_LINE_MAX];
 
@@ -231,7 +229,7 @@ main(int argc, char *argv[])
 	if (argc < 0)
 		return (argc);
 
-	while ((c = getopt(argc, argv, "ac:fhHiM:mN:n:oPp:stw:z")) != -1) {
+	while ((c = getopt(argc, argv, "ac:fhHiM:mN:n:oPp:sw:z")) != -1) {
 		switch (c) {
 		case 'a':
 			aflag++;
@@ -281,14 +279,6 @@ main(int argc, char *argv[])
 		case 's':
 			todo |= SUMSTAT;
 			break;
-		case 't':
-#ifdef notyet
-			todo |= TIMESTAT;
-#else
-			xo_errx(EX_USAGE,
-			    "sorry, -t is not (re)implemented yet");
-#endif
-			break;
 		case 'w':
 			/* Convert to milliseconds. */
 			f = atof(optarg);
@@ -318,7 +308,8 @@ main(int argc, char *argv[])
 retry_nlist:
 	if (kd != NULL && (c = kvm_nlist(kd, namelist)) != 0) {
 		if (c > 0) {
-			bufsize = 0, len = 0;
+			bufsize = 0;
+			len = 0;
 
 			/*
 			 * 'cnt' was renamed to 'vm_cnt'.  If 'vm_cnt' is not
@@ -329,6 +320,13 @@ retry_nlist:
 				namelist[X_SUM].n_name = "_cnt";
 				goto retry_nlist;
 			}
+
+			/*
+			 * 'nintrcnt' doesn't exist in older kernels, but
+			 * that isn't fatal.
+			 */
+			if (namelist[X_NINTRCNT].n_type == 0 && c == 1)
+				goto nlist_ok;
 
 			for (c = 0; c < (int)(nitems(namelist)); c++)
 				if (namelist[c].n_type == 0)
@@ -353,6 +351,7 @@ retry_nlist:
 		xo_finish();
 		exit(1);
 	}
+nlist_ok:
 	if (kd && Pflag)
 		xo_errx(1, "Cannot use -P with crash dumps");
 
@@ -392,10 +391,6 @@ retry_nlist:
 		dosum();
 	if (todo & OBJSTAT)
 		doobjstat();
-#ifdef notyet
-	if (todo & TIMESTAT)
-		dotimes();
-#endif
 	if (todo & INTRSTAT)
 		dointr(interval, reps);
 	if (todo & VMSTAT)
@@ -436,8 +431,11 @@ getdrivedata(char **argv)
 		if (isdigit(**argv))
 			break;
 		num_devices_specified++;
-		specified_devices = realloc(specified_devices,
+		specified_devices = reallocf(specified_devices,
 		    sizeof(char *) * num_devices_specified);
+		if (specified_devices == NULL) {
+			xo_errx(1, "%s", "reallocf (specified_devices)");
+		}
 		specified_devices[num_devices_specified - 1] = *argv;
 	}
 	dev_select = NULL;
@@ -569,6 +567,7 @@ fill_vmmeter(struct __vmmeter *vmmp)
 		GET_VM_STATS(vm, v_free_min);
 		GET_VM_STATS(vm, v_free_count);
 		GET_VM_STATS(vm, v_wire_count);
+		GET_VM_STATS(vm, v_user_wire_count);
 		GET_VM_STATS(vm, v_active_count);
 		GET_VM_STATS(vm, v_inactive_target);
 		GET_VM_STATS(vm, v_inactive_count);
@@ -647,9 +646,8 @@ getcpuinfo(u_long *maskp, int *maxidp)
 
 
 static void
-prthuman(const char *name, uint64_t val, int size)
+prthuman(const char *name, uint64_t val, int size, int flags)
 {
-	int flags;
 	char buf[10];
 	char fmt[128];
 
@@ -657,7 +655,7 @@ prthuman(const char *name, uint64_t val, int size)
 
 	if (size < 5 || size > 9)
 		xo_errx(1, "doofus");
-	flags = HN_B | HN_NOSPACE | HN_DECIMAL;
+	flags |= HN_NOSPACE | HN_DECIMAL;
 	humanize_number(buf, size, val, "", HN_AUTOSCALE, flags);
 	xo_attr("value", "%ju", (uintmax_t) val);
 	xo_emit(fmt, size, buf);
@@ -785,20 +783,20 @@ dovmstat(unsigned int interval, int reps)
 		fill_vmmeter(&sum);
 		fill_vmtotal(&total);
 		xo_open_container("processes");
-		xo_emit("{:runnable/%1d} {:waiting/%ld} "
-		    "{:swapped-out/%ld}", total.t_rq - 1, total.t_dw +
+		xo_emit("{:runnable/%2d} {:waiting/%2ld} "
+		    "{:swapped-out/%2ld}", total.t_rq - 1, total.t_dw +
 		    total.t_pw, total.t_sw);
 		xo_close_container("processes");
 		xo_open_container("memory");
 #define vmstat_pgtok(a) ((uintmax_t)(a) * (sum.v_page_size >> 10))
-#define	rate(x)	(((x) * rate_adj + halfuptime) / uptime)	/* round */
+#define	rate(x)	(unsigned long)(((x) * rate_adj + halfuptime) / uptime)
 		if (hflag) {
-			xo_emit("");
 			prthuman("available-memory",
-			    total.t_avm * (uint64_t)sum.v_page_size, 5);
-			xo_emit(" ");
+			    total.t_avm * (uint64_t)sum.v_page_size, 5, HN_B);
 			prthuman("free-memory",
-			    total.t_free * (uint64_t)sum.v_page_size, 5);
+			    total.t_free * (uint64_t)sum.v_page_size, 5, HN_B);
+			prthuman("total-page-faults",
+			    rate(sum.v_vm_faults - osum.v_vm_faults), 5, 0);
 			xo_emit(" ");
 		} else {
 			xo_emit(" ");
@@ -808,35 +806,50 @@ dovmstat(unsigned int interval, int reps)
 			xo_emit("{:free-memory/%7ju}",
 			    vmstat_pgtok(total.t_free));
 			xo_emit(" ");
+			xo_emit("{:total-page-faults/%5lu} ",
+			    rate(sum.v_vm_faults - osum.v_vm_faults));
 		}
-		xo_emit("{:total-page-faults/%5lu} ",
-		    (unsigned long)rate(sum.v_vm_faults -
-		    osum.v_vm_faults));
 		xo_close_container("memory");
 
 		xo_open_container("paging-rates");
 		xo_emit("{:page-reactivated/%3lu} ",
-		    (unsigned long)rate(sum.v_reactivated -
-		    osum.v_reactivated));
+		    rate(sum.v_reactivated - osum.v_reactivated));
 		xo_emit("{:paged-in/%3lu} ",
-		    (unsigned long)rate(sum.v_swapin + sum.v_vnodein -
+		    rate(sum.v_swapin + sum.v_vnodein -
 		    (osum.v_swapin + osum.v_vnodein)));
-		xo_emit("{:paged-out/%3lu} ",
-		    (unsigned long)rate(sum.v_swapout + sum.v_vnodeout -
+		xo_emit("{:paged-out/%3lu}",
+		    rate(sum.v_swapout + sum.v_vnodeout -
 		    (osum.v_swapout + osum.v_vnodeout)));
-		xo_emit("{:freed/%5lu} ",
-		    (unsigned long)rate(sum.v_tfree - osum.v_tfree));
-		xo_emit("{:scanned/%4lu} ",
-		    (unsigned long)rate(sum.v_pdpages - osum.v_pdpages));
+		if (hflag) {
+			prthuman("freed",
+			    rate(sum.v_tfree - osum.v_tfree), 5, 0);
+			prthuman("scanned",
+			    rate(sum.v_pdpages - osum.v_pdpages), 5, 0);
+			xo_emit(" ");
+		} else {
+			xo_emit(" ");
+			xo_emit("{:freed/%5lu} ",
+			    rate(sum.v_tfree - osum.v_tfree));
+			xo_emit("{:scanned/%4lu} ",
+			    rate(sum.v_pdpages - osum.v_pdpages));
+		}
 		xo_close_container("paging-rates");
 
 		devstats();
 		xo_open_container("fault-rates");
-		xo_emit("{:interrupts/%4lu} {:system-calls/%5lu} "
-		    "{:context-switches/%5lu}",
-		    (unsigned long)rate(sum.v_intr - osum.v_intr),
-		    (unsigned long)rate(sum.v_syscall - osum.v_syscall),
-		    (unsigned long)rate(sum.v_swtch - osum.v_swtch));
+		xo_emit("{:interrupts/%4lu}", rate(sum.v_intr - osum.v_intr));
+		if (hflag) {
+			prthuman("system-calls",
+			    rate(sum.v_syscall - osum.v_syscall), 5, 0);
+			prthuman("context-switches",
+			    rate(sum.v_swtch - osum.v_swtch), 5, 0);
+		} else {
+			xo_emit(" ");
+			xo_emit("{:system-calls/%5lu} "
+			    "{:context-switches/%5lu}",
+			    rate(sum.v_syscall - osum.v_syscall),
+			    rate(sum.v_swtch - osum.v_swtch));
+		}
 		xo_close_container("fault-rates");
 		if (Pflag)
 			pcpustats(cpumask, maxid);
@@ -868,14 +881,14 @@ printhdr(int maxid, u_long cpumask)
 
 	num_shown = MIN(num_selected, maxshowdevs);
 	if (hflag)
-		xo_emit("{T:procs}  {T:memory}       {T:/page%*s}", 19, "");
+		xo_emit(" {T:procs}    {T:memory}    {T:/page%*s}", 19, "");
 	else
-		xo_emit("{T:procs}     {T:memory}        {T:/page%*s}", 19, "");
+		xo_emit("{T:procs}     {T:memory}       {T:/page%*s}", 19, "");
 	if (num_shown > 1)
-		xo_emit(" {T:/disks %*s}", num_shown * 4 - 7, "");
+		xo_emit("   {T:/disks %*s}  ", num_shown * 4 - 7, "");
 	else if (num_shown == 1)
 		xo_emit("   {T:disks}");
-	xo_emit("   {T:faults}      ");
+	xo_emit(" {T:faults}      ");
 	if (Pflag) {
 		for (i = 0; i <= maxid; i++) {
 			if (cpumask & (1ul << i))
@@ -883,10 +896,10 @@ printhdr(int maxid, u_long cpumask)
 		}
 		xo_emit("\n");
 	} else
-		xo_emit("   {T:cpu}\n");
+		xo_emit(" {T:cpu}\n");
 	if (hflag) {
-		xo_emit("{T:r} {T:b} {T:w}  {T:avm}   {T:fre}   {T:flt}  {T:re}"
-		    "  {T:pi}  {T:po}    {T:fr}   {T:sr} ");
+		xo_emit(" {T:r}  {T:b}  {T:w}  {T:avm}  {T:fre}  {T:flt}  {T:re}"
+		    "  {T:pi}  {T:po}   {T:fr}   {T:sr} ");
 	} else {
 		xo_emit("{T:r} {T:b} {T:w}     {T:avm}     {T:fre}  {T:flt}  "
 		    "{T:re}  {T:pi}  {T:po}    {T:fr}   {T:sr} ");
@@ -897,7 +910,7 @@ printhdr(int maxid, u_long cpumask)
 			xo_emit("{T:/%c%c%d} ", dev_select[i].device_name[0],
 			    dev_select[i].device_name[1],
 			    dev_select[i].unit_number);
-	xo_emit("  {T:in}    {T:sy}    {T:cs}");
+	xo_emit("  {T:in}   {T:sy}   {T:cs}");
 	if (Pflag) {
 		for (i = 0; i <= maxid; i++) {
 			if (cpumask & (1ul << i))
@@ -961,29 +974,6 @@ doresize(void)
 	 */
 	wresized = 0;
 }
-
-#ifdef notyet
-static void
-dotimes(void)
-{
-	unsigned int pgintime, rectime;
-
-	kread(X_REC, &rectime, sizeof(rectime));
-	kread(X_PGIN, &pgintime, sizeof(pgintime));
-	kread(X_SUM, &sum, sizeof(sum));
-	xo_emit("{:page-reclaims/%u} {N:reclaims}, "
-	    "{:reclaim-time/%u} {N:total time (usec)}\n",
-	    sum.v_pgrec, rectime);
-	xo_emit("{L:average}: {:reclaim-average/%u} {N:usec \\/ reclaim}\n",
-	    rectime / sum.v_pgrec);
-	xo_emit("\n");
-	xo_emit("{:page-ins/%u} {N:page ins}, "
-	    "{:page-in-time/%u} {N:total time (msec)}\n",
-	    sum.v_pgin, pgintime / 10);
-	xo_emit("{L:average}: {:average/%8.1f} {N:msec \\/ page in}\n",
-	    pgintime / (sum.v_pgin * 10.0));
-}
-#endif
 
 static long
 pct(long top, long bot)
@@ -1083,6 +1073,8 @@ dosum(void)
 	    sum.v_laundry_count);
 	xo_emit("{:wired-pages/%9u} {N:pages wired down}\n",
 	    sum.v_wire_count);
+	xo_emit("{:virtual-user-wired-pages/%9lu} {N:virtual user pages wired "
+	    "down}\n", sum.v_user_wire_count);
 	xo_emit("{:free-pages/%9u} {N:pages free}\n",
 	    sum.v_free_count);
 	xo_emit("{:bytes-per-page/%9u} {N:bytes per page}\n", sum.v_page_size);
@@ -1206,7 +1198,7 @@ cpustats(void)
 	total = 0;
 	for (state = 0; state < CPUSTATES; ++state)
 		total += cur.cp_time[state];
-	if (total)
+	if (total > 0)
 		lpct = 100.0 / total;
 	else
 		lpct = 0.0;
@@ -1268,12 +1260,18 @@ static unsigned int
 read_intrcnts(unsigned long **intrcnts)
 {
 	size_t intrcntlen;
+	uintptr_t kaddr;
 
 	if (kd != NULL) {
 		kread(X_SINTRCNT, &intrcntlen, sizeof(intrcntlen));
 		if ((*intrcnts = malloc(intrcntlen)) == NULL)
 			err(1, "malloc()");
-		kread(X_INTRCNT, *intrcnts, intrcntlen);
+		if (namelist[X_NINTRCNT].n_type == 0)
+			kread(X_INTRCNT, *intrcnts, intrcntlen);
+		else {
+			kread(X_INTRCNT, &kaddr, sizeof(kaddr));
+			kreadptr(kaddr, *intrcnts, intrcntlen);
+		}
 	} else {
 		for (*intrcnts = NULL, intrcntlen = 1024; ; intrcntlen *= 2) {
 			*intrcnts = reallocf(*intrcnts, intrcntlen);
@@ -1330,6 +1328,7 @@ dointr(unsigned int interval, int reps)
 	char *intrname, *intrnames;
 	long long period_ms, old_uptime, uptime;
 	size_t clen, inamlen, istrnamlen;
+	uintptr_t kaddr;
 	unsigned int nintr;
 
 	old_intrcnts = NULL;
@@ -1340,7 +1339,12 @@ dointr(unsigned int interval, int reps)
 		kread(X_SINTRNAMES, &inamlen, sizeof(inamlen));
 		if ((intrnames = malloc(inamlen)) == NULL)
 			xo_err(1, "malloc()");
-		kread(X_INTRNAMES, intrnames, inamlen);
+		if (namelist[X_NINTRCNT].n_type == 0)
+			kread(X_INTRNAMES, intrnames, inamlen);
+		else {
+			kread(X_INTRNAMES, &kaddr, sizeof(kaddr));
+			kreadptr(kaddr, intrnames, inamlen);
+		}
 	} else {
 		for (intrnames = NULL, inamlen = 1024; ; inamlen *= 2) {
 			if ((intrnames = reallocf(intrnames, inamlen)) == NULL)
@@ -1493,9 +1497,9 @@ domemstat_zone(void)
 		}
 	}
 	xo_open_container("memory-zone-statistics");
-	xo_emit("{T:/%-20s} {T:/%6s} {T:/%6s} {T:/%8s} {T:/%8s} {T:/%8s} "
+	xo_emit("{T:/%-20s} {T:/%6s} {T:/%6s} {T:/%8s} {T:/%8s} {T:/%8s} {T:/%8s}"
 	    "{T:/%4s} {T:/%4s}\n\n", "ITEM", "SIZE",
-	    "LIMIT", "USED", "FREE", "REQ", "FAIL", "SLEEP");
+	    "LIMIT", "USED", "FREE", "REQ", "FAIL", "SLEEP", "XDOMAIN");
 	xo_open_list("zone");
 	for (mtp = memstat_mtl_first(mtlp); mtp != NULL;
 	    mtp = memstat_mtl_next(mtp)) {
@@ -1505,7 +1509,7 @@ domemstat_zone(void)
 		xo_emit("{d:name/%-20s}{ke:name/%s} {:size/%6ju}, "
 		    "{:limit/%6ju},{:used/%8ju},"
 		    "{:free/%8ju},{:requests/%8ju},"
-		    "{:fail/%4ju},{:sleep/%4ju}\n", name,
+		    "{:fail/%4ju},{:sleep/%4ju},{:xdomain/%4ju}\n", name,
 		    memstat_get_name(mtp),
 		    (uintmax_t)memstat_get_size(mtp),
 		    (uintmax_t)memstat_get_countlimit(mtp),
@@ -1513,7 +1517,8 @@ domemstat_zone(void)
 		    (uintmax_t)memstat_get_free(mtp),
 		    (uintmax_t)memstat_get_numallocs(mtp),
 		    (uintmax_t)memstat_get_failures(mtp),
-		    (uintmax_t)memstat_get_sleeps(mtp));
+		    (uintmax_t)memstat_get_sleeps(mtp),
+		    (uintmax_t)memstat_get_xdomain(mtp));
 		xo_close_instance("zone");
 	}
 	memstat_mtl_free(mtlp);
@@ -1683,6 +1688,14 @@ kread(int nlx, void *addr, size_t size)
 }
 
 static void
+kreadptr(uintptr_t addr, void *buf, size_t size)
+{
+
+	if ((size_t)kvm_read(kd, addr, buf, size) != size)
+		xo_errx(1, "%s", kvm_geterr(kd));
+}
+
+static void __dead2
 usage(void)
 {
 	xo_error("%s%s",

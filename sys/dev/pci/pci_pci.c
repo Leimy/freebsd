@@ -42,8 +42,11 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/mutex.h>
+#include <sys/pciio.h>
 #include <sys/rman.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -80,6 +83,7 @@ static void		pcib_pcie_dll_timeout(void *arg);
 #endif
 static int		pcib_request_feature_default(device_t pcib, device_t dev,
 			    enum pci_feature feature);
+static int		pcib_reset_child(device_t dev, device_t child, int flags);
 
 static device_method_t pcib_methods[] = {
     /* Device interface */
@@ -106,6 +110,7 @@ static device_method_t pcib_methods[] = {
     DEVMETHOD(bus_deactivate_resource,	bus_generic_deactivate_resource),
     DEVMETHOD(bus_setup_intr,		bus_generic_setup_intr),
     DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
+    DEVMETHOD(bus_reset_child,		pcib_reset_child),
 
     /* pcib interface */
     DEVMETHOD(pcib_maxslots,		pcib_ari_maxslots),
@@ -131,7 +136,8 @@ static device_method_t pcib_methods[] = {
 static devclass_t pcib_devclass;
 
 DEFINE_CLASS_0(pcib, pcib_driver, pcib_methods, sizeof(struct pcib_softc));
-DRIVER_MODULE(pcib, pci, pcib_driver, pcib_devclass, NULL, NULL);
+EARLY_DRIVER_MODULE(pcib, pci, pcib_driver, pcib_devclass, NULL, NULL,
+    BUS_PASS_BUS);
 
 #if defined(NEW_PCIB) || defined(PCI_HP)
 SYSCTL_DECL(_hw_pci);
@@ -1067,14 +1073,6 @@ pcib_hotplug_present(struct pcib_softc *sc)
 	if (!pcib_hotplug_inserted(sc))
 		return (0);
 
-	/*
-	 * Require the Electromechanical Interlock to be engaged if
-	 * present.
-	 */
-	if (sc->pcie_slot_cap & PCIEM_SLOT_CAP_EIP &&
-	    (sc->pcie_slot_sta & PCIEM_SLOT_STA_EIS) == 0)
-		return (0);
-
 	/* Require the Data Link Layer to be active. */
 	if (!(sc->pcie_link_sta & PCIEM_LINK_STA_DL_ACTIVE))
 		return (0);
@@ -1164,9 +1162,12 @@ pcib_pcie_intr_hotplug(void *arg)
 {
 	struct pcib_softc *sc;
 	device_t dev;
+	uint16_t old_slot_sta;
 
 	sc = arg;
 	dev = sc->dev;
+	PCIB_HP_LOCK(sc);
+	old_slot_sta = sc->pcie_slot_sta;
 	sc->pcie_slot_sta = pcie_read_config(dev, PCIER_SLOT_STA, 2);
 
 	/* Clear the events just reported. */
@@ -1182,7 +1183,8 @@ pcib_pcie_intr_hotplug(void *arg)
 			    "Attention Button Pressed: Detach Cancelled\n");
 			sc->flags &= ~PCIB_DETACH_PENDING;
 			callout_stop(&sc->pcie_ab_timer);
-		} else {
+		} else if (old_slot_sta & PCIEM_SLOT_STA_PDS) {
+			/* Only initiate detach sequence if device present. */
 			device_printf(dev,
 		    "Attention Button Pressed: Detaching in 5 seconds\n");
 			sc->flags |= PCIB_DETACH_PENDING;
@@ -1212,6 +1214,7 @@ pcib_pcie_intr_hotplug(void *arg)
 	}
 
 	pcib_pcie_hotplug_update(sc, 0, 0, true);
+	PCIB_HP_UNLOCK(sc);
 }
 
 static void
@@ -1221,7 +1224,7 @@ pcib_pcie_hotplug_task(void *context, int pending)
 	device_t dev;
 
 	sc = context;
-	mtx_lock(&Giant);
+	PCIB_HP_LOCK(sc);
 	dev = sc->dev;
 	if (pcib_hotplug_present(sc) != 0) {
 		if (sc->child == NULL) {
@@ -1234,7 +1237,7 @@ pcib_pcie_hotplug_task(void *context, int pending)
 				sc->child = NULL;
 		}
 	}
-	mtx_unlock(&Giant);
+	PCIB_HP_UNLOCK(sc);
 }
 
 static void
@@ -1243,7 +1246,7 @@ pcib_pcie_ab_timeout(void *arg)
 	struct pcib_softc *sc;
 
 	sc = arg;
-	mtx_assert(&Giant, MA_OWNED);
+	PCIB_HP_LOCK_ASSERT(sc);
 	if (sc->flags & PCIB_DETACH_PENDING) {
 		sc->flags |= PCIB_DETACHING;
 		sc->flags &= ~PCIB_DETACH_PENDING;
@@ -1260,14 +1263,11 @@ pcib_pcie_cc_timeout(void *arg)
 
 	sc = arg;
 	dev = sc->dev;
-	mtx_assert(&Giant, MA_OWNED);
+	PCIB_HP_LOCK_ASSERT(sc);
 	sta = pcie_read_config(dev, PCIER_SLOT_STA, 2);
 	if (!(sta & PCIEM_SLOT_STA_CC)) {
-		device_printf(dev,
-		    "HotPlug Command Timed Out - forcing detach\n");
-		sc->flags &= ~(PCIB_HOTPLUG_CMD_PENDING | PCIB_DETACH_PENDING);
-		sc->flags |= PCIB_DETACHING;
-		pcib_pcie_hotplug_update(sc, 0, 0, true);
+		device_printf(dev, "HotPlug Command Timed Out\n");
+		sc->flags &= ~PCIB_HOTPLUG_CMD_PENDING;
 	} else {
 		device_printf(dev,
 	    "Missed HotPlug interrupt waiting for Command Completion\n");
@@ -1284,7 +1284,7 @@ pcib_pcie_dll_timeout(void *arg)
 
 	sc = arg;
 	dev = sc->dev;
-	mtx_assert(&Giant, MA_OWNED);
+	PCIB_HP_LOCK_ASSERT(sc);
 	sta = pcie_read_config(dev, PCIER_LINK_STA, 2);
 	if (!(sta & PCIEM_LINK_STA_DL_ACTIVE)) {
 		device_printf(dev,
@@ -1330,7 +1330,7 @@ pcib_alloc_pcie_irq(struct pcib_softc *sc)
 		rid = 0;
 
 	sc->pcie_irq = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
-	    RF_ACTIVE);
+	    RF_ACTIVE | RF_SHAREABLE);
 	if (sc->pcie_irq == NULL) {
 		device_printf(dev,
 		    "Failed to allocate interrupt for PCI-e events\n");
@@ -1339,7 +1339,7 @@ pcib_alloc_pcie_irq(struct pcib_softc *sc)
 		return (ENXIO);
 	}
 
-	error = bus_setup_intr(dev, sc->pcie_irq, INTR_TYPE_MISC,
+	error = bus_setup_intr(dev, sc->pcie_irq, INTR_TYPE_MISC|INTR_MPSAFE,
 	    NULL, pcib_pcie_intr_hotplug, sc, &sc->pcie_ihand);
 	if (error) {
 		device_printf(dev, "Failed to setup PCI-e interrupt handler\n");
@@ -1378,6 +1378,7 @@ pcib_setup_hotplug(struct pcib_softc *sc)
 	callout_init(&sc->pcie_cc_timer, 0);
 	callout_init(&sc->pcie_dll_timer, 0);
 	TASK_INIT(&sc->pcie_hp_task, 0, pcib_pcie_hotplug_task, sc);
+	sc->pcie_hp_lock = &Giant;
 
 	/* Allocate IRQ. */
 	if (pcib_alloc_pcie_irq(sc) != 0)
@@ -1783,6 +1784,12 @@ pcib_resume(device_t dev)
 {
 
 	pcib_cfg_restore(device_get_softc(dev));
+
+	/*
+	 * Restore the Command register only after restoring the windows.
+	 * The bridge should not be claiming random windows.
+	 */
+	pci_write_config(dev, PCIR_COMMAND, pci_get_cmdreg(dev), 2);
 	return (bus_generic_resume(dev));
 }
 
@@ -2545,6 +2552,22 @@ pcib_enable_ari(struct pcib_softc *sc, uint32_t pcie_pos)
 int
 pcib_maxslots(device_t dev)
 {
+#if !defined(__amd64__) && !defined(__i386__)
+	uint32_t pcie_pos;
+	uint16_t val;
+
+	/*
+	 * If this is a PCIe rootport or downstream switch port, there's only
+	 * one slot permitted.
+	 */
+	if (pci_find_cap(dev, PCIY_EXPRESS, &pcie_pos) == 0) {
+		val = pci_read_config(dev, pcie_pos + PCIER_FLAGS, 2);
+		val &= PCIEM_FLAGS_TYPE;
+		if (val == PCIEM_TYPE_ROOT_PORT ||
+		    val == PCIEM_TYPE_DOWNSTREAM_PORT)
+			return (0);
+	}
+#endif
 	return (PCI_SLOTMAX);
 }
 
@@ -2558,7 +2581,7 @@ pcib_ari_maxslots(device_t dev)
 	if (sc->flags & PCIB_ENABLE_ARI)
 		return (PCIE_ARI_SLOTMAX);
 	else
-		return (PCI_SLOTMAX);
+		return (pcib_maxslots(dev));
 }
 
 static int
@@ -2891,4 +2914,32 @@ pcib_request_feature_default(device_t pcib, device_t dev,
 	 */
 	bus = device_get_parent(pcib);
 	return (PCIB_REQUEST_FEATURE(device_get_parent(bus), dev, feature));
+}
+
+static int
+pcib_reset_child(device_t dev, device_t child, int flags)
+{
+	struct pci_devinfo *pdinfo;
+	int error;
+
+	error = 0;
+	if (dev == NULL || device_get_parent(child) != dev)
+		goto out;
+	error = ENXIO;
+	if (device_get_devclass(child) != devclass_find("pci"))
+		goto out;
+	pdinfo = device_get_ivars(dev);
+	if (pdinfo->cfg.pcie.pcie_location != 0 &&
+	    (pdinfo->cfg.pcie.pcie_type == PCIEM_TYPE_DOWNSTREAM_PORT ||
+	    pdinfo->cfg.pcie.pcie_type == PCIEM_TYPE_ROOT_PORT)) {
+		error = bus_helper_reset_prepare(child, flags);
+		if (error == 0) {
+			error = pcie_link_reset(dev,
+			    pdinfo->cfg.pcie.pcie_location);
+			/* XXXKIB call _post even if error != 0 ? */
+			bus_helper_reset_post(child, flags);
+		}
+	}
+out:
+	return (error);
 }

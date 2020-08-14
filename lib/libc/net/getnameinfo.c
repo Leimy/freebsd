@@ -224,10 +224,8 @@ getnameinfo_inet(const struct afd *afd,
 	case AF_INET:
 		v4a = (u_int32_t)
 		    ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
-		if (IN_MULTICAST(v4a) || IN_EXPERIMENTAL(v4a))
-			flags |= NI_NUMERICHOST;
-		v4a >>= IN_CLASSA_NSHIFT;
-		if (v4a == 0)
+		if (IN_MULTICAST(v4a) || IN_EXPERIMENTAL(v4a) ||
+		    IN_ZERONET(v4a))
 			flags |= NI_NUMERICHOST;
 		break;
 #ifdef INET6
@@ -481,7 +479,6 @@ getnameinfo_link(const struct afd *afd,
 	 * IFT_OTHER	(netinet/ip_ipip.c)
 	 */
 	/* default below is believed correct for all these. */
-	case IFT_ARCNET:
 	case IFT_ETHER:
 	case IFT_FDDI:
 	case IFT_HIPPI:

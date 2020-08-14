@@ -45,13 +45,15 @@ __FBSDID("$FreeBSD$");
 #include <sys/watchdog.h>
 #endif
 #include <vm/vm.h>
+#include <vm/vm_param.h>
+#include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 #include <vm/pmap.h>
 #include <machine/atomic.h>
 #include <machine/cpu.h>
 #include <machine/elf.h>
 #include <machine/md_var.h>
 #include <machine/minidump.h>
-#include <machine/vmparam.h>
 
 CTASSERT(sizeof(struct kerneldumpheader) == 512);
 
@@ -246,12 +248,12 @@ minidumpsys(struct dumperinfo *di)
 	dump_init_header(di, &kdh, KERNELDUMPMAGIC, KERNELDUMP_ARM_VERSION,
 	    dumpsize);
 
-	printf("Physical memory: %u MB\n", ptoa((uintmax_t)physmem) / 1048576);
-	printf("Dumping %llu MB:", (long long)dumpsize >> 20);
-
 	error = dump_start(di, &kdh);
 	if (error != 0)
 		goto fail;
+
+	printf("Physical memory: %u MB\n", ptoa((uintmax_t)physmem) / 1048576);
+	printf("Dumping %llu MB:", (long long)dumpsize >> 20);
 
 	/* Dump my header */
 	bzero(dumpbuf, sizeof(dumpbuf));
@@ -340,9 +342,10 @@ fail:
 
 	if (error == ECANCELED)
 		printf("\nDump aborted\n");
-	else if (error == E2BIG || error == ENOSPC)
-		printf("\nDump failed. Partition too small.\n");
-	else
+	else if (error == E2BIG || error == ENOSPC) {
+		printf("\nDump failed. Partition too small (about %lluMB were "
+		    "needed this time).\n", (long long)dumpsize >> 20);
+	} else
 		printf("\n** DUMP FAILED (ERROR %d) **\n", error);
 	return (error);
 }

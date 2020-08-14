@@ -51,31 +51,31 @@ struct ethtool_modinfo {
 	u32	eeprom_len;
 };
 
-static inline bool 
+static inline bool
 is_zero_ether_addr(const u8 * addr)
 {
 	return ((addr[0] + addr[1] + addr[2] + addr[3] + addr[4] + addr[5]) == 0x00);
 }
 
-static inline bool 
+static inline bool
 is_multicast_ether_addr(const u8 * addr)
 {
 	return (0x01 & addr[0]);
 }
 
-static inline bool 
+static inline bool
 is_broadcast_ether_addr(const u8 * addr)
 {
 	return ((addr[0] + addr[1] + addr[2] + addr[3] + addr[4] + addr[5]) == (6 * 0xff));
 }
 
-static inline bool 
+static inline bool
 is_valid_ether_addr(const u8 * addr)
 {
 	return !is_multicast_ether_addr(addr) && !is_zero_ether_addr(addr);
 }
 
-static inline void 
+static inline void
 ether_addr_copy(u8 * dst, const u8 * src)
 {
 	memcpy(dst, src, 6);
@@ -108,8 +108,7 @@ eth_zero_addr(u8 *pa)
 static inline void
 random_ether_addr(u8 * dst)
 {
-	if (read_random(dst, 6) == 0)
-		arc4rand(dst, 6, 0);
+	arc4random_buf(dst, 6);
 
 	dst[0] &= 0xfe;
 	dst[0] |= 0x02;

@@ -41,7 +41,7 @@ __FBSDID("$FreeBSD$");
 
 #include "quad.h"
 
-#define	ONE_FOURTH	(1 << (LONG_BITS - 2))
+#define	ONE_FOURTH	(1L << (LONG_BITS - 2))
 #define	ONE_HALF	(ONE_FOURTH * 2.0)
 #define	ONE		(ONE_FOURTH * 4.0)
 
@@ -51,8 +51,7 @@ __FBSDID("$FreeBSD$");
  * of range becomes UQUAD_MAX.
  */
 u_quad_t
-__fixunsdfdi(x)
-	double x;
+__fixunsdfdi(double x)
 {
 	double toppart;
 	union uu t;
@@ -85,11 +84,11 @@ __fixunsdfdi(x)
 	x -= (double)t.uq;
 	if (x < 0) {
 		t.ul[H]--;
-		x += ULONG_MAX;
+		x += (double)ULONG_MAX;
 	}
-	if (x > ULONG_MAX) {
+	if (x > (double)ULONG_MAX) {
 		t.ul[H]++;
-		x -= ULONG_MAX;
+		x -= (double)ULONG_MAX;
 	}
 	t.ul[L] = (u_long)x;
 	return (t.uq);

@@ -120,7 +120,7 @@ cdcmd(int argc __unused, char **argv __unused)
 	    (dest[0] == '.' && dest[1] == '.' && (dest[2] == '/' || dest[2] == '\0')) ||
 	    (path = bltinlookup("CDPATH", 1)) == NULL)
 		path = "";
-	while ((p = padvance(&path, dest)) != NULL) {
+	while ((p = padvance(&path, NULL, dest)) != NULL) {
 		if (stat(p, &statb) < 0) {
 			if (errno != ENOENT)
 				errno1 = errno;
@@ -376,8 +376,11 @@ getpwd(void)
 		return curdir;
 
 	p = getpwd2();
-	if (p != NULL)
+	if (p != NULL) {
+		INTOFF;
 		curdir = savestr(p);
+		INTON;
+	}
 
 	return curdir;
 }

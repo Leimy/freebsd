@@ -55,7 +55,7 @@ struct mdthread {
 #else
 	int		md_upte[KSTACK_PAGES];
 #endif
-	int		md_ss_addr;	/* single step address for ptrace */
+	uintptr_t	md_ss_addr;	/* single step address for ptrace */
 	int		md_ss_instr;	/* single step instruction for ptrace */
 	register_t	md_saved_intr;
 	u_int		md_spinlock_count;
@@ -64,7 +64,6 @@ struct mdthread {
 	int		md_pc_count;	/* performance counter */
 	int		md_pc_spill;	/* performance counter spill */
 	void		*md_tls;
-	size_t		md_tls_tcb_offset;	/* TCB offset */
 #ifdef	CPU_CNMIPS
 	struct octeon_cop2_state	*md_cop2; /* kernel context */
 	struct octeon_cop2_state	*md_ucop2; /* userland context */
@@ -79,7 +78,7 @@ struct mdthread {
 #define	MDTD_COP2USED	0x0002		/* Process used the COP2 */
 
 struct mdproc {
-	/* empty */
+	size_t		md_tls_tcb_offset;	/* TCB offset */
 };
 
 struct syscall_args {

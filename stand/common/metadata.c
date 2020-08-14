@@ -31,9 +31,9 @@ __FBSDID("$FreeBSD$");
 
 #include <stand.h>
 #include <sys/param.h>
-#include <sys/reboot.h>
 #include <sys/linker.h>
 #include <sys/boot.h>
+#include <sys/reboot.h>
 #if defined(LOADER_FDT_SUPPORT)
 #include <fdt_platform.h>
 #endif
@@ -45,127 +45,22 @@ __FBSDID("$FreeBSD$");
 
 #include "bootstrap.h"
 
-#if defined(__sparc64__)
-#include <openfirm.h>
-
-extern struct tlb_entry *dtlb_store;
-extern struct tlb_entry *itlb_store;
-
-extern int dtlb_slot;
-extern int itlb_slot;
-
-static int
-md_bootserial(void)
-{
-    char        buf[64];
-    ihandle_t        inst;
-    phandle_t        input;
-    phandle_t        node;
-    phandle_t        output;
-
-    if ((node = OF_finddevice("/options")) == -1)
-        return(-1);
-    if (OF_getprop(node, "input-device", buf, sizeof(buf)) == -1)
-        return(-1);
-    input = OF_finddevice(buf);
-    if (OF_getprop(node, "output-device", buf, sizeof(buf)) == -1)
-        return(-1);
-    output = OF_finddevice(buf);
-    if (input == -1 || output == -1 ||
-        OF_getproplen(input, "keyboard") >= 0) {
-        if ((node = OF_finddevice("/chosen")) == -1)
-            return(-1);
-        if (OF_getprop(node, "stdin", &inst, sizeof(inst)) == -1)
-            return(-1);
-        if ((input = OF_instance_to_package(inst)) == -1)
-            return(-1);
-        if (OF_getprop(node, "stdout", &inst, sizeof(inst)) == -1)
-            return(-1);
-        if ((output = OF_instance_to_package(inst)) == -1)
-            return(-1);
-    }
-    if (input != output)
-        return(-1);
-    if (OF_getprop(input, "device_type", buf, sizeof(buf)) == -1)
-        return(-1);
-    if (strcmp(buf, "serial") != 0)
-        return(-1);
-    return(0);
-}
+#ifdef LOADER_GELI_SUPPORT
+#include "geliboot.h"
 #endif
 
-int
+static int
 md_getboothowto(char *kargs)
 {
-    char	*cp;
     int		howto;
-    int		active;
-    int		i;
 
     /* Parse kargs */
-    howto = 0;
-    if (kargs != NULL) {
-	cp = kargs;
-	active = 0;
-	while (*cp != 0) {
-	    if (!active && (*cp == '-')) {
-		active = 1;
-	    } else if (active)
-		switch (*cp) {
-		case 'a':
-		    howto |= RB_ASKNAME;
-		    break;
-		case 'C':
-		    howto |= RB_CDROM;
-		    break;
-		case 'd':
-		    howto |= RB_KDB;
-		    break;
-		case 'D':
-		    howto |= RB_MULTIPLE;
-		    break;
-		case 'm':
-		    howto |= RB_MUTE;
-		    break;
-		case 'g':
-		    howto |= RB_GDB;
-		    break;
-		case 'h':
-		    howto |= RB_SERIAL;
-		    break;
-		case 'p':
-		    howto |= RB_PAUSE;
-		    break;
-		case 'r':
-		    howto |= RB_DFLTROOT;
-		    break;
-		case 's':
-		    howto |= RB_SINGLE;
-		    break;
-		case 'v':
-		    howto |= RB_VERBOSE;
-		    break;
-		default:
-		    active = 0;
-		    break;
-		}
-	    cp++;
-	}
-    }
-
-    /* get equivalents from the environment */
-    for (i = 0; howto_names[i].ev != NULL; i++)
-	if (getenv(howto_names[i].ev) != NULL)
-	    howto |= howto_names[i].mask;
-#if defined(__sparc64__)
-    if (md_bootserial() != -1)
-	howto |= RB_SERIAL;
-#else
+    howto = boot_parse_cmdline(kargs);
+    howto |= boot_env_to_howto();
     if (!strcmp(getenv("console"), "comconsole"))
 	howto |= RB_SERIAL;
     if (!strcmp(getenv("console"), "nullconsole"))
 	howto |= RB_MUTE;
-#endif
     return(howto);
 }
 
@@ -307,7 +202,7 @@ md_copymodules(vm_offset_t addr, int kern64)
  * - The kernel environment is copied into kernel space.
  * - Module metadata are formatted and placed in kernel space.
  */
-int
+static int
 md_load_dual(char *args, vm_offset_t *modulep, vm_offset_t *dtb, int kern64)
 {
     struct preloaded_file	*kfp;
@@ -410,16 +305,8 @@ md_load_dual(char *args, vm_offset_t *modulep, vm_offset_t *dtb, int kern64)
 #endif
 	file_addmetadata(kfp, MODINFOMD_KERNEND, sizeof kernend, &kernend);
     }
-
-#if defined(__sparc64__)
-    file_addmetadata(kfp, MODINFOMD_DTLB_SLOTS,
-	sizeof dtlb_slot, &dtlb_slot);
-    file_addmetadata(kfp, MODINFOMD_ITLB_SLOTS,
-	sizeof itlb_slot, &itlb_slot);
-    file_addmetadata(kfp, MODINFOMD_DTLB,
-	dtlb_slot * sizeof(*dtlb_store), dtlb_store);
-    file_addmetadata(kfp, MODINFOMD_ITLB,
-	itlb_slot * sizeof(*itlb_store), itlb_store);
+#ifdef LOADER_GELI_SUPPORT
+    geli_export_key_metadata(kfp);
 #endif
 
     *modulep = addr;

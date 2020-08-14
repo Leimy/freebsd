@@ -1189,9 +1189,8 @@ agp_i810_install_gatt(device_t dev)
 		sc->dcache_size = 0;
 
 	/* According to the specs the gatt on the i810 must be 64k. */
-	sc->gatt->ag_virtual = (void *)kmem_alloc_contig(kernel_arena,
-	    64 * 1024, M_NOWAIT | M_ZERO, 0, ~0, PAGE_SIZE,
-	    0, VM_MEMATTR_WRITE_COMBINING);
+	sc->gatt->ag_virtual = (void *)kmem_alloc_contig(64 * 1024, M_NOWAIT |
+	    M_ZERO, 0, ~0, PAGE_SIZE, 0, VM_MEMATTR_WRITE_COMBINING);
 	if (sc->gatt->ag_virtual == NULL) {
 		if (bootverbose)
 			device_printf(dev, "contiguous allocation failed\n");
@@ -1330,7 +1329,7 @@ agp_i810_deinstall_gatt(device_t dev)
 
 	sc = device_get_softc(dev);
 	bus_write_4(sc->sc_res[0], AGP_I810_PGTBL_CTL, 0);
-	kmem_free(kernel_arena, (vm_offset_t)sc->gatt->ag_virtual, 64 * 1024);
+	kmem_free((vm_offset_t)sc->gatt->ag_virtual, 64 * 1024);
 }
 
 static void
@@ -1796,9 +1795,7 @@ agp_i810_free_memory(device_t dev, struct agp_memory *mem)
 			 */
 			VM_OBJECT_WLOCK(mem->am_obj);
 			m = vm_page_lookup(mem->am_obj, 0);
-			vm_page_lock(m);
 			vm_page_unwire(m, PQ_INACTIVE);
-			vm_page_unlock(m);
 			VM_OBJECT_WUNLOCK(mem->am_obj);
 		} else {
 			contigfree(sc->argb_cursor, mem->am_size, M_AGP);
@@ -1957,7 +1954,7 @@ agp_intel_gtt_insert_pages(device_t dev, u_int first_entry, u_int num_entries,
 	sc = device_get_softc(dev);
 	for (i = 0; i < num_entries; i++) {
 		MPASS(pages[i]->valid == VM_PAGE_BITS_ALL);
-		MPASS(pages[i]->wire_count > 0);
+		MPASS(pages[i]->ref_count > 0);
 		sc->match->driver->install_gtt_pte(dev, first_entry + i,
 		    VM_PAGE_TO_PHYS(pages[i]), flags);
 	}

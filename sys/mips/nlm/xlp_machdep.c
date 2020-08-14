@@ -49,13 +49,16 @@ __FBSDID("$FreeBSD$");
 
 #include <sys/cons.h>		/* cinit() */
 #include <sys/kdb.h>
+#include <sys/boot.h>
 #include <sys/reboot.h>
 #include <sys/queue.h>
 #include <sys/smp.h>
 #include <sys/timetc.h>
 
 #include <vm/vm.h>
+#include <vm/vm_param.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 
 #include <machine/cpu.h>
 #include <machine/cpufunc.h>
@@ -261,36 +264,6 @@ unsupp:
 	return;
 }
 
-/* Parse cmd line args as env - copied from ar71xx */
-static void
-xlp_parse_bootargs(char *cmdline)
-{
-	char *n, *v;
-
-	while ((v = strsep(&cmdline, " \n")) != NULL) {
-		if (*v == '\0')
-			continue;
-		if (*v == '-') {
-			while (*v != '\0') {
-				v++;
-				switch (*v) {
-				case 'a': boothowto |= RB_ASKNAME; break;
-				case 'd': boothowto |= RB_KDB; break;
-				case 'g': boothowto |= RB_GDB; break;
-				case 's': boothowto |= RB_SINGLE; break;
-				case 'v': boothowto |= RB_VERBOSE; break;
-				}
-			}
-		} else {
-			n = strsep(&v, "=");
-			if (v == NULL)
-				kern_setenv(n, "1");
-			else
-				kern_setenv(n, v);
-		}
-	}
-}
-
 #ifdef FDT
 static void
 xlp_bootargs_init(__register_t arg)
@@ -321,7 +294,7 @@ xlp_bootargs_init(__register_t arg)
 	}
 
 	if (OF_getprop(chosen, "bootargs", buf, sizeof(buf)) != -1)
-		xlp_parse_bootargs(buf);
+		boothowto |= boot_parse_cmdline(buf);
 }
 #else
 /*
@@ -363,7 +336,7 @@ xlp_bootargs_init(__register_t arg)
 	v = kern_getenv("bootargs");
 	if (v != NULL) {
 		strlcpy(buf, v, sizeof(buf));
-		xlp_parse_bootargs(buf);
+		boothowto |= boot_parse_cmdline(buf);
 		freeenv(v);
 	}
 }

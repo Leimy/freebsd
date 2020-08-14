@@ -110,7 +110,8 @@ static int mps_debug_sysctl(SYSCTL_HANDLER_ARGS);
 static int mps_dump_reqs(SYSCTL_HANDLER_ARGS);
 static void mps_parse_debug(struct mps_softc *sc, char *list);
 
-SYSCTL_NODE(_hw, OID_AUTO, mps, CTLFLAG_RD, 0, "MPS Driver Parameters");
+SYSCTL_NODE(_hw, OID_AUTO, mps, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "MPS Driver Parameters");
 
 MALLOC_DEFINE(M_MPT2, "mps", "mpt2 driver memory");
 MALLOC_DECLARE(M_MPSUSER);
@@ -497,6 +498,12 @@ mps_iocfacts_allocate(struct mps_softc *sc, uint8_t attaching)
 	    sc->facts->FWVersion.Struct.Minor,
 	    sc->facts->FWVersion.Struct.Unit,
 	    sc->facts->FWVersion.Struct.Dev);
+
+	snprintf(sc->msg_version, sizeof(sc->msg_version), "%d.%d",
+	    (sc->facts->MsgVersion & MPI2_IOCFACTS_MSGVERSION_MAJOR_MASK) >>
+	    MPI2_IOCFACTS_MSGVERSION_MAJOR_SHIFT, 
+	    (sc->facts->MsgVersion & MPI2_IOCFACTS_MSGVERSION_MINOR_MASK) >>
+	    MPI2_IOCFACTS_MSGVERSION_MINOR_SHIFT);
 
 	mps_dprint(sc, MPS_INFO, "Firmware: %s, Driver: %s\n", sc->fw_version,
 	    MPS_DRIVER_VERSION);
@@ -1513,10 +1520,6 @@ mps_alloc_requests(struct mps_softc *sc)
 	 */
 	sc->commands = malloc(sizeof(struct mps_command) * sc->num_reqs,
 	    M_MPT2, M_WAITOK | M_ZERO);
-	if(!sc->commands) {
-		mps_dprint(sc, MPS_ERROR, "Cannot allocate command memory\n");
-		return (ENOMEM);
-	}
 	for (i = 1; i < sc->num_reqs; i++) {
 		cm = &sc->commands[i];
 		cm->cm_req = sc->req_frames + i * sc->reqframesz;
@@ -1698,7 +1701,7 @@ mps_setup_sysctl(struct mps_softc *sc)
 		sysctl_ctx_init(&sc->sysctl_ctx);
 		sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
 		    SYSCTL_STATIC_CHILDREN(_hw_mps), OID_AUTO, tmpstr2,
-		    CTLFLAG_RD, 0, tmpstr);
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, tmpstr);
 		if (sc->sysctl_tree == NULL)
 			return;
 		sysctl_ctx = &sc->sysctl_ctx;
@@ -1742,12 +1745,16 @@ mps_setup_sysctl(struct mps_softc *sc)
 	    "Total number of event frames allocated");
 
 	SYSCTL_ADD_STRING(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
-	    OID_AUTO, "firmware_version", CTLFLAG_RW, sc->fw_version,
+	    OID_AUTO, "firmware_version", CTLFLAG_RD, sc->fw_version,
 	    strlen(sc->fw_version), "firmware version");
 
 	SYSCTL_ADD_STRING(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
-	    OID_AUTO, "driver_version", CTLFLAG_RW, MPS_DRIVER_VERSION,
+	    OID_AUTO, "driver_version", CTLFLAG_RD, MPS_DRIVER_VERSION,
 	    strlen(MPS_DRIVER_VERSION), "driver version");
+
+	SYSCTL_ADD_STRING(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
+	    OID_AUTO, "msg_version", CTLFLAG_RD, sc->msg_version,
+	    strlen(sc->msg_version), "message interface version");
 
 	SYSCTL_ADD_INT(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
 	    OID_AUTO, "io_cmds_active", CTLFLAG_RD,
@@ -1788,16 +1795,19 @@ mps_setup_sysctl(struct mps_softc *sc)
 	    "spinup after SATA ID error");
 
 	SYSCTL_ADD_PROC(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
-	    OID_AUTO, "mapping_table_dump", CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
+	    OID_AUTO, "mapping_table_dump",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT, sc, 0,
 	    mps_mapping_dump, "A", "Mapping Table Dump");
 
 	SYSCTL_ADD_PROC(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
-	    OID_AUTO, "encl_table_dump", CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
+	    OID_AUTO, "encl_table_dump",
+	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT, sc, 0,
 	    mps_mapping_encl_dump, "A", "Enclosure Table Dump");
 
 	SYSCTL_ADD_PROC(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
-	    OID_AUTO, "dump_reqs", CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_SKIP, sc, 0,
-	    mps_dump_reqs, "I", "Dump Active Requests");
+	    OID_AUTO, "dump_reqs",
+	    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_SKIP | CTLFLAG_NEEDGIANT,
+	    sc, 0, mps_dump_reqs, "I", "Dump Active Requests");
 
 	SYSCTL_ADD_INT(sysctl_ctx, SYSCTL_CHILDREN(sysctl_tree),
 	    OID_AUTO, "use_phy_num", CTLFLAG_RD, &sc->use_phynum, 0,
@@ -2361,12 +2371,13 @@ void
 mps_intr_locked(void *data)
 {
 	MPI2_REPLY_DESCRIPTORS_UNION *desc;
-	struct mps_softc *sc;
-	struct mps_command *cm = NULL;
-	uint8_t flags;
-	u_int pq;
 	MPI2_DIAG_RELEASE_REPLY *rel_rep;
 	mps_fw_diagnostic_buffer_t *pBuffer;
+	struct mps_softc *sc;
+	struct mps_command *cm = NULL;
+	uint64_t tdesc;
+	uint8_t flags;
+	u_int pq;
 
 	sc = (struct mps_softc *)data;
 
@@ -2378,6 +2389,17 @@ mps_intr_locked(void *data)
 	for ( ;; ) {
 		cm = NULL;
 		desc = &sc->post_queue[sc->replypostindex];
+
+		/*
+		 * Copy and clear out the descriptor so that any reentry will
+		 * immediately know that this descriptor has already been
+		 * looked at.  There is unfortunate casting magic because the
+		 * MPI API doesn't have a cardinal 64bit type.
+		 */
+		tdesc = 0xffffffffffffffff;
+		tdesc = atomic_swap_64((uint64_t *)desc, tdesc);
+		desc = (MPI2_REPLY_DESCRIPTORS_UNION *)&tdesc;
+
 		flags = desc->Default.ReplyFlags &
 		    MPI2_RPY_DESCRIPT_FLAGS_TYPE_MASK;
 		if ((flags == MPI2_RPY_DESCRIPT_FLAGS_UNUSED)
@@ -2467,14 +2489,24 @@ mps_intr_locked(void *data)
 					    (MPI2_EVENT_NOTIFICATION_REPLY *)
 					    reply);
 			} else {
+				/*
+				 * Ignore commands not in INQUEUE state
+				 * since they've already been completed
+				 * via another path.
+				 */
 				cm = &sc->commands[
 				    le16toh(desc->AddressReply.SMID)];
-				KASSERT(cm->cm_state == MPS_CM_STATE_INQUEUE,
-				    ("command not inqueue\n"));
-				cm->cm_state = MPS_CM_STATE_BUSY;
-				cm->cm_reply = reply;
-				cm->cm_reply_data = le32toh(
-				    desc->AddressReply.ReplyFrameAddress);
+				if (cm->cm_state == MPS_CM_STATE_INQUEUE) {
+					cm->cm_state = MPS_CM_STATE_BUSY;
+					cm->cm_reply = reply;
+					cm->cm_reply_data = le32toh(
+					    desc->AddressReply.ReplyFrameAddress);
+				} else {
+					mps_dprint(sc, MPS_RECOVERY,
+					    "Bad state for ADDRESS_REPLY status,"
+					    " ignoring state %d cm %p\n",
+					    cm->cm_state, cm);
+				}
 			}
 			break;
 		}
@@ -2496,9 +2528,6 @@ mps_intr_locked(void *data)
 				mps_display_reply_info(sc,cm->cm_reply);
 			mps_complete_command(sc, cm);
 		}
-
-		desc->Words.Low = 0xffffffff;
-		desc->Words.High = 0xffffffff;
 	}
 
 	if (pq != sc->replypostindex) {
@@ -2565,10 +2594,6 @@ mps_register_events(struct mps_softc *sc, u32 *mask,
 	int error = 0;
 
 	eh = malloc(sizeof(struct mps_event_handle), M_MPT2, M_WAITOK|M_ZERO);
-	if(!eh) {
-		mps_dprint(sc, MPS_ERROR, "Cannot allocate event memory\n");
-		return (ENOMEM);
-	}
 	eh->callback = cb;
 	eh->data = data;
 	TAILQ_INSERT_TAIL(&sc->event_list, eh, eh_list);
@@ -3094,12 +3119,15 @@ mps_wait_command(struct mps_softc *sc, struct mps_command **cmp, int timeout,
 	}
 
 	if (error == EWOULDBLOCK) {
-		mps_dprint(sc, MPS_FAULT, "Calling Reinit from %s, timeout=%d,"
-		    " elapsed=%jd\n", __func__, timeout,
-		    (intmax_t)cur_time.tv_sec);
-		rc = mps_reinit(sc);
-		mps_dprint(sc, MPS_FAULT, "Reinit %s\n", (rc == 0) ? "success" :
-		    "failed");
+		if (cm->cm_timeout_handler == NULL) {
+			mps_dprint(sc, MPS_FAULT, "Calling Reinit from %s, timeout=%d,"
+			    " elapsed=%jd\n", __func__, timeout,
+			    (intmax_t)cur_time.tv_sec);
+			rc = mps_reinit(sc);
+			mps_dprint(sc, MPS_FAULT, "Reinit %s\n", (rc == 0) ? "success" :
+			    "failed");
+		} else
+			cm->cm_timeout_handler(sc, cm);
 		if (sc->mps_flags & MPS_FLAGS_REALLOCATED) {
 			/*
 			 * Tell the caller that we freed the command in a

@@ -55,20 +55,10 @@ void
 db_set_thread(db_expr_t tid, bool hastid, db_expr_t cnt, char *mod)
 {
 	struct thread *thr;
-	db_expr_t radix;
 	int err;
 
-	/*
-	 * We parse our own arguments. We don't like the default radix.
-	 */
-	radix = db_radix;
-	db_radix = 10;
-	hastid = db_expression(&tid);
-	db_radix = radix;
-	db_skip_to_eol();
-
 	if (hastid) {
-		thr = kdb_thr_lookup(tid);
+		thr = db_lookup_thread(tid, false);
 		if (thr != NULL) {
 			err = kdb_thr_select(thr);
 			if (err != 0) {
@@ -135,11 +125,7 @@ db_lookup_thread(db_expr_t addr, bool check_pid)
 	if (td != NULL)
 		return (td);
 	if (check_pid) {
-		FOREACH_PROC_IN_SYSTEM(p) {
-			if (p->p_pid == decaddr)
-				return (FIRST_THREAD_IN_PROC(p));
-		}
-		LIST_FOREACH(p, &zombproc, p_list) {
+		LIST_FOREACH(p, PIDHASH(decaddr), p_hash) {
 			if (p->p_pid == decaddr)
 				return (FIRST_THREAD_IN_PROC(p));
 		}
@@ -161,11 +147,7 @@ db_lookup_proc(db_expr_t addr)
 
 	decaddr = db_hex2dec(addr);
 	if (decaddr != -1) {
-		FOREACH_PROC_IN_SYSTEM(p) {
-			if (p->p_pid == decaddr)
-				return (p);
-		}
-		LIST_FOREACH(p, &zombproc, p_list) {
+		LIST_FOREACH(p, PIDHASH(decaddr), p_hash) {
 			if (p->p_pid == decaddr)
 				return (p);
 		}

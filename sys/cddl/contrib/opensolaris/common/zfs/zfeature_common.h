@@ -20,10 +20,11 @@
  */
 
 /*
- * Copyright (c) 2011, 2015 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2017 by Delphix. All rights reserved.
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2013, Joyent, Inc. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #ifndef _ZFEATURE_COMMON_H
@@ -52,6 +53,7 @@ typedef enum spa_feature {
 	SPA_FEATURE_BOOKMARKS,
 	SPA_FEATURE_FS_SS_LIMIT,
 	SPA_FEATURE_LARGE_BLOCKS,
+	SPA_FEATURE_LARGE_DNODE,
 	SPA_FEATURE_SHA512,
 	SPA_FEATURE_SKEIN,
 #ifdef illumos
@@ -59,6 +61,9 @@ typedef enum spa_feature {
 #endif
 	SPA_FEATURE_DEVICE_REMOVAL,
 	SPA_FEATURE_OBSOLETE_COUNTS,
+	SPA_FEATURE_POOL_CHECKPOINT,
+	SPA_FEATURE_SPACEMAP_V2,
+	SPA_FEATURE_ALLOCATION_CLASSES,
 	SPA_FEATURES
 } spa_feature_t;
 

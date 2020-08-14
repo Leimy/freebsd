@@ -132,6 +132,9 @@ struct tty {
 	void		*t_devswsoftc;	/* (c) Soft config, for drivers. */
 	void		*t_hooksoftc;	/* (t) Soft config, for hooks. */
 	struct cdev	*t_dev;		/* (c) Primary character device. */
+
+	size_t		t_prbufsz;	/* (t) SIGINFO buffer size. */
+	char		t_prbuf[];	/* (t) SIGINFO buffer. */
 };
 
 /*
@@ -170,8 +173,11 @@ void	tty_rel_gone(struct tty *tp);
 #define	tty_lock(tp)		mtx_lock((tp)->t_mtx)
 #define	tty_unlock(tp)		mtx_unlock((tp)->t_mtx)
 #define	tty_lock_owned(tp)	mtx_owned((tp)->t_mtx)
-#define	tty_lock_assert(tp,ma)	mtx_assert((tp)->t_mtx, (ma))
+#define	tty_assert_locked(tp)	mtx_assert((tp)->t_mtx, MA_OWNED)
 #define	tty_getlock(tp)		((tp)->t_mtx)
+
+/* XXX Should migrate users to tty_assert_locked! */
+#define	tty_lock_assert(tp, ma)	mtx_assert((tp)->t_mtx, (ma))
 
 /* Device node creation. */
 int	tty_makedevf(struct tty *tp, struct ucred *cred, int flags,
@@ -194,6 +200,7 @@ void	tty_wakeup(struct tty *tp, int flags);
 /* System messages. */
 int	tty_checkoutq(struct tty *tp);
 int	tty_putchar(struct tty *tp, char c);
+int	tty_putstrn(struct tty *tp, const char *p, size_t n);
 
 int	tty_ioctl(struct tty *tp, u_long cmd, void *data, int fflag,
     struct thread *td);

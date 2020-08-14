@@ -32,12 +32,9 @@
  * SUCH DAMAGE.
  */
 
-#ifndef lint
 #if 0
 static char sccsid[] = "@(#)find.c	8.5 (Berkeley) 8/5/94";
-#else
 #endif
-#endif /* not lint */
 
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
@@ -211,8 +208,10 @@ find_execute(PLAN *plan, char *paths[])
 			    entry->fts_path, strerror(entry->fts_errno));
 			exitstatus = 1;
 			continue;
-#ifdef FTS_W
+#if defined(FTS_W) && defined(FTS_WHITEOUT)
 		case FTS_W:
+			if (ftsoptions & FTS_WHITEOUT)
+				break;
 			continue;
 #endif /* FTS_W */
 		}

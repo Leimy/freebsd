@@ -60,19 +60,27 @@ __FBSDID("$FreeBSD$");
 #include <sys/mutex.h>
 #include <sys/vmmeter.h>
 #include <sys/proc.h>
+#include <sys/queue.h>
 #include <sys/sbuf.h>
+#include <sys/smp.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <sys/vmem.h>
+#ifdef EPOCH_TRACE
+#include <sys/epoch.h>
+#endif
 
 #include <vm/vm.h>
 #include <vm/pmap.h>
+#include <vm/vm_domainset.h>
 #include <vm/vm_pageout.h>
 #include <vm/vm_param.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_extern.h>
 #include <vm/vm_map.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
+#include <vm/vm_pagequeue.h>
 #include <vm/uma.h>
 #include <vm/uma_int.h>
 #include <vm/uma_dbg.h>
@@ -93,7 +101,8 @@ __FBSDID("$FreeBSD$");
 #ifdef KDTRACE_HOOKS
 #include <sys/dtrace_bsd.h>
 
-dtrace_malloc_probe_func_t	dtrace_malloc_probe;
+bool	__read_frequently			dtrace_malloc_enabled;
+dtrace_malloc_probe_func_t __read_mostly	dtrace_malloc_probe;
 #endif
 
 #if defined(INVARIANTS) || defined(MALLOC_MAKE_FAILURES) ||		\
@@ -144,7 +153,7 @@ static int numzones = MALLOC_DEBUG_MAXZONES;
  */
 struct {
 	int kz_size;
-	char *kz_name;
+	const char *kz_name;
 	uma_zone_t kz_zone[MALLOC_DEBUG_MAXZONES];
 } kmemzones[] = {
 	{16, "16", },
@@ -172,6 +181,7 @@ struct {
  * declare malloc types.
  */
 static uma_zone_t mt_zone;
+static uma_zone_t mt_stats_zone;
 
 u_long vm_kmem_size;
 SYSCTL_ULONG(_vm, OID_AUTO, kmem_size, CTLFLAG_RDTUN, &vm_kmem_size, 0,
@@ -222,7 +232,7 @@ static int sysctl_kern_malloc_stats(SYSCTL_HANDLER_ARGS);
 static time_t t_malloc_fail;
 
 #if defined(MALLOC_MAKE_FAILURES) || (MALLOC_DEBUG_MAXZONES > 1)
-static SYSCTL_NODE(_debug, OID_AUTO, malloc, CTLFLAG_RD, 0,
+static SYSCTL_NODE(_debug, OID_AUTO, malloc, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
     "Kernel malloc debugging options");
 #endif
 
@@ -296,22 +306,49 @@ SYSCTL_UINT(_debug_malloc, OID_AUTO, zone_offset, CTLFLAG_RDTUN,
     &zone_offset, 0, "Separate malloc types by examining the "
     "Nth character in the malloc type short description.");
 
-static u_int
-mtp_get_subzone(const char *desc)
+static void
+mtp_set_subzone(struct malloc_type *mtp)
 {
+	struct malloc_type_internal *mtip;
+	const char *desc;
 	size_t len;
 	u_int val;
 
+	mtip = mtp->ks_handle;
+	desc = mtp->ks_shortdesc;
 	if (desc == NULL || (len = strlen(desc)) == 0)
-		return (0);
-	val = desc[zone_offset % len];
-	return (val % numzones);
+		val = 0;
+	else
+		val = desc[zone_offset % len];
+	mtip->mti_zone = (val % numzones);
+}
+
+static inline u_int
+mtp_get_subzone(struct malloc_type *mtp)
+{
+	struct malloc_type_internal *mtip;
+
+	mtip = mtp->ks_handle;
+
+	KASSERT(mtip->mti_zone < numzones,
+	    ("mti_zone %u out of range %d",
+	    mtip->mti_zone, numzones));
+	return (mtip->mti_zone);
 }
 #elif MALLOC_DEBUG_MAXZONES == 0
 #error "MALLOC_DEBUG_MAXZONES must be positive."
 #else
+static void
+mtp_set_subzone(struct malloc_type *mtp)
+{
+	struct malloc_type_internal *mtip;
+
+	mtip = mtp->ks_handle;
+	mtip->mti_zone = 0;
+}
+
 static inline u_int
-mtp_get_subzone(const char *desc)
+mtp_get_subzone(struct malloc_type *mtp)
 {
 
 	return (0);
@@ -340,7 +377,7 @@ malloc_type_zone_allocated(struct malloc_type *mtp, unsigned long size,
 
 	critical_enter();
 	mtip = mtp->ks_handle;
-	mtsp = &mtip->mti_stats[curcpu];
+	mtsp = zpcpu_get(mtip->mti_stats);
 	if (size > 0) {
 		mtsp->mts_memalloced += size;
 		mtsp->mts_numallocs++;
@@ -349,7 +386,7 @@ malloc_type_zone_allocated(struct malloc_type *mtp, unsigned long size,
 		mtsp->mts_size |= 1 << zindx;
 
 #ifdef KDTRACE_HOOKS
-	if (dtrace_malloc_probe != NULL) {
+	if (__predict_false(dtrace_malloc_enabled)) {
 		uint32_t probe_id = mtip->mti_probes[DTMALLOC_PROBE_MALLOC];
 		if (probe_id != 0)
 			(dtrace_malloc_probe)(probe_id,
@@ -383,12 +420,12 @@ malloc_type_freed(struct malloc_type *mtp, unsigned long size)
 
 	critical_enter();
 	mtip = mtp->ks_handle;
-	mtsp = &mtip->mti_stats[curcpu];
+	mtsp = zpcpu_get(mtip->mti_stats);
 	mtsp->mts_memfreed += size;
 	mtsp->mts_numfrees++;
 
 #ifdef KDTRACE_HOOKS
-	if (dtrace_malloc_probe != NULL) {
+	if (__predict_false(dtrace_malloc_enabled)) {
 		uint32_t probe_id = mtip->mti_probes[DTMALLOC_PROBE_FREE];
 		if (probe_id != 0)
 			(dtrace_malloc_probe)(probe_id,
@@ -415,21 +452,21 @@ contigmalloc(unsigned long size, struct malloc_type *type, int flags,
 {
 	void *ret;
 
-	ret = (void *)kmem_alloc_contig(kernel_arena, size, flags, low, high,
-	    alignment, boundary, VM_MEMATTR_DEFAULT);
+	ret = (void *)kmem_alloc_contig(size, flags, low, high, alignment,
+	    boundary, VM_MEMATTR_DEFAULT);
 	if (ret != NULL)
 		malloc_type_allocated(type, round_page(size));
 	return (ret);
 }
 
 void *
-contigmalloc_domain(unsigned long size, struct malloc_type *type,
-    int domain, int flags, vm_paddr_t low, vm_paddr_t high,
+contigmalloc_domainset(unsigned long size, struct malloc_type *type,
+    struct domainset *ds, int flags, vm_paddr_t low, vm_paddr_t high,
     unsigned long alignment, vm_paddr_t boundary)
 {
 	void *ret;
 
-	ret = (void *)kmem_alloc_contig_domain(domain, size, flags, low, high,
+	ret = (void *)kmem_alloc_contig_domainset(ds, size, flags, low, high,
 	    alignment, boundary, VM_MEMATTR_DEFAULT);
 	if (ret != NULL)
 		malloc_type_allocated(type, round_page(size));
@@ -447,7 +484,7 @@ void
 contigfree(void *addr, unsigned long size, struct malloc_type *type)
 {
 
-	kmem_free(kernel_arena, (vm_offset_t)addr, size);
+	kmem_free((vm_offset_t)addr, size);
 	malloc_type_freed(type, round_page(size));
 }
 
@@ -486,9 +523,17 @@ malloc_dbg(caddr_t *vap, size_t *sizep, struct malloc_type *mtp,
 		}
 	}
 #endif
-	if (flags & M_WAITOK)
+	if (flags & M_WAITOK) {
 		KASSERT(curthread->td_intr_nesting_level == 0,
 		   ("malloc(M_WAITOK) in interrupt context"));
+		if (__predict_false(!THREAD_CAN_SLEEP())) {
+#ifdef EPOCH_TRACE
+			epoch_trace_list(curthread);
+#endif
+			KASSERT(1, 
+			    ("malloc(M_WAITOK) with sleeping prohibited"));
+		}
+	}
 	KASSERT(curthread->td_critnest == 0 || SCHEDULER_STOPPED(),
 	    ("malloc: called with spinlock or critical section held"));
 
@@ -510,6 +555,52 @@ malloc_dbg(caddr_t *vap, size_t *sizep, struct malloc_type *mtp,
 #endif
 
 /*
+ * Handle large allocations and frees by using kmem_malloc directly.
+ */
+static inline bool
+malloc_large_slab(uma_slab_t slab)
+{
+	uintptr_t va;
+
+	va = (uintptr_t)slab;
+	return ((va & 1) != 0);
+}
+
+static inline size_t
+malloc_large_size(uma_slab_t slab)
+{
+	uintptr_t va;
+
+	va = (uintptr_t)slab;
+	return (va >> 1);
+}
+
+static caddr_t
+malloc_large(size_t *size, struct domainset *policy, int flags)
+{
+	vm_offset_t va;
+	size_t sz;
+
+	sz = roundup(*size, PAGE_SIZE);
+	va = kmem_malloc_domainset(policy, sz, flags);
+	if (va != 0) {
+		/* The low bit is unused for slab pointers. */
+		vsetzoneslab(va, NULL, (void *)((sz << 1) | 1));
+		uma_total_inc(sz);
+		*size = sz;
+	}
+	return ((caddr_t)va);
+}
+
+static void
+free_large(void *addr, size_t size)
+{
+
+	kmem_free((vm_offset_t)addr, size);
+	uma_total_dec(size);
+}
+
+/*
  *	malloc:
  *
  *	Allocate a block of memory.
@@ -518,10 +609,9 @@ malloc_dbg(caddr_t *vap, size_t *sizep, struct malloc_type *mtp,
  *	the allocation fails.
  */
 void *
-malloc(size_t size, struct malloc_type *mtp, int flags)
+(malloc)(size_t size, struct malloc_type *mtp, int flags)
 {
 	int indx;
-	struct malloc_type_internal *mtip;
 	caddr_t va;
 	uma_zone_t zone;
 #if defined(DEBUG_REDZONE)
@@ -529,19 +619,16 @@ malloc(size_t size, struct malloc_type *mtp, int flags)
 #endif
 
 #ifdef MALLOC_DEBUG
+	va = NULL;
 	if (malloc_dbg(&va, &size, mtp, flags) != 0)
 		return (va);
 #endif
 
-	if (size <= kmem_zmax) {
-		mtip = mtp->ks_handle;
+	if (size <= kmem_zmax && (flags & M_EXEC) == 0) {
 		if (size & KMEM_ZMASK)
 			size = (size & ~KMEM_ZMASK) + KMEM_ZBASE;
 		indx = kmemsize[size >> KMEM_ZSHIFT];
-		KASSERT(mtip->mti_zone < numzones,
-		    ("mti_zone %u out of range %d",
-		    mtip->mti_zone, numzones));
-		zone = kmemzones[indx].kz_zone[mtip->mti_zone];
+		zone = kmemzones[indx].kz_zone[mtp_get_subzone(mtp)];
 #ifdef MALLOC_PROFILE
 		krequests[size >> KMEM_ZSHIFT]++;
 #endif
@@ -550,9 +637,7 @@ malloc(size_t size, struct malloc_type *mtp, int flags)
 			size = zone->uz_size;
 		malloc_type_zone_allocated(mtp, va == NULL ? 0 : size, indx);
 	} else {
-		size = roundup(size, PAGE_SIZE);
-		zone = NULL;
-		va = uma_large_malloc(size, flags);
+		va = malloc_large(&size, DOMAINSET_RR(), flags);
 		malloc_type_allocated(mtp, va == NULL ? 0 : size);
 	}
 	if (flags & M_WAITOK)
@@ -566,53 +651,71 @@ malloc(size_t size, struct malloc_type *mtp, int flags)
 	return ((void *) va);
 }
 
-void *
-malloc_domain(size_t size, struct malloc_type *mtp, int domain,
+static void *
+malloc_domain(size_t *sizep, int *indxp, struct malloc_type *mtp, int domain,
     int flags)
 {
-	int indx;
-	struct malloc_type_internal *mtip;
-	caddr_t va;
 	uma_zone_t zone;
+	caddr_t va;
+	size_t size;
+	int indx;
+
+	size = *sizep;
+	KASSERT(size <= kmem_zmax && (flags & M_EXEC) == 0,
+	    ("malloc_domain: Called with bad flag / size combination."));
+	if (size & KMEM_ZMASK)
+		size = (size & ~KMEM_ZMASK) + KMEM_ZBASE;
+	indx = kmemsize[size >> KMEM_ZSHIFT];
+	zone = kmemzones[indx].kz_zone[mtp_get_subzone(mtp)];
+#ifdef MALLOC_PROFILE
+	krequests[size >> KMEM_ZSHIFT]++;
+#endif
+	va = uma_zalloc_domain(zone, NULL, domain, flags);
+	if (va != NULL)
+		*sizep = zone->uz_size;
+	*indxp = indx;
+	return ((void *)va);
+}
+
+void *
+malloc_domainset(size_t size, struct malloc_type *mtp, struct domainset *ds,
+    int flags)
+{
+	struct vm_domainset_iter di;
+	caddr_t ret;
+	int domain;
+	int indx;
+
 #if defined(DEBUG_REDZONE)
 	unsigned long osize = size;
 #endif
-
 #ifdef MALLOC_DEBUG
-	if (malloc_dbg(&va, &size, mtp, flags) != 0)
-		return (va);
+	ret= NULL;
+	if (malloc_dbg(&ret, &size, mtp, flags) != 0)
+		return (ret);
 #endif
-	if (size <= kmem_zmax) {
-		mtip = mtp->ks_handle;
-		if (size & KMEM_ZMASK)
-			size = (size & ~KMEM_ZMASK) + KMEM_ZBASE;
-		indx = kmemsize[size >> KMEM_ZSHIFT];
-		KASSERT(mtip->mti_zone < numzones,
-		    ("mti_zone %u out of range %d",
-		    mtip->mti_zone, numzones));
-		zone = kmemzones[indx].kz_zone[mtip->mti_zone];
-#ifdef MALLOC_PROFILE
-		krequests[size >> KMEM_ZSHIFT]++;
-#endif
-		va = uma_zalloc_domain(zone, NULL, domain, flags);
-		if (va != NULL)
-			size = zone->uz_size;
-		malloc_type_zone_allocated(mtp, va == NULL ? 0 : size, indx);
+	if (size <= kmem_zmax && (flags & M_EXEC) == 0) {
+		vm_domainset_iter_policy_init(&di, ds, &domain, &flags);
+		do {
+			ret = malloc_domain(&size, &indx, mtp, domain, flags);
+		} while (ret == NULL &&
+		    vm_domainset_iter_policy(&di, &domain) == 0);
+		malloc_type_zone_allocated(mtp, ret == NULL ? 0 : size, indx);
 	} else {
-		size = roundup(size, PAGE_SIZE);
-		zone = NULL;
-		va = uma_large_malloc_domain(size, domain, flags);
-		malloc_type_allocated(mtp, va == NULL ? 0 : size);
+		/* Policy is handled by kmem. */
+		ret = malloc_large(&size, ds, flags);
+		malloc_type_allocated(mtp, ret == NULL ? 0 : size);
 	}
+
 	if (flags & M_WAITOK)
-		KASSERT(va != NULL, ("malloc(M_WAITOK) returned NULL"));
-	else if (va == NULL)
+		KASSERT(ret != NULL, ("malloc(M_WAITOK) returned NULL"));
+	else if (ret == NULL)
 		t_malloc_fail = time_uptime;
 #ifdef DEBUG_REDZONE
-	if (va != NULL)
-		va = redzone_setup(va, osize);
+	if (ret != NULL)
+		ret = redzone_setup(ret, osize);
 #endif
-	return ((void *) va);
+	return (ret);
 }
 
 void *
@@ -687,6 +790,7 @@ free_dbg(void **addrp, struct malloc_type *mtp)
 void
 free(void *addr, struct malloc_type *mtp)
 {
+	uma_zone_t zone;
 	uma_slab_t slab;
 	u_long size;
 
@@ -698,27 +802,35 @@ free(void *addr, struct malloc_type *mtp)
 	if (addr == NULL)
 		return;
 
-	slab = vtoslab((vm_offset_t)addr & (~UMA_SLAB_MASK));
+	vtozoneslab((vm_offset_t)addr & (~UMA_SLAB_MASK), &zone, &slab);
 	if (slab == NULL)
 		panic("free: address %p(%p) has not been allocated.\n",
 		    addr, (void *)((u_long)addr & (~UMA_SLAB_MASK)));
 
-	if (!(slab->us_flags & UMA_SLAB_MALLOC)) {
-		size = slab->us_keg->uk_size;
+	if (__predict_true(!malloc_large_slab(slab))) {
+		size = zone->uz_size;
 #ifdef INVARIANTS
 		free_save_type(addr, mtp, size);
 #endif
-		uma_zfree_arg(LIST_FIRST(&slab->us_keg->uk_zones), addr, slab);
+		uma_zfree_arg(zone, addr, slab);
 	} else {
-		size = slab->us_size;
-		uma_large_free(slab);
+		size = malloc_large_size(slab);
+		free_large(addr, size);
 	}
 	malloc_type_freed(mtp, size);
 }
 
+/*
+ *	zfree:
+ *
+ *	Zero then free a block of memory allocated by malloc.
+ *
+ *	This routine may not block.
+ */
 void
-free_domain(void *addr, struct malloc_type *mtp)
+zfree(void *addr, struct malloc_type *mtp)
 {
+	uma_zone_t zone;
 	uma_slab_t slab;
 	u_long size;
 
@@ -726,26 +838,26 @@ free_domain(void *addr, struct malloc_type *mtp)
 	if (free_dbg(&addr, mtp) != 0)
 		return;
 #endif
-
 	/* free(NULL, ...) does nothing */
 	if (addr == NULL)
 		return;
 
-	slab = vtoslab((vm_offset_t)addr & (~UMA_SLAB_MASK));
+	vtozoneslab((vm_offset_t)addr & (~UMA_SLAB_MASK), &zone, &slab);
 	if (slab == NULL)
-		panic("free_domain: address %p(%p) has not been allocated.\n",
+		panic("free: address %p(%p) has not been allocated.\n",
 		    addr, (void *)((u_long)addr & (~UMA_SLAB_MASK)));
 
-	if (!(slab->us_flags & UMA_SLAB_MALLOC)) {
-		size = slab->us_keg->uk_size;
+	if (__predict_true(!malloc_large_slab(slab))) {
+		size = zone->uz_size;
 #ifdef INVARIANTS
 		free_save_type(addr, mtp, size);
 #endif
-		uma_zfree_domain(LIST_FIRST(&slab->us_keg->uk_zones),
-		    addr, slab);
+		explicit_bzero(addr, size);
+		uma_zfree_arg(zone, addr, slab);
 	} else {
-		size = slab->us_size;
-		uma_large_free(slab);
+		size = malloc_large_size(slab);
+		explicit_bzero(addr, size);
+		free_large(addr, size);
 	}
 	malloc_type_freed(mtp, size);
 }
@@ -756,6 +868,7 @@ free_domain(void *addr, struct malloc_type *mtp)
 void *
 realloc(void *addr, size_t size, struct malloc_type *mtp, int flags)
 {
+	uma_zone_t zone;
 	uma_slab_t slab;
 	unsigned long alloc;
 	void *newaddr;
@@ -781,19 +894,20 @@ realloc(void *addr, size_t size, struct malloc_type *mtp, int flags)
 
 #ifdef DEBUG_REDZONE
 	slab = NULL;
+	zone = NULL;
 	alloc = redzone_get_size(addr);
 #else
-	slab = vtoslab((vm_offset_t)addr & ~(UMA_SLAB_MASK));
+	vtozoneslab((vm_offset_t)addr & (~UMA_SLAB_MASK), &zone, &slab);
 
 	/* Sanity check */
 	KASSERT(slab != NULL,
 	    ("realloc: address %p out of range", (void *)addr));
 
 	/* Get the size of the original block */
-	if (!(slab->us_flags & UMA_SLAB_MALLOC))
-		alloc = slab->us_keg->uk_size;
+	if (!malloc_large_slab(slab))
+		alloc = zone->uz_size;
 	else
-		alloc = slab->us_size;
+		alloc = malloc_large_size(slab);
 
 	/* Reuse the original block if appropriate */
 	if (size <= alloc
@@ -824,9 +938,7 @@ reallocf(void *addr, size_t size, struct malloc_type *mtp, int flags)
 	return (mem);
 }
 
-#ifndef __sparc64__
 CTASSERT(VM_KMEM_SIZE_SCALE >= 1);
-#endif
 
 /*
  * Initialize the kernel memory (kmem) arena.
@@ -877,13 +989,16 @@ kmeminit(void)
 	 * variable:
 	 */
 	if (vm_kmem_size == 0) {
-		vm_kmem_size = (mem_size / vm_kmem_size_scale) * PAGE_SIZE;
-
+		vm_kmem_size = mem_size / vm_kmem_size_scale;
+		vm_kmem_size = vm_kmem_size * PAGE_SIZE < vm_kmem_size ?
+		    vm_kmem_size_max : vm_kmem_size * PAGE_SIZE;
 		if (vm_kmem_size_min > 0 && vm_kmem_size < vm_kmem_size_min)
 			vm_kmem_size = vm_kmem_size_min;
 		if (vm_kmem_size_max > 0 && vm_kmem_size >= vm_kmem_size_max)
 			vm_kmem_size = vm_kmem_size_max;
 	}
+	if (vm_kmem_size == 0)
+		panic("Tune VM_KMEM_SIZE_* for the platform");
 
 	/*
 	 * The amount of KVA space that is preallocated to the
@@ -930,6 +1045,9 @@ mallocinit(void *dummy)
 	if (kmem_zmax < PAGE_SIZE || kmem_zmax > KMEM_ZMAX)
 		kmem_zmax = KMEM_ZMAX;
 
+	mt_stats_zone = uma_zcreate("mt_stats_zone",
+	    sizeof(struct malloc_type_stats), NULL, NULL, NULL, NULL,
+	    UMA_ALIGN_PTR, UMA_ZONE_PCPU);
 	mt_zone = uma_zcreate("mt_zone", sizeof(struct malloc_type_internal),
 #ifdef INVARIANTS
 	    mtrash_ctor, mtrash_dtor, mtrash_init, mtrash_fini,
@@ -939,7 +1057,7 @@ mallocinit(void *dummy)
 	    UMA_ALIGN_PTR, UMA_ZONE_MALLOC);
 	for (i = 0, indx = 0; kmemzones[indx].kz_size != 0; indx++) {
 		int size = kmemzones[indx].kz_size;
-		char *name = kmemzones[indx].kz_name;
+		const char *name = kmemzones[indx].kz_name;
 		int subzone;
 
 		for (subzone = 0; subzone < numzones; subzone++) {
@@ -972,8 +1090,9 @@ malloc_init(void *data)
 		panic("malloc_init: bad malloc type magic");
 
 	mtip = uma_zalloc(mt_zone, M_WAITOK | M_ZERO);
+	mtip->mti_stats = uma_zalloc_pcpu(mt_stats_zone, M_WAITOK | M_ZERO);
 	mtp->ks_handle = mtip;
-	mtip->mti_zone = mtp_get_subzone(mtp->ks_shortdesc);
+	mtp_set_subzone(mtp);
 
 	mtx_lock(&malloc_mtx);
 	mtp->ks_next = kmemstatistics;
@@ -1019,8 +1138,8 @@ malloc_uninit(void *data)
 	 * Look for memory leaks.
 	 */
 	temp_allocs = temp_bytes = 0;
-	for (i = 0; i < MAXCPU; i++) {
-		mtsp = &mtip->mti_stats[i];
+	for (i = 0; i <= mp_maxid; i++) {
+		mtsp = zpcpu_get_cpu(mtip->mti_stats, i);
 		temp_allocs += mtsp->mts_numallocs;
 		temp_allocs -= mtsp->mts_numfrees;
 		temp_bytes += mtsp->mts_memalloced;
@@ -1033,6 +1152,7 @@ malloc_uninit(void *data)
 	}
 
 	slab = vtoslab((vm_offset_t) mtip & (~UMA_SLAB_MASK));
+	uma_zfree_pcpu(mt_stats_zone, mtip->mti_stats);
 	uma_zfree_arg(mt_zone, mtip, slab);
 }
 
@@ -1054,6 +1174,7 @@ sysctl_kern_malloc_stats(SYSCTL_HANDLER_ARGS)
 {
 	struct malloc_type_stream_header mtsh;
 	struct malloc_type_internal *mtip;
+	struct malloc_type_stats *mtsp, zeromts;
 	struct malloc_type_header mth;
 	struct malloc_type *mtp;
 	int error, i;
@@ -1065,6 +1186,8 @@ sysctl_kern_malloc_stats(SYSCTL_HANDLER_ARGS)
 	sbuf_new_for_sysctl(&sbuf, NULL, 128, req);
 	sbuf_clear_flags(&sbuf, SBUF_INCLUDENUL);
 	mtx_lock(&malloc_mtx);
+
+	bzero(&zeromts, sizeof(zeromts));
 
 	/*
 	 * Insert stream header.
@@ -1091,10 +1214,17 @@ sysctl_kern_malloc_stats(SYSCTL_HANDLER_ARGS)
 		/*
 		 * Insert type statistics for each CPU.
 		 */
-		for (i = 0; i < MAXCPU; i++) {
-			(void)sbuf_bcat(&sbuf, &mtip->mti_stats[i],
-			    sizeof(mtip->mti_stats[i]));
+		for (i = 0; i <= mp_maxid; i++) {
+			mtsp = zpcpu_get_cpu(mtip->mti_stats, i);
+			(void)sbuf_bcat(&sbuf, mtsp, sizeof(*mtsp));
 		}
+		/*
+		 * Fill in the missing CPUs.
+		 */
+		for (; i < MAXCPU; i++) {
+			(void)sbuf_bcat(&sbuf, &zeromts, sizeof(zeromts));
+		}
+
 	}
 	mtx_unlock(&malloc_mtx);
 	error = sbuf_finish(&sbuf);
@@ -1102,8 +1232,9 @@ sysctl_kern_malloc_stats(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_kern, OID_AUTO, malloc_stats, CTLFLAG_RD|CTLTYPE_STRUCT,
-    0, 0, sysctl_kern_malloc_stats, "s,malloc_type_ustats",
+SYSCTL_PROC(_kern, OID_AUTO, malloc_stats,
+    CTLFLAG_RD | CTLTYPE_STRUCT | CTLFLAG_MPSAFE, 0, 0,
+    sysctl_kern_malloc_stats, "s,malloc_type_ustats",
     "Return malloc types");
 
 SYSCTL_INT(_kern, OID_AUTO, malloc_count, CTLFLAG_RD, &kmemcount, 0,
@@ -1144,33 +1275,90 @@ restart:
 }
 
 #ifdef DDB
-DB_SHOW_COMMAND(malloc, db_show_malloc)
+static int64_t
+get_malloc_stats(const struct malloc_type_internal *mtip, uint64_t *allocs,
+    uint64_t *inuse)
 {
-	struct malloc_type_internal *mtip;
-	struct malloc_type *mtp;
-	uint64_t allocs, frees;
-	uint64_t alloced, freed;
+	const struct malloc_type_stats *mtsp;
+	uint64_t frees, alloced, freed;
 	int i;
 
-	db_printf("%18s %12s  %12s %12s\n", "Type", "InUse", "MemUse",
-	    "Requests");
-	for (mtp = kmemstatistics; mtp != NULL; mtp = mtp->ks_next) {
-		mtip = (struct malloc_type_internal *)mtp->ks_handle;
-		allocs = 0;
-		frees = 0;
-		alloced = 0;
-		freed = 0;
-		for (i = 0; i < MAXCPU; i++) {
-			allocs += mtip->mti_stats[i].mts_numallocs;
-			frees += mtip->mti_stats[i].mts_numfrees;
-			alloced += mtip->mti_stats[i].mts_memalloced;
-			freed += mtip->mti_stats[i].mts_memfreed;
+	*allocs = 0;
+	frees = 0;
+	alloced = 0;
+	freed = 0;
+	for (i = 0; i <= mp_maxid; i++) {
+		mtsp = zpcpu_get_cpu(mtip->mti_stats, i);
+
+		*allocs += mtsp->mts_numallocs;
+		frees += mtsp->mts_numfrees;
+		alloced += mtsp->mts_memalloced;
+		freed += mtsp->mts_memfreed;
+	}
+	*inuse = *allocs - frees;
+	return (alloced - freed);
+}
+
+DB_SHOW_COMMAND(malloc, db_show_malloc)
+{
+	const char *fmt_hdr, *fmt_entry;
+	struct malloc_type *mtp;
+	uint64_t allocs, inuse;
+	int64_t size;
+	/* variables for sorting */
+	struct malloc_type *last_mtype, *cur_mtype;
+	int64_t cur_size, last_size;
+	int ties;
+
+	if (modif[0] == 'i') {
+		fmt_hdr = "%s,%s,%s,%s\n";
+		fmt_entry = "\"%s\",%ju,%jdK,%ju\n";
+	} else {
+		fmt_hdr = "%18s %12s  %12s %12s\n";
+		fmt_entry = "%18s %12ju %12jdK %12ju\n";
+	}
+
+	db_printf(fmt_hdr, "Type", "InUse", "MemUse", "Requests");
+
+	/* Select sort, largest size first. */
+	last_mtype = NULL;
+	last_size = INT64_MAX;
+	for (;;) {
+		cur_mtype = NULL;
+		cur_size = -1;
+		ties = 0;
+
+		for (mtp = kmemstatistics; mtp != NULL; mtp = mtp->ks_next) {
+			/*
+			 * In the case of size ties, print out mtypes
+			 * in the order they are encountered.  That is,
+			 * when we encounter the most recently output
+			 * mtype, we have already printed all preceding
+			 * ties, and we must print all following ties.
+			 */
+			if (mtp == last_mtype) {
+				ties = 1;
+				continue;
+			}
+			size = get_malloc_stats(mtp->ks_handle, &allocs,
+			    &inuse);
+			if (size > cur_size && size < last_size + ties) {
+				cur_size = size;
+				cur_mtype = mtp;
+			}
 		}
-		db_printf("%18s %12ju %12juK %12ju\n",
-		    mtp->ks_shortdesc, allocs - frees,
-		    (alloced - freed + 1023) / 1024, allocs);
+		if (cur_mtype == NULL)
+			break;
+
+		size = get_malloc_stats(cur_mtype->ks_handle, &allocs, &inuse);
+		db_printf(fmt_entry, cur_mtype->ks_shortdesc, inuse,
+		    howmany(size, 1024), allocs);
+
 		if (db_pager_quit)
 			break;
+
+		last_mtype = cur_mtype;
+		last_size = cur_size;
 	}
 }
 
@@ -1250,6 +1438,8 @@ sysctl_kern_mprof(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_OID(_kern, OID_AUTO, mprof, CTLTYPE_STRING|CTLFLAG_RD,
-    NULL, 0, sysctl_kern_mprof, "A", "Malloc Profiling");
+SYSCTL_OID(_kern, OID_AUTO, mprof,
+    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_NEEDGIANT, NULL, 0,
+    sysctl_kern_mprof, "A",
+    "Malloc Profiling");
 #endif /* MALLOC_PROFILE */

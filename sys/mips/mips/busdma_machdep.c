@@ -55,6 +55,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 #include <vm/vm_map.h>
 
 #include <machine/atomic.h>
@@ -141,7 +142,8 @@ static int total_bpages;
 static int busdma_zonecount;
 static STAILQ_HEAD(, bounce_zone) bounce_zone_list;
 
-static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD, 0, "Busdma parameters");
+static SYSCTL_NODE(_hw, OID_AUTO, busdma, CTLFLAG_RD, 0,
+    "Busdma parameters");
 SYSCTL_INT(_hw_busdma, OID_AUTO, total_bpages, CTLFLAG_RD, &total_bpages, 0,
 	   "Total bounce pages");
 
@@ -155,8 +157,6 @@ struct bus_dmamap {
 	bus_dma_tag_t	dmat;
 	struct memdesc	mem;
 	int		flags;
-	void		*origbuffer;
-	void		*allocbuffer;
 	TAILQ_ENTRY(bus_dmamap)	freelist;
 	STAILQ_ENTRY(bus_dmamap) links;
 	bus_dmamap_callback_t *callback;
@@ -204,11 +204,8 @@ dmamap_ctor(void *mem, int size, void *arg, int flags)
 
 	dmat->map_count++;
 
+	bzero(map, sizeof(*map));
 	map->dmat = dmat;
-	map->flags = 0;
-	map->slist = NULL;
-	map->allocbuffer = NULL;
-	map->sync_count = 0;
 	STAILQ_INIT(&map->bpages);
 
 	return (0);
@@ -480,6 +477,57 @@ bus_dma_tag_create(bus_dma_tag_t parent, bus_size_t alignment,
 	return (error);
 }
 
+void
+bus_dma_template_init(bus_dma_tag_template_t *t, bus_dma_tag_t parent)
+{
+
+	if (t == NULL)
+		return;
+
+	t->parent = parent;
+	t->alignment = 1;
+	t->boundary = 0;
+	t->lowaddr = t->highaddr = BUS_SPACE_MAXADDR;
+	t->maxsize = t->maxsegsize = BUS_SPACE_MAXSIZE;
+	t->nsegments = BUS_SPACE_UNRESTRICTED;
+	t->lockfunc = NULL;
+	t->lockfuncarg = NULL;
+	t->flags = 0;
+}
+
+int
+bus_dma_template_tag(bus_dma_tag_template_t *t, bus_dma_tag_t *dmat)
+{
+
+	if (t == NULL || dmat == NULL)
+		return (EINVAL);
+
+	return (bus_dma_tag_create(t->parent, t->alignment, t->boundary,
+	    t->lowaddr, t->highaddr, NULL, NULL, t->maxsize,
+	    t->nsegments, t->maxsegsize, t->flags, t->lockfunc, t->lockfuncarg,
+	    dmat));
+}
+
+void
+bus_dma_template_clone(bus_dma_tag_template_t *t, bus_dma_tag_t dmat)
+{
+
+	if (t == NULL || dmat == NULL)
+		return;
+
+	t->parent = dmat->parent;
+	t->alignment = dmat->alignment;
+	t->boundary = dmat->boundary;
+	t->lowaddr = dmat->lowaddr;
+	t->highaddr = dmat->highaddr;
+	t->maxsize = dmat->maxsize;
+	t->nsegments = dmat->nsegments;
+	t->maxsegsize = dmat->maxsegsz;
+	t->flags = dmat->flags;
+	t->lockfunc = dmat->lockfunc;
+	t->lockfuncarg = dmat->lockfuncarg;
+}
+
 int
 bus_dma_tag_set_domain(bus_dma_tag_t dmat, int domain)
 {
@@ -714,12 +762,11 @@ bus_dmamem_alloc(bus_dma_tag_t dmat, void** vaddrp, int flags,
 	    howmany(dmat->maxsize, MIN(dmat->maxsegsz, PAGE_SIZE)) &&
 	    dmat->alignment <= PAGE_SIZE &&
 	    (dmat->boundary % PAGE_SIZE) == 0) {
-		vaddr = (void *)kmem_alloc_attr(kernel_arena, dmat->maxsize,
-		    mflags, 0, dmat->lowaddr, memattr);
+		vaddr = (void *)kmem_alloc_attr(dmat->maxsize, mflags, 0,
+		    dmat->lowaddr, memattr);
 	} else {
-		vaddr = (void *)kmem_alloc_contig(kernel_arena, dmat->maxsize,
-		    mflags, 0, dmat->lowaddr, dmat->alignment, dmat->boundary,
-		    memattr);
+		vaddr = (void *)kmem_alloc_contig(dmat->maxsize, mflags, 0,
+		    dmat->lowaddr, dmat->alignment, dmat->boundary, memattr);
 	}
 	if (vaddr == NULL) {
 		_busdma_free_dmamap(newmap);
@@ -757,7 +804,7 @@ bus_dmamem_free(bus_dma_tag_t dmat, void *vaddr, bus_dmamap_t map)
 	    !_bus_dma_can_bounce(dmat->lowaddr, dmat->highaddr))
 		uma_zfree(bufzone->umazone, vaddr);
 	else
-		kmem_free(kernel_arena, (vm_offset_t)vaddr, dmat->maxsize);
+		kmem_free((vm_offset_t)vaddr, dmat->maxsize);
 	CTR3(KTR_BUSDMA, "%s: tag %p flags 0x%x", __func__, dmat, dmat->flags);
 }
 
@@ -1328,7 +1375,7 @@ alloc_bounce_zone(bus_dma_tag_t dmat)
 	sysctl_ctx_init(&bz->sysctl_tree);
 	bz->sysctl_tree_top = SYSCTL_ADD_NODE(&bz->sysctl_tree,
 	    SYSCTL_STATIC_CHILDREN(_hw_busdma), OID_AUTO, bz->zoneid,
-	    CTLFLAG_RD, 0, "");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "");
 	if (bz->sysctl_tree_top == NULL) {
 		sysctl_ctx_free(&bz->sysctl_tree);
 		return (0);	/* XXX error code? */

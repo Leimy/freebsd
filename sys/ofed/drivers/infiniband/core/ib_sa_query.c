@@ -32,9 +32,10 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $FreeBSD$
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <linux/module.h>
 #include <linux/err.h>
@@ -696,18 +697,15 @@ int ib_init_ah_from_path(struct ib_device *device, u8 port_num,
 
 		resolved_dev = dev_get_by_index(dev_addr.net,
 						dev_addr.bound_dev_if);
-		if (resolved_dev->if_flags & IFF_LOOPBACK) {
-			dev_put(resolved_dev);
-			resolved_dev = idev;
-			dev_hold(resolved_dev);
+		if (!resolved_dev) {
+			dev_put(idev);
+			return -ENODEV;
 		}
 		ndev = ib_get_ndev_from_path(rec);
-		rcu_read_lock();
 		if ((ndev && ndev != resolved_dev) ||
 		    (resolved_dev != idev &&
-		     !rdma_is_upper_dev_rcu(idev, resolved_dev)))
+		     rdma_vlan_dev_real_dev(resolved_dev) != idev))
 			ret = -EHOSTUNREACH;
-		rcu_read_unlock();
 		dev_put(idev);
 		dev_put(resolved_dev);
 		if (ret) {

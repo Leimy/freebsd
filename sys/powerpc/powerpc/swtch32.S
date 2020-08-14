@@ -56,7 +56,7 @@
  * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include "assym.s"
+#include "assym.inc"
 #include "opt_sched.h"
 
 #include <sys/syscall.h>
@@ -92,27 +92,35 @@ ENTRY(cpu_switch)
 	mflr	%r16			/* Save the link register */
 	stw	%r16,PCB_LR(%r6)
 	stw	%r1,PCB_SP(%r6)		/* Save the stack pointer */
+	bl	1f
+1:
+	mflr	%r30			/* Prepare for secure-PLT calls */
+	addis	%r30, %r30, (_GLOBAL_OFFSET_TABLE_-1b)@ha
+	addi	%r30, %r30, (_GLOBAL_OFFSET_TABLE_-1b)@l
 
 	mr	%r14,%r3		/* Copy the old thread ptr... */
 	mr	%r2,%r4			/* and the new thread ptr in curthread */
 	mr	%r16,%r5		/* and the new lock */
 	mr	%r17,%r6		/* and the PCB */
 	
-	lwz	%r7,PCB_FLAGS(%r17)
+	lwz	%r18,PCB_FLAGS(%r17)
 	/* Save FPU context if needed */
-	andi.	%r7, %r7, PCB_FPU
+	andi.	%r7, %r18, PCB_FPU
 	beq	.L1
 	bl	save_fpu
 
 .L1:
 	mr	%r3,%r14		/* restore old thread ptr */
-	lwz	%r7,PCB_FLAGS(%r17)
 	/* Save Altivec context if needed */
-	andi.	%r7, %r7, PCB_VEC
+	andi.	%r7, %r18, PCB_VEC
 	beq	.L2
 	bl	save_vec
 	
 .L2:
+#if defined(__SPE__)
+	mfspr	%r3,SPR_SPEFSCR
+	stw	%r3,PCB_VSCR(%r17)
+#endif
 	mr	%r3,%r14		/* restore old thread ptr */
 	bl	pmap_deactivate		/* Deactivate the current pmap */
 
@@ -121,8 +129,12 @@ ENTRY(cpu_switch)
 cpu_switchin:
 #if defined(SMP) && defined(SCHED_ULE)
 	/* Wait for the new thread to become unblocked */
-	bl	_GLOBAL_OFFSET_TABLE_@local-4
+	bl	1f
+1:
 	mflr	%r6
+	addis	%r6,%r6,(_GLOBAL_OFFSET_TABLE_-1b)@ha
+	addi	%r6,%r6,(_GLOBAL_OFFSET_TABLE_-1b)@l
+	mr	%r30, %r6		/* Prepare for secure-PLT calls */
 	lwz	%r6,blocked_lock@got(%r6)
 blocked_loop:
 	lwz	%r7,TD_LOCK(%r2)
@@ -147,22 +159,25 @@ blocked_loop:
 	mr	%r3,%r2			/* Get new thread ptr */
 	bl	pmap_activate		/* Activate the new address space */
 
-	lwz	%r6, PCB_FLAGS(%r17)
+	lwz	%r19, PCB_FLAGS(%r17)
 	/* Restore FPU context if needed */
-	andi.	%r6, %r6, PCB_FPU
+	andi.	%r6, %r19, PCB_FPU
 	beq	.L3
 	mr	%r3,%r2			/* Pass curthread to enable_fpu */
 	bl	enable_fpu
 
 .L3:
-	lwz	%r6, PCB_FLAGS(%r17)
 	/* Restore Altivec context if needed */
-	andi.	%r6, %r6, PCB_VEC
+	andi.	%r6, %r19, PCB_VEC
 	beq	.L4
 	mr	%r3,%r2			/* Pass curthread to enable_vec */
 	bl	enable_vec
 
 .L4:
+#if defined(__SPE__)
+	lwz	%r3,PCB_VSCR(%r17)
+	mtspr	SPR_SPEFSCR,%r3
+#endif
 	/* thread to restore is in r3 */
 	mr	%r3,%r17		/* Recover PCB ptr */
 	lmw	%r12,PCB_CONTEXT(%r3)	/* Load the non-volatile GP regs */
@@ -187,6 +202,7 @@ ENTRY(savectx)
 	stmw	%r12,PCB_CONTEXT(%r3)	/* Save the non-volatile GP regs */
 	mfcr	%r4			/* Save the condition register */
 	stw	%r4,PCB_CR(%r3)
+	stw	%r1,PCB_SP(%r3)		/* Save the stack pointer */
 	mflr	%r4			/* Save the link register */
 	stw	%r4,PCB_LR(%r3)
 	blr
@@ -204,4 +220,8 @@ ENTRY(fork_trampoline)
 					   trapframe to simulate FRAME_SETUP
 					   does when allocating space for
 					   a frame pointer/saved LR */
+#ifdef __SPE__
+	li	%r3,SPEFSCR_FINVE|SPEFSCR_FDBZE|SPEFSCR_FUNFE|SPEFSCR_FOVFE
+	mtspr	SPR_SPEFSCR, %r3
+#endif
 	b	trapexit

@@ -132,8 +132,6 @@ static const struct iwi_ident iwi_ident_table[] = {
 	{ 0, 0, NULL }
 };
 
-static const uint8_t def_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 static const uint8_t def_chan_5ghz_band1[] =
 	{ 36, 40, 44, 48, 52, 56, 60, 64 };
 static const uint8_t def_chan_5ghz_band2[] =
@@ -1183,6 +1181,7 @@ static void
 iwi_frame_intr(struct iwi_softc *sc, struct iwi_rx_data *data, int i,
     struct iwi_frame *frame)
 {
+	struct epoch_tracker et;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct mbuf *mnew, *m;
 	struct ieee80211_node *ni;
@@ -1272,11 +1271,13 @@ iwi_frame_intr(struct iwi_softc *sc, struct iwi_rx_data *data, int i,
 	IWI_UNLOCK(sc);
 
 	ni = ieee80211_find_rxnode(ic, mtod(m, struct ieee80211_frame_min *));
+	NET_EPOCH_ENTER(et);
 	if (ni != NULL) {
 		type = ieee80211_input(ni, m, rssi, nf);
 		ieee80211_free_node(ni);
 	} else
 		type = ieee80211_input_all(ic, m, rssi, nf);
+	NET_EPOCH_EXIT(et);
 
 	IWI_LOCK(sc);
 	if (sc->sc_softled) {
@@ -2059,7 +2060,7 @@ iwi_ioctl(struct ieee80211com *ic, u_long cmd, void *data)
 	switch (cmd) {
 	case SIOCGIWISTATS:
 		/* XXX validate permissions/memory/etc? */
-		error = copyout(&sc->sc_linkqual, ifr->ifr_data,
+		error = copyout(&sc->sc_linkqual, ifr_data_get_ptr(ifr),
 		    sizeof(struct iwi_notif_link_quality));
 		break;
 	case SIOCZIWISTATS:
@@ -2578,15 +2579,18 @@ static int
 iwi_config(struct iwi_softc *sc)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211vap *vap = TAILQ_FIRST(&ic->ic_vaps);
 	struct iwi_configuration config;
 	struct iwi_txpower power;
+	uint8_t *macaddr;
 	uint32_t data;
 	int error, i;
 
 	IWI_LOCK_ASSERT(sc);
 
-	DPRINTF(("Setting MAC address to %6D\n", ic->ic_macaddr, ":"));
-	error = iwi_cmd(sc, IWI_CMD_SET_MAC_ADDRESS, ic->ic_macaddr,
+	macaddr = vap ? vap->iv_myaddr : ic->ic_macaddr;
+	DPRINTF(("Setting MAC address to %6D\n", macaddr, ":"));
+	error = iwi_cmd(sc, IWI_CMD_SET_MAC_ADDRESS, macaddr,
 	    IEEE80211_ADDR_LEN);
 	if (error != 0)
 		return error;
@@ -2833,12 +2837,12 @@ iwi_auth_and_assoc(struct iwi_softc *sc, struct ieee80211vap *vap)
 
 	IWI_LOCK_ASSERT(sc);
 
-	ni = ieee80211_ref_node(vap->iv_bss);
-
 	if (sc->flags & IWI_FLAG_ASSOCIATED) {
 		DPRINTF(("Already associated\n"));
 		return (-1);
 	}
+
+	ni = ieee80211_ref_node(vap->iv_bss);
 
 	IWI_STATE_BEGIN(sc, IWI_FW_ASSOCIATING);
 	error = 0;
@@ -3330,12 +3334,13 @@ iwi_sysctlattach(struct iwi_softc *sc)
 	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
 
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "radio",
-	    CTLTYPE_INT | CTLFLAG_RD, sc, 0, iwi_sysctl_radio, "I",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_NEEDGIANT, sc, 0,
+	    iwi_sysctl_radio, "I",
 	    "radio transmitter switch state (0=off, 1=on)");
 
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "stats",
-	    CTLTYPE_OPAQUE | CTLFLAG_RD, sc, 0, iwi_sysctl_stats, "S",
-	    "statistics");
+	    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_NEEDGIANT, sc, 0,
+	    iwi_sysctl_stats, "S", "statistics");
 
 	sc->bluetooth = 0;
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "bluetooth",
@@ -3509,8 +3514,8 @@ iwi_ledattach(struct iwi_softc *sc)
 	callout_init_mtx(&sc->sc_ledtimer, &sc->sc_mtx, 0);
 
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
-		"softled", CTLTYPE_INT | CTLFLAG_RW, sc, 0,
-		iwi_sysctl_softled, "I", "enable/disable software LED support");
+	    "softled", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc, 0,
+	    iwi_sysctl_softled, "I", "enable/disable software LED support");
 	SYSCTL_ADD_UINT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
 		"ledpin", CTLFLAG_RW, &sc->sc_ledpin, 0,
 		"pin setting to turn activity LED on");
@@ -3604,8 +3609,8 @@ iwi_getradiocaps(struct ieee80211com *ic,
 	iwi_collect_bands(ic, bands, sizeof(bands));
 	*nchans = 0;
 	if (isset(bands, IEEE80211_MODE_11B) || isset(bands, IEEE80211_MODE_11G))
-		ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
-		    def_chan_2ghz, nitems(def_chan_2ghz), bands, 0);
+		ieee80211_add_channels_default_2ghz(chans, maxchans, nchans,
+		    bands, 0);
 	if (isset(bands, IEEE80211_MODE_11A)) {
 		ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 		    def_chan_5ghz_band1, nitems(def_chan_5ghz_band1),

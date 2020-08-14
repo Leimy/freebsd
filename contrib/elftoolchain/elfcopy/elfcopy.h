@@ -23,7 +23,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * $Id: elfcopy.h 3446 2016-05-03 01:31:17Z emaste $
+ * $Id: elfcopy.h 3757 2019-06-28 01:15:28Z emaste $
  */
 
 #include <sys/queue.h>
@@ -127,6 +127,7 @@ struct section {
 	uint64_t	 cap;	/* section capacity */
 	uint64_t	 align;	/* section alignment */
 	uint64_t	 type;	/* section type */
+	uint64_t	 flags;	/* section flags */
 	uint64_t	 vma;	/* section virtual addr */
 	uint64_t	 lma;	/* section load addr */
 	uint64_t	 pad_sz;/* section padding size */
@@ -134,8 +135,12 @@ struct section {
 	int		 pseudo;
 	int		 nocopy;
 
+	Elftc_String_Table *strtab;
+
 	TAILQ_ENTRY(section) sec_list;	/* next section */
 };
+
+TAILQ_HEAD(sectionlist, section);
 
 /* Internal data structure for segments. */
 struct segment {
@@ -310,7 +315,6 @@ struct sec_action *lookup_sec_act(struct elfcopy *_ecp,
 struct symop *lookup_symop_list(struct elfcopy *_ecp, const char *_name,
     unsigned int _op);
 void	resync_sections(struct elfcopy *_ecp);
-void	set_shstrtab(struct elfcopy *_ecp);
 void	setup_phdr(struct elfcopy *_ecp);
 void	update_shdr(struct elfcopy *_ecp, int _update_link);
 

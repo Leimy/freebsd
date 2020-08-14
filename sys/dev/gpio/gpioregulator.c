@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2016 Jared McNeill <jmcneill@invisible.ca>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -216,7 +215,7 @@ gpioregulator_parse_fdt(struct gpioregulator_softc *sc)
 		return (error);
 
 	/* "states" property (required) */
-	len = OF_getencprop_alloc(node, "states", sizeof(*pstates),
+	len = OF_getencprop_alloc_multi(node, "states", sizeof(*pstates),
 	    (void **)&pstates);
 	if (len < 2) {
 		device_printf(sc->dev, "invalid 'states' property\n");
@@ -248,7 +247,7 @@ gpioregulator_parse_fdt(struct gpioregulator_softc *sc)
 	/* "gpios" property */
 	sc->init_def.npins = 32 - __builtin_clz(mask);
 	sc->init_def.pins = malloc(sc->init_def.npins *
-	    sizeof(sc->init_def.pins), M_DEVBUF, M_WAITOK);
+	    sizeof(sc->init_def.pins), M_DEVBUF, M_WAITOK | M_ZERO);
 	for (n = 0; n < sc->init_def.npins; n++) {
 		error = gpio_pin_get_by_ofw_idx(sc->dev, node, n,
 		    &sc->init_def.pins[n]);

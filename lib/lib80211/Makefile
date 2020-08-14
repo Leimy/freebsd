@@ -1,6 +1,7 @@
 # $FreeBSD$
 
-PACKAGE=lib${LIB}
+PACKAGE=	runtime
+CONFS=	regdomain.xml
 LIB=	80211
 SHLIBDIR?= /lib
 SHLIB_MAJOR= 1

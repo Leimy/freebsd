@@ -30,8 +30,6 @@
  * $FreeBSD$
  */
 
-#include "opt_compat.h"
-
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/conf.h>
@@ -65,7 +63,8 @@ static MALLOC_DEFINE(M_DEVFS2, "DEVFS2", "DEVFS data 2");
 static MALLOC_DEFINE(M_DEVFS3, "DEVFS3", "DEVFS data 3");
 static MALLOC_DEFINE(M_CDEVP, "DEVFS1", "DEVFS cdev_priv storage");
 
-SYSCTL_NODE(_vfs, OID_AUTO, devfs, CTLFLAG_RW, 0, "DEVFS filesystem");
+SYSCTL_NODE(_vfs, OID_AUTO, devfs, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "DEVFS filesystem");
 
 static unsigned devfs_generation;
 SYSCTL_UINT(_vfs_devfs, OID_AUTO, generation, CTLFLAG_RD,
@@ -140,6 +139,8 @@ devfs_alloc(int flags)
 	if (cdp == NULL)
 		return (NULL);
 
+	mtx_init(&cdp->cdp_threadlock, "devthrd", NULL, MTX_DEF);
+
 	cdp->cdp_dirents = &cdp->cdp_dirent0;
 
 	cdev = &cdp->cdp_c;
@@ -155,7 +156,7 @@ devfs_dev_exists(const char *name)
 {
 	struct cdev_priv *cdp;
 
-	mtx_assert(&devmtx, MA_OWNED);
+	dev_lock_assert_locked();
 
 	TAILQ_FOREACH(cdp, &cdevp_list, cdp_list) {
 		if ((cdp->cdp_flags & CDP_ACTIVE) == 0)
@@ -182,6 +183,7 @@ devfs_free(struct cdev *cdev)
 	devfs_free_cdp_inode(cdp->cdp_inode);
 	if (cdp->cdp_maxdirent > 0) 
 		free(cdp->cdp_dirents, M_DEVFS2);
+	mtx_destroy(&cdp->cdp_threadlock);
 	free(cdp, M_CDEVP);
 }
 
@@ -228,7 +230,7 @@ devfs_newdirent(char *name, int namelen)
 	de->de_dirent->d_namlen = namelen;
 	de->de_dirent->d_reclen = GENERIC_DIRSIZ(&d);
 	bcopy(name, de->de_dirent->d_name, namelen);
-	de->de_dirent->d_name[namelen] = '\0';
+	dirent_terminate(de->de_dirent);
 	vfs_timestamp(&de->de_ctime);
 	de->de_mtime = de->de_atime = de->de_ctime;
 	de->de_links = 1;
@@ -406,7 +408,7 @@ devfs_delete(struct devfs_mount *dm, struct devfs_dirent *de, int flags)
 			VI_UNLOCK(vp);
 		vgone(vp);
 		if ((flags & DEVFS_DEL_VNLOCKED) == 0)
-			VOP_UNLOCK(vp, 0);
+			VOP_UNLOCK(vp);
 		vdrop(vp);
 		sx_xlock(&dm->dm_lock);
 	} else
@@ -657,6 +659,13 @@ devfs_populate_loop(struct devfs_mount *dm, int cleanup)
 	return (0);
 }
 
+int
+devfs_populate_needed(struct devfs_mount *dm)
+{
+
+	return (dm->dm_generation != devfs_generation);
+}
+
 /*
  * The caller needs to hold the dm for the duration of the call.
  */
@@ -666,9 +675,9 @@ devfs_populate(struct devfs_mount *dm)
 	unsigned gen;
 
 	sx_assert(&dm->dm_lock, SX_XLOCKED);
-	gen = devfs_generation;
-	if (dm->dm_generation == gen)
+	if (!devfs_populate_needed(dm))
 		return;
+	gen = devfs_generation;
 	while (devfs_populate_loop(dm, 0))
 		continue;
 	dm->dm_generation = gen;
@@ -698,7 +707,7 @@ devfs_create(struct cdev *dev)
 {
 	struct cdev_priv *cdp;
 
-	mtx_assert(&devmtx, MA_OWNED);
+	dev_lock_assert_locked();
 	cdp = cdev2priv(dev);
 	cdp->cdp_flags |= CDP_ACTIVE;
 	cdp->cdp_inode = alloc_unrl(devfs_inos);
@@ -712,7 +721,7 @@ devfs_destroy(struct cdev *dev)
 {
 	struct cdev_priv *cdp;
 
-	mtx_assert(&devmtx, MA_OWNED);
+	dev_lock_assert_locked();
 	cdp = cdev2priv(dev);
 	cdp->cdp_flags &= ~CDP_ACTIVE;
 	devfs_generation++;

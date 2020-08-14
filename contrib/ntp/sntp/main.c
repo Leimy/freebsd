@@ -8,6 +8,10 @@
 # include <event2/thread.h>
 #endif
 
+#ifdef HAVE_SYSEXITS_H
+# include <sysexits.h>
+#endif
+
 #include "main.h"
 #include "ntp_libopts.h"
 #include "kod_management.h"
@@ -1608,3 +1612,9 @@ gettimeofday_cached(
 #endif
 }
 
+/* Dummy function to satisfy libntp/work_fork.c */
+extern int set_user_group_ids(void);
+int set_user_group_ids(void)
+{
+    return 1;
+}

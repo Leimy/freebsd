@@ -66,6 +66,7 @@
 #include <sys/callout.h>
 #include <sys/malloc.h>
 #include <sys/priv.h>
+#include <sys/rman.h>
 
 #include <dev/usb/usb.h>
 #include <dev/usb/usbdi.h>
@@ -106,7 +107,8 @@
 
 static int dwc_otg_phy_type = DWC_OTG_PHY_DEFAULT;
 
-static SYSCTL_NODE(_hw_usb, OID_AUTO, dwc_otg, CTLFLAG_RW, 0, "USB DWC OTG");
+static SYSCTL_NODE(_hw_usb, OID_AUTO, dwc_otg, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "USB DWC OTG");
 SYSCTL_INT(_hw_usb_dwc_otg, OID_AUTO, phy_type, CTLFLAG_RDTUN,
     &dwc_otg_phy_type, 0, "DWC OTG PHY TYPE - 0/1/2/3 - ULPI/HSIC/INTERNAL/UTMI+");
 
@@ -1432,6 +1434,19 @@ dwc_otg_host_data_rx(struct dwc_otg_softc *sc, struct dwc_otg_td *td)
 					goto receive_pkt;
 				}
 			} else if (td->ep_type == UE_ISOCHRONOUS) {
+				if (td->hcsplt != 0) {
+					/*
+					 * Sometimes the complete
+					 * split packet may be queued
+					 * too early and the
+					 * transaction translator will
+					 * return a NAK. Ignore
+					 * this message and retry the
+					 * complete split instead.
+					 */
+					DPRINTF("Retrying complete split\n");
+					goto receive_pkt;
+				}
 				goto complete;
 			}
 			td->did_nak = 1;
@@ -1458,6 +1473,8 @@ dwc_otg_host_data_rx(struct dwc_otg_softc *sc, struct dwc_otg_td *td)
 				/* check if we are complete */
 				if (td->tt_xactpos == HCSPLT_XACTPOS_BEGIN) {
 					goto complete;
+				} else if (td->hcsplt != 0) {
+					goto receive_pkt;
 				} else {
 					/* get more packets */
 					goto busy;
@@ -1516,8 +1533,10 @@ receive_pkt:
   	if (td->hcsplt != 0) {
 		delta = td->tt_complete_slot - sc->sc_last_frame_num - 1;
 		if (td->tt_scheduled == 0 || delta < DWC_OTG_TT_SLOT_MAX) {
-			td->state = DWC_CHAN_ST_WAIT_C_PKT;
-			goto busy;
+			if (td->ep_type != UE_ISOCHRONOUS) {
+				td->state = DWC_CHAN_ST_WAIT_C_PKT;
+				goto busy;
+			}
 		}
 		delta = sc->sc_last_frame_num - td->tt_start_slot;
 		if (delta > DWC_OTG_TT_SLOT_MAX) {
@@ -1563,12 +1582,23 @@ receive_pkt:
 		hcchar = td->hcchar;
 		hcchar |= HCCHAR_EPDIR_IN;
 
-		/* receive complete split ASAP */
-		if ((sc->sc_last_frame_num & 1) != 0 &&
-		    td->ep_type == UE_ISOCHRONOUS)
-			hcchar |= HCCHAR_ODDFRM;
-		else
+		if (td->ep_type == UE_ISOCHRONOUS) {
+			if (td->hcsplt != 0) {
+				/* continously buffer */
+				if (sc->sc_last_frame_num & 1)
+					hcchar &= ~HCCHAR_ODDFRM;
+				else
+					hcchar |= HCCHAR_ODDFRM;
+			} else {
+				/* multi buffer, if any */
+				if (sc->sc_last_frame_num & 1)
+					hcchar |= HCCHAR_ODDFRM;
+				else
+					hcchar &= ~HCCHAR_ODDFRM;
+			}
+		} else {
 			hcchar &= ~HCCHAR_ODDFRM;
+		}
 
 		/* must enable channel before data can be received */
 		DWC_OTG_WRITE_4(sc, DOTG_HCCHAR(channel), hcchar);
@@ -3844,12 +3874,40 @@ int
 dwc_otg_init(struct dwc_otg_softc *sc)
 {
 	uint32_t temp;
+	int err;
 
 	DPRINTF("start\n");
 
+	sc->sc_io_tag = rman_get_bustag(sc->sc_io_res);
+	sc->sc_io_hdl = rman_get_bushandle(sc->sc_io_res);
+	sc->sc_io_size = rman_get_size(sc->sc_io_res);
+
 	/* set up the bus structure */
+	sc->sc_bus.devices = sc->sc_devices;
+	sc->sc_bus.devices_max = DWC_OTG_MAX_DEVICES;
+	sc->sc_bus.dma_bits = 32;
 	sc->sc_bus.usbrev = USB_REV_2_0;
 	sc->sc_bus.methods = &dwc_otg_bus_methods;
+
+	/* get all DMA memory */
+	if (usb_bus_mem_alloc_all(&sc->sc_bus,
+	    USB_GET_DMA_TAG(sc->sc_bus.parent), NULL)) {
+		return (ENOMEM);
+	}
+
+	sc->sc_bus.bdev = device_add_child(sc->sc_bus.parent, "usbus", -1);
+	if (sc->sc_bus.bdev == NULL)
+		return (ENXIO);
+
+	device_set_ivars(sc->sc_bus.bdev, &sc->sc_bus);
+
+	err = bus_setup_intr(sc->sc_bus.parent, sc->sc_irq_res,
+	    INTR_TYPE_TTY | INTR_MPSAFE, &dwc_otg_filter_interrupt,
+	    &dwc_otg_interrupt, sc, &sc->sc_intr_hdl);
+	if (err) {
+		sc->sc_intr_hdl = NULL;
+		return (ENXIO);
+	}
 
 	usb_callout_init_mtx(&sc->sc_timer,
 	    &sc->sc_bus.bus_mtx, 0);

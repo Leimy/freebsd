@@ -97,8 +97,7 @@ zfs_sa_symlink(znode_t *zp, char *link, int len, dmu_tx_t *tx)
 	dmu_buf_t *db = sa_get_db(zp->z_sa_hdl);
 
 	if (ZFS_OLD_ZNODE_PHYS_SIZE + len <= dmu_bonus_max()) {
-		VERIFY(dmu_set_bonus(db,
-		    len + ZFS_OLD_ZNODE_PHYS_SIZE, tx) == 0);
+		VERIFY0(dmu_set_bonus(db, len + ZFS_OLD_ZNODE_PHYS_SIZE, tx));
 		if (len) {
 			bcopy(link, (caddr_t)db->db_data +
 			    ZFS_OLD_ZNODE_PHYS_SIZE, len);
@@ -306,7 +305,7 @@ zfs_sa_upgrade(sa_handle_t *hdl, dmu_tx_t *tx)
 
 	zp->z_is_sa = B_TRUE;
 done:
-	VOP_UNLOCK(ZTOV(zp), 0);
+	VOP_UNLOCK(ZTOV(zp));
 }
 
 void

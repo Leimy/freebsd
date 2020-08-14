@@ -82,8 +82,9 @@ __FBSDID("$FreeBSD$");
 #ifdef NTOSKRNL_DEBUG_TIMERS
 static int sysctl_show_timers(SYSCTL_HANDLER_ARGS);
 
-SYSCTL_PROC(_debug, OID_AUTO, ntoskrnl_timers, CTLTYPE_INT | CTLFLAG_RW,
-    NULL, 0, sysctl_show_timers, "I",
+SYSCTL_PROC(_debug, OID_AUTO, ntoskrnl_timers,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, NULL, 0,
+    sysctl_show_timers, "I",
     "Show ntoskrnl timer stats");
 #endif
 
@@ -2491,8 +2492,8 @@ MmAllocateContiguousMemorySpecifyCache(size, lowest, highest,
 		break;
 	}
 
-	ret = (void *)kmem_alloc_contig(kernel_arena, size, M_ZERO | M_NOWAIT,
-	    lowest, highest, PAGE_SIZE, boundary, memattr);
+	ret = (void *)kmem_alloc_contig(size, M_ZERO | M_NOWAIT, lowest,
+	    highest, PAGE_SIZE, boundary, memattr);
 	if (ret != NULL)
 		malloc_type_allocated(M_DEVBUF, round_page(size));
 	return (ret);
@@ -3195,10 +3196,8 @@ rand(void)
 }
 
 static void
-srand(unsigned int seed)
+srand(unsigned int seed __unused)
 {
-
-	srandom(seed);
 }
 
 static uint8_t

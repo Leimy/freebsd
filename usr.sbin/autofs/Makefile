@@ -1,5 +1,6 @@
 # $FreeBSD$
 
+CONFS=	auto_master
 PACKAGE=autofs
 PROG=	automountd
 SRCS=	automount.c
@@ -23,11 +24,11 @@ LIBADD=	util
 MOUNT=  ${SRCTOP}/sbin/mount
 CFLAGS+=-I${MOUNT}
 
-WARNS=	6
-
 LINKS=	${BINDIR}/automountd ${BINDIR}/automount
 LINKS+=	${BINDIR}/automountd ${BINDIR}/autounmountd
 
 .PATH:	${MOUNT}
+
+SUBDIR=	autofs
 
 .include <bsd.prog.mk>

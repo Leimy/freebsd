@@ -97,6 +97,7 @@ static struct vop_vector udf_vnodeops = {
 	.vop_strategy =		udf_strategy,
 	.vop_vptofh =		udf_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(udf_vnodeops);
 
 struct vop_vector udf_fifoops = {
 	.vop_default =		&fifo_specops,
@@ -108,6 +109,7 @@ struct vop_vector udf_fifoops = {
 	.vop_setattr =		udf_setattr,
 	.vop_vptofh =		udf_vptofh,
 };
+VFS_VOP_VECTOR_REGISTER(udf_fifoops);
 
 static MALLOC_DEFINE(M_UDFFID, "udf_fid", "UDF FileId structure");
 static MALLOC_DEFINE(M_UDFDS, "udf_ds", "UDF Dirstream structure");
@@ -178,7 +180,7 @@ udf_access(struct vop_access_args *a)
 	mode = udf_permtomode(node);
 
 	return (vaccess(vp->v_type, mode, node->fentry->uid, node->fentry->gid,
-	    accmode, a->a_cred, NULL));
+	    accmode, a->a_cred));
 }
 
 static int
@@ -843,9 +845,10 @@ udf_readdir(struct vop_readdir_args *a)
 			dir.d_fileno = node->hash_id;
 			dir.d_type = DT_DIR;
 			dir.d_name[0] = '.';
-			dir.d_name[1] = '\0';
 			dir.d_namlen = 1;
 			dir.d_reclen = GENERIC_DIRSIZ(&dir);
+			dir.d_off = 1;
+			dirent_terminate(&dir);
 			uiodir.dirent = &dir;
 			error = udf_uiodir(&uiodir, dir.d_reclen, uio, 1);
 			if (error)
@@ -855,9 +858,10 @@ udf_readdir(struct vop_readdir_args *a)
 			dir.d_type = DT_DIR;
 			dir.d_name[0] = '.';
 			dir.d_name[1] = '.';
-			dir.d_name[2] = '\0';
 			dir.d_namlen = 2;
 			dir.d_reclen = GENERIC_DIRSIZ(&dir);
+			dir.d_off = 2;
+			dirent_terminate(&dir);
 			uiodir.dirent = &dir;
 			error = udf_uiodir(&uiodir, dir.d_reclen, uio, 2);
 		} else {
@@ -867,6 +871,8 @@ udf_readdir(struct vop_readdir_args *a)
 			dir.d_type = (fid->file_char & UDF_FILE_CHAR_DIR) ?
 			    DT_DIR : DT_UNKNOWN;
 			dir.d_reclen = GENERIC_DIRSIZ(&dir);
+			dir.d_off = ds->this_off;
+			dirent_terminate(&dir);
 			uiodir.dirent = &dir;
 			error = udf_uiodir(&uiodir, dir.d_reclen, uio,
 			    ds->this_off);
@@ -1261,11 +1267,6 @@ udf_reclaim(struct vop_reclaim_args *a)
 
 	vp = a->a_vp;
 	unode = VTON(vp);
-
-	/*
-	 * Destroy the vm object and flush associated pages.
-	 */
-	vnode_destroy_vobject(vp);
 
 	if (unode != NULL) {
 		vfs_hash_remove(vp);

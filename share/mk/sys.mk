@@ -118,7 +118,8 @@ NO_META_IGNORE_HOST_HEADERS=	1
 # This needs to be done early - before .PATH is computed
 # Don't do this for 'make showconfig' as it enables all options where meta mode
 # is not expected.
-.if !make(showconfig) && !make(print-dir) && empty(.MAKEFLAGS:M-[nN])
+.if !make(showconfig) && !make(print-dir) && !make(test-system-*) && \
+    empty(.MAKEFLAGS:M-[nN])
 .sinclude <auto.obj.mk>
 .endif
 .endif	# ${MK_AUTO_OBJ} == "yes"
@@ -165,7 +166,7 @@ CC		?=	c89
 CFLAGS		?=	-O
 .else
 CC		?=	cc
-.if ${MACHINE_CPUARCH} == "arm" || ${MACHINE_CPUARCH} == "mips"
+.if ${MACHINE_CPUARCH} == "mips"
 CFLAGS		?=	-O -pipe
 .else
 CFLAGS		?=	-O2 -pipe
@@ -233,7 +234,7 @@ FFLAGS		?=	-O
 .endif
 EFLAGS		?=
 
-INSTALL		?=	install
+INSTALL		?=	${INSTALL_CMD:Uinstall}
 
 LEX		?=	lex
 LFLAGS		?=
@@ -274,6 +275,7 @@ SHELL		?=	sh
 
 .if !defined(%POSIX)
 SIZE		?=	size
+STRIPBIN	?=	strip
 .endif
 
 YACC		?=	yacc

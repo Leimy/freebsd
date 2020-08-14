@@ -46,6 +46,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/uma.h>
 
 #include <geom/geom.h>
+#include <geom/geom_dbg.h>
 #include <geom/eli/g_eli.h>
 
 
@@ -57,11 +58,10 @@ g_eli_ctl_attach(struct gctl_req *req, struct g_class *mp)
 {
 	struct g_eli_metadata md;
 	struct g_provider *pp;
-	const char *name;
 	u_char *key, mkey[G_ELI_DATAIVKEYLEN];
-	int *nargs, *detach, *readonly;
-	int keysize, error;
-	u_int nkey;
+	int *nargs, *detach, *readonly, *dryrunp;
+	int keysize, error, nkey, dryrun, dummy;
+	intmax_t *valp;
 
 	g_topology_assert();
 
@@ -81,10 +81,32 @@ g_eli_ctl_attach(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 
+	/* "keyno" is optional for backward compatibility */
+	nkey = -1;
+	valp = gctl_get_param(req, "keyno", &dummy);
+	if (valp != NULL) {
+		valp = gctl_get_paraml(req, "keyno", sizeof(*valp));
+		if (valp != NULL)
+			nkey = *valp;
+	}
+	if (nkey < -1 || nkey >= G_ELI_MAXMKEYS) {
+		gctl_error(req, "Invalid '%s' argument.", "keyno");
+		return;
+	}
+
 	readonly = gctl_get_paraml(req, "readonly", sizeof(*readonly));
 	if (readonly == NULL) {
 		gctl_error(req, "No '%s' argument.", "readonly");
 		return;
+	}
+
+	/* "dryrun" is optional for backward compatibility */
+	dryrun = 0;
+	dryrunp = gctl_get_param(req, "dryrun", &dummy);
+	if (dryrunp != NULL) {
+		dryrunp = gctl_get_paraml(req, "dryrun", sizeof(*dryrunp));
+		if (dryrunp != NULL)
+			dryrun = *dryrunp;
 	}
 
 	if (*detach && *readonly) {
@@ -92,27 +114,23 @@ g_eli_ctl_attach(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 
-	name = gctl_get_asciiparam(req, "arg0");
-	if (name == NULL) {
-		gctl_error(req, "No 'arg%u' argument.", 0);
+	pp = gctl_get_provider(req, "arg0");
+	if (pp == NULL)
 		return;
-	}
-	if (strncmp(name, "/dev/", strlen("/dev/")) == 0)
-		name += strlen("/dev/");
-	pp = g_provider_by_name(name);
-	if (pp == NULL) {
-		gctl_error(req, "Provider %s is invalid.", name);
-		return;
-	}
 	error = g_eli_read_metadata(mp, pp, &md);
 	if (error != 0) {
 		gctl_error(req, "Cannot read metadata from %s (error=%d).",
-		    name, error);
+		    pp->name, error);
 		return;
 	}
 	if (md.md_keys == 0x00) {
 		explicit_bzero(&md, sizeof(md));
 		gctl_error(req, "No valid keys on %s.", pp->name);
+		return;
+	}
+	if (!eli_metadata_crypto_supported(&md)) {
+		explicit_bzero(&md, sizeof(md));
+		gctl_error(req, "Invalid or unsupported algorithms.");
 		return;
 	}
 
@@ -123,7 +141,10 @@ g_eli_ctl_attach(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 
-	error = g_eli_mkey_decrypt(&md, key, mkey, &nkey);
+	if (nkey == -1)
+		error = g_eli_mkey_decrypt_any(&md, key, mkey, &nkey);
+	else
+		error = g_eli_mkey_decrypt(&md, key, mkey, nkey);
 	explicit_bzero(key, keysize);
 	if (error == -1) {
 		explicit_bzero(&md, sizeof(md));
@@ -141,7 +162,8 @@ g_eli_ctl_attach(struct gctl_req *req, struct g_class *mp)
 		md.md_flags |= G_ELI_FLAG_WO_DETACH;
 	if (*readonly)
 		md.md_flags |= G_ELI_FLAG_RO;
-	g_eli_create(req, mp, pp, &md, mkey, nkey);
+	if (!dryrun)
+		g_eli_create(req, mp, pp, &md, mkey, nkey);
 	explicit_bzero(mkey, sizeof(mkey));
 	explicit_bzero(&md, sizeof(md));
 }
@@ -154,8 +176,8 @@ g_eli_find_device(struct g_class *mp, const char *prov)
 	struct g_provider *pp;
 	struct g_consumer *cp;
 
-	if (strncmp(prov, "/dev/", strlen("/dev/")) == 0)
-		prov += strlen("/dev/");
+	if (strncmp(prov, _PATH_DEV, strlen(_PATH_DEV)) == 0)
+		prov += strlen(_PATH_DEV);
 	LIST_FOREACH(gp, &mp->geom, geom) {
 		sc = gp->softc;
 		if (sc == NULL)
@@ -238,7 +260,7 @@ g_eli_ctl_onetime(struct gctl_req *req, struct g_class *mp)
 	const char *name;
 	intmax_t *keylen, *sectorsize;
 	u_char mkey[G_ELI_DATAIVKEYLEN];
-	int *nargs, *detach, *notrim;
+	int *nargs, *detach, *noautoresize, *notrim;
 
 	g_topology_assert();
 	bzero(&md, sizeof(md));
@@ -256,10 +278,15 @@ g_eli_ctl_onetime(struct gctl_req *req, struct g_class *mp)
 	strlcpy(md.md_magic, G_ELI_MAGIC, sizeof(md.md_magic));
 	md.md_version = G_ELI_VERSION;
 	md.md_flags |= G_ELI_FLAG_ONETIME;
+	md.md_flags |= G_ELI_FLAG_AUTORESIZE;
 
 	detach = gctl_get_paraml(req, "detach", sizeof(*detach));
 	if (detach != NULL && *detach)
 		md.md_flags |= G_ELI_FLAG_WO_DETACH;
+	noautoresize = gctl_get_paraml(req, "noautoresize",
+	    sizeof(*noautoresize));
+	if (noautoresize != NULL && *noautoresize)
+		md.md_flags &= ~G_ELI_FLAG_AUTORESIZE;
 	notrim = gctl_get_paraml(req, "notrim", sizeof(*notrim));
 	if (notrim != NULL && *notrim)
 		md.md_flags |= G_ELI_FLAG_NODELETE;
@@ -331,18 +358,9 @@ g_eli_ctl_onetime(struct gctl_req *req, struct g_class *mp)
 	/* Not important here. */
 	bzero(md.md_hash, sizeof(md.md_hash));
 
-	name = gctl_get_asciiparam(req, "arg0");
-	if (name == NULL) {
-		gctl_error(req, "No 'arg%u' argument.", 0);
+	pp = gctl_get_provider(req, "arg0");
+	if (pp == NULL)
 		return;
-	}
-	if (strncmp(name, "/dev/", strlen("/dev/")) == 0)
-		name += strlen("/dev/");
-	pp = g_provider_by_name(name);
-	if (pp == NULL) {
-		gctl_error(req, "Provider %s is invalid.", name);
-		return;
-	}
 
 	sectorsize = gctl_get_paraml(req, "sectorsize", sizeof(*sectorsize));
 	if (sectorsize == NULL) {
@@ -379,7 +397,7 @@ g_eli_ctl_configure(struct gctl_req *req, struct g_class *mp)
 	const char *prov;
 	u_char *sector;
 	int *nargs, *boot, *noboot, *trim, *notrim, *geliboot, *nogeliboot;
-	int *displaypass, *nodisplaypass;
+	int *displaypass, *nodisplaypass, *autoresize, *noautoresize;
 	int zero, error, changed;
 	u_int i;
 
@@ -448,6 +466,20 @@ g_eli_ctl_configure(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 	if (*displaypass || *nodisplaypass)
+		changed = 1;
+
+	autoresize = gctl_get_paraml(req, "autoresize", sizeof(*autoresize));
+	if (autoresize == NULL)
+		autoresize = &zero;
+	noautoresize = gctl_get_paraml(req, "noautoresize",
+	    sizeof(*noautoresize));
+	if (noautoresize == NULL)
+		noautoresize = &zero;
+	if (*autoresize && *noautoresize) {
+		gctl_error(req, "Options -r and -R are mutually exclusive.");
+		return;
+	}
+	if (*autoresize || *noautoresize)
 		changed = 1;
 
 	if (!changed) {
@@ -519,6 +551,17 @@ g_eli_ctl_configure(struct gctl_req *req, struct g_class *mp)
 			continue;
 		}
 
+		if (*autoresize && (sc->sc_flags & G_ELI_FLAG_AUTORESIZE)) {
+			G_ELI_DEBUG(1, "AUTORESIZE flag already configured for %s.",
+			    prov);
+			continue;
+		} else if (*noautoresize &&
+		    !(sc->sc_flags & G_ELI_FLAG_AUTORESIZE)) {
+			G_ELI_DEBUG(1, "AUTORESIZE flag not configured for %s.",
+			    prov);
+			continue;
+		}
+
 		if (!(sc->sc_flags & G_ELI_FLAG_ONETIME)) {
 			/*
 			 * ONETIME providers don't write metadata to
@@ -570,6 +613,14 @@ g_eli_ctl_configure(struct gctl_req *req, struct g_class *mp)
 			sc->sc_flags &= ~G_ELI_FLAG_GELIDISPLAYPASS;
 		}
 
+		if (*autoresize) {
+			md.md_flags |= G_ELI_FLAG_AUTORESIZE;
+			sc->sc_flags |= G_ELI_FLAG_AUTORESIZE;
+		} else if (*noautoresize) {
+			md.md_flags &= ~G_ELI_FLAG_AUTORESIZE;
+			sc->sc_flags &= ~G_ELI_FLAG_AUTORESIZE;
+		}
+
 		if (sc->sc_flags & G_ELI_FLAG_ONETIME) {
 			/* There's no metadata on disk so we are done here. */
 			continue;
@@ -585,8 +636,7 @@ g_eli_ctl_configure(struct gctl_req *req, struct g_class *mp)
 			    prov, error);
 		}
 		explicit_bzero(&md, sizeof(md));
-		explicit_bzero(sector, pp->sectorsize);
-		free(sector, M_ELI);
+		zfree(sector, M_ELI);
 	}
 }
 
@@ -689,8 +739,7 @@ g_eli_ctl_setkey(struct gctl_req *req, struct g_class *mp)
 	explicit_bzero(&md, sizeof(md));
 	error = g_write_data(cp, pp->mediasize - pp->sectorsize, sector,
 	    pp->sectorsize);
-	explicit_bzero(sector, pp->sectorsize);
-	free(sector, M_ELI);
+	zfree(sector, M_ELI);
 	if (error != 0) {
 		gctl_error(req, "Cannot store metadata on %s (error=%d).",
 		    pp->name, error);
@@ -805,8 +854,7 @@ g_eli_ctl_delkey(struct gctl_req *req, struct g_class *mp)
 		(void)g_io_flush(cp);
 	}
 	explicit_bzero(&md, sizeof(md));
-	explicit_bzero(sector, pp->sectorsize);
-	free(sector, M_ELI);
+	zfree(sector, M_ELI);
 	if (*all)
 		G_ELI_DEBUG(1, "All keys removed from %s.", pp->name);
 	else
@@ -974,7 +1022,7 @@ g_eli_ctl_resume(struct gctl_req *req, struct g_class *mp)
 		return;
 	}
 
-	error = g_eli_mkey_decrypt(&md, key, mkey, &nkey);
+	error = g_eli_mkey_decrypt_any(&md, key, mkey, &nkey);
 	explicit_bzero(key, keysize);
 	if (error == -1) {
 		explicit_bzero(&md, sizeof(md));

@@ -113,7 +113,7 @@ typedef struct {
 	wint_t		max;
 } crange;
 typedef struct {
-	unsigned char	bmp[NC / 8];
+	unsigned char	bmp[NC_MAX / 8];
 	wctype_t	*types;
 	unsigned int	ntypes;
 	wint_t		*wides;
@@ -133,9 +133,14 @@ CHIN1(cset *cs, wint_t ch)
 	if (ch < NC)
 		return (((cs->bmp[ch >> 3] & (1 << (ch & 7))) != 0) ^
 		    cs->invert);
-	for (i = 0; i < cs->nwides; i++)
-		if (ch == cs->wides[i])
+	for (i = 0; i < cs->nwides; i++) {
+		if (cs->icase) {
+			if (ch == towlower(cs->wides[i]) ||
+			    ch == towupper(cs->wides[i]))
+				return (!cs->invert);
+		} else if (ch == cs->wides[i])
 			return (!cs->invert);
+	}
 	for (i = 0; i < cs->nranges; i++)
 		if (cs->ranges[i].min <= ch && ch <= cs->ranges[i].max)
 			return (!cs->invert);
@@ -177,6 +182,7 @@ struct re_guts {
 #		define	USEBOL	01	/* used ^ */
 #		define	USEEOL	02	/* used $ */
 #		define	BAD	04	/* something wrong */
+#		define	EMPTBR	010	/* empty branch present */
 	int nbol;		/* number of ^ used */
 	int neol;		/* number of $ used */
 	char *must;		/* match must contain this string */

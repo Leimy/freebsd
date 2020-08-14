@@ -55,6 +55,13 @@
 #include <machine/atomic-v4.h>
 #endif /* Arch >= v6 */
 
+static __inline u_long
+atomic_swap_long(volatile u_long *p, u_long v)
+{
+
+	return (atomic_swap_32((volatile uint32_t *)p, v));
+}
+
 #define atomic_clear_ptr		atomic_clear_32
 #define atomic_clear_acq_ptr		atomic_clear_acq_32
 #define atomic_clear_rel_ptr		atomic_clear_rel_32
@@ -95,5 +102,7 @@
 #define atomic_load_acq_int		atomic_load_acq_32
 #define atomic_store_rel_int		atomic_store_rel_32
 #define atomic_swap_int			atomic_swap_32
+
+#include <sys/_atomic_subword.h>
 
 #endif /* _MACHINE_ATOMIC_H_ */

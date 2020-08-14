@@ -30,18 +30,28 @@
 #define	_MACHINE_PSCI_H_
 
 #include <sys/types.h>
+#include <dev/psci/smccc.h>
 
-typedef int (*psci_initfn_t)(device_t dev);
-typedef int (*psci_callfn_t)(register_t, register_t, register_t, register_t);
+typedef int (*psci_initfn_t)(device_t dev, int default_version);
+typedef int (*psci_callfn_t)(register_t, register_t, register_t, register_t,
+	register_t, register_t, register_t, register_t,
+	struct arm_smccc_res *res);
 
 extern int psci_present;
 
-void	psci_reset(void);
 int	psci_cpu_on(unsigned long, unsigned long, unsigned long);
-int	psci_hvc_despatch(register_t, register_t, register_t, register_t);
-int	psci_smc_despatch(register_t, register_t, register_t, register_t);
-
+void	psci_reset(void);
+int32_t	psci_features(uint32_t);
 int	psci_get_version(void);
+
+/* Handler to let us call into the PSCI/SMCCC firmware */
+extern psci_callfn_t psci_callfn;
+static inline int
+psci_call(register_t a, register_t b, register_t c, register_t d)
+{
+
+	return (psci_callfn(a, b, c, d, 0, 0, 0, 0, NULL));
+}
 
 /*
  * PSCI return codes.
@@ -74,6 +84,7 @@ int	psci_get_version(void);
 #define	PSCI_FNID_MIGRATE_INFO_UP_CPU	0xc4000007
 #define	PSCI_FNID_SYSTEM_OFF		0x84000008
 #define	PSCI_FNID_SYSTEM_RESET		0x84000009
+#define	PSCI_FNID_FEATURES		0x8400000a
 #else
 #define	PSCI_FNID_VERSION		0x84000000
 #define	PSCI_FNID_CPU_SUSPEND		0x84000001
@@ -85,6 +96,7 @@ int	psci_get_version(void);
 #define	PSCI_FNID_MIGRATE_INFO_UP_CPU	0x84000007
 #define	PSCI_FNID_SYSTEM_OFF		0x84000008
 #define	PSCI_FNID_SYSTEM_RESET		0x84000009
+#define	PSCI_FNID_FEATURES		0x8400000a
 #endif
 
 #define	PSCI_VER_MAJOR(v)		(((v) >> 16) & 0xFF)

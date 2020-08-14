@@ -8,6 +8,8 @@
 .PATH: ${SRCTOP}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/lua
 # ZFS_SHARED_SRCS
 .PATH: ${SRCTOP}/sys/cddl/contrib/opensolaris/common/zfs
+# LZ4_COMMON_SRCS
+.PATH: ${SRCTOP}/sys/cddl/contrib/opensolaris/common/lz4
 # KERNEL_SRCS
 .PATH: ${SRCTOP}/cddl/contrib/opensolaris/lib/libzpool/common
 # LIST_SRCS
@@ -16,9 +18,7 @@
 .if exists(${SRCTOP}/sys/cddl/contrib/opensolaris/common/atomic/${MACHINE_ARCH}/opensolaris_atomic.S)
 .PATH: ${SRCTOP}/sys/cddl/contrib/opensolaris/common/atomic/${MACHINE_ARCH}
 ATOMIC_SRCS=	opensolaris_atomic.S
-.if ${MACHINE_ARCH} != "sparc64"
 ACFLAGS+=	-Wa,--noexecstack
-.endif
 .else
 .PATH: ${SRCTOP}/sys/cddl/compat/opensolaris/kern
 ATOMIC_SRCS=	opensolaris_atomic.c
@@ -32,6 +32,7 @@ LIB=		zpool
 
 ZFS_COMMON_SRCS= ${ZFS_COMMON_OBJS:C/.o$/.c/} trim_map.c
 ZFS_SHARED_SRCS= ${ZFS_SHARED_OBJS:C/.o$/.c/}
+LZ4_COMMON_SRCS= lz4.c
 LUA_SRCS=	${LUA_OBJS:C/.o$/.c/}
 KERNEL_SRCS=	kernel.c taskq.c util.c
 LIST_SRCS=	list.c
@@ -39,18 +40,19 @@ UNICODE_SRCS=	u8_textprep.c
 LIBCMDUTILS_SRCS=nicenum.c
 
 SRCS=		${ZFS_COMMON_SRCS} ${ZFS_SHARED_SRCS} ${LUA_SRCS} \
-		${KERNEL_SRCS} ${LIST_SRCS} ${ATOMIC_SRCS} \
+		${LZ4_COMMON_SRCS} ${KERNEL_SRCS} ${LIST_SRCS} ${ATOMIC_SRCS} \
 		${UNICODE_SRCS} ${LIBCMDUTILS_SRCS}
 
 WARNS?=		0
 CFLAGS+=	-I${SRCTOP}/sys/cddl/compat/opensolaris
 CFLAGS+=	-I${SRCTOP}/cddl/compat/opensolaris/include
 CFLAGS+=	-I${SRCTOP}/cddl/compat/opensolaris/lib/libumem
+CFLAGS+=	-I${SRCTOP}/cddl/contrib/opensolaris/lib/libzfs/common
 CFLAGS+=	-I${SRCTOP}/cddl/contrib/opensolaris/lib/libzpool/common
-CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/uts/common/sys
 CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs
 CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/uts/common/fs/zfs/lua
 CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/common/zfs
+CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/common/lz4
 CFLAGS+=	-I${SRCTOP}/sys/cddl/contrib/opensolaris/uts/common
 CFLAGS+=	-I${SRCTOP}/cddl/contrib/opensolaris/head
 CFLAGS+=	-I${SRCTOP}/cddl/contrib/opensolaris/lib/libnvpair
@@ -62,6 +64,8 @@ CFLAGS+=	-DWANTS_MUTEX_OWNED
 CFLAGS+=	-I${SRCTOP}/lib/libpthread/thread
 CFLAGS+=	-I${SRCTOP}/lib/libpthread/sys
 CFLAGS+=	-I${SRCTOP}/lib/libthr/arch/${MACHINE_CPUARCH}/include
+CFLAGS.lz4.c+=	-D_FAKE_KERNEL
+CFLAGS.gcc+=	-fms-extensions
 
 LIBADD=		md pthread z nvpair avl umem
 

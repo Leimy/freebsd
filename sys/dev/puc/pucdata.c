@@ -689,6 +689,13 @@ const struct puc_cfg puc_pci_devices[] = {
 	    .config_function = puc_config_exar
 	},
 
+	{   0x13a8, 0x0352, 0xffff, 0,
+	    "Exar XR17V352",
+	    125000000,
+	    PUC_PORT_2S, 0x10, 0, -1,
+	    .config_function = puc_config_exar_pcie
+	},
+
 	/* The XR17V358 uses the 125MHz PCIe clock as its reference clock. */
 	{   0x13a8, 0x0358, 0xffff, 0,
 	    "Exar XR17V358",
@@ -701,7 +708,7 @@ const struct puc_cfg puc_pci_devices[] = {
 	 * The Advantech PCI-1602 Rev. A use the first two ports of an Oxford
 	 * Semiconductor OXuPCI954.  Note these boards have a hardware bug in
 	 * that they drive the RS-422/485 transmitters after power-on until a
-	 * driver initalizes the UARTs.
+	 * driver initializes the UARTs.
 	 */
 	{   0x13fe, 0x1600, 0x1602, 0x0002,
 	    "Advantech PCI-1602 Rev. A",

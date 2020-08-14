@@ -46,6 +46,7 @@
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -491,6 +492,7 @@ property::property(text_input_buffer &input,
 					break;
 				}
 			}
+			[[fallthrough]];
 			default:
 				input.parse_error("Invalid property value.");
 				valid = false;
@@ -622,6 +624,7 @@ property_value::try_to_merge(property_value &other)
 			return false;
 		case EMPTY:
 			*this = other;
+			[[fallthrough]];
 		case STRING:
 		case STRING_LIST:
 		case CROSS_REFERENCE:
@@ -727,14 +730,32 @@ node::parse_name(text_input_buffer &input, bool &is_property, const char *error)
 	return n;
 }
 
-void
-node::visit(std::function<void(node&)> fn)
+node::visit_behavior
+node::visit(std::function<visit_behavior(node&, node*)> fn, node *parent)
 {
-	fn(*this);
-	for (auto &&c : children)
+	visit_behavior behavior;
+	behavior = fn(*this, parent);
+	if (behavior == VISIT_BREAK)
 	{
-		c->visit(fn);
+		return VISIT_BREAK;
 	}
+	else if (behavior != VISIT_CONTINUE)
+	{
+		for (auto &&c : children)
+		{
+			behavior = c->visit(fn, this);
+			// Any status other than VISIT_RECURSE stops our execution and
+			// bubbles up to our caller.  The caller may then either continue
+			// visiting nodes that are siblings to this one or completely halt
+			// visiting.
+			if (behavior != VISIT_RECURSE)
+			{
+				return behavior;
+			}
+		}
+	}
+	// Continue recursion by default
+	return VISIT_RECURSE;
 }
 
 node::node(input_buffer &structs, input_buffer &strings) : valid(true)
@@ -828,6 +849,7 @@ node_ptr node::create_special_node(const string &name,
 }
 
 node::node(text_input_buffer &input,
+           device_tree &tree,
            string &&n,
            std::unordered_set<string> &&l,
            string &&a,
@@ -844,6 +866,9 @@ node::node(text_input_buffer &input,
 		// flag set if we find any characters that are only in
 		// the property name character set, not the node 
 		bool is_property = false;
+		// flag set if our node is marked as /omit-if-no-ref/ to be
+		// garbage collected later if nothing references it
+		bool marked_omit_if_no_ref = false;
 		string child_name, child_address;
 		std::unordered_set<string> child_labels;
 		auto parse_delete = [&](const char *expected, bool at)
@@ -890,6 +915,12 @@ node::node(text_input_buffer &input,
 			}
 			continue;
 		}
+		if (input.consume("/omit-if-no-ref/"))
+		{
+			input.next_token();
+			marked_omit_if_no_ref = true;
+			tree.set_needs_garbage_collection();
+		}
 		child_name = parse_name(input, is_property,
 				"Expected property or node name");
 		while (input.consume(':'))
@@ -925,10 +956,11 @@ node::node(text_input_buffer &input,
 		}
 		else if (!is_property && *input == ('{'))
 		{
-			node_ptr child = node::parse(input, std::move(child_name),
+			node_ptr child = node::parse(input, tree, std::move(child_name),
 					std::move(child_labels), std::move(child_address), defines);
 			if (child)
 			{
+				child->omit_if_no_ref = marked_omit_if_no_ref;
 				children.push_back(std::move(child));
 			}
 			else
@@ -980,12 +1012,14 @@ node::sort()
 
 node_ptr
 node::parse(text_input_buffer &input,
+            device_tree &tree,
             string &&name,
             string_set &&label,
             string &&address,
             define_map *defines)
 {
 	node_ptr n(new node(input,
+	                    tree,
 	                    std::move(name),
 	                    std::move(label),
 	                    std::move(address),
@@ -1028,6 +1062,30 @@ node::merge_node(node_ptr &other)
 	{
 		labels.insert(l);
 	}
+	children.erase(std::remove_if(children.begin(), children.end(),
+			[&](const node_ptr &p) {
+				string full_name = p->name;
+				if (p->unit_address != string())
+				{
+					full_name += '@';
+					full_name += p->unit_address;
+				}
+				if (other->deleted_children.count(full_name) > 0)
+				{
+					other->deleted_children.erase(full_name);
+					return true;
+				}
+				return false;
+			}), children.end());
+	props.erase(std::remove_if(props.begin(), props.end(),
+			[&](const property_ptr &p) {
+				if (other->deleted_props.count(p->get_key()) > 0)
+				{
+					other->deleted_props.erase(p->get_key());
+					return true;
+				}
+				return false;
+			}), props.end());
 	// Note: this is an O(n*m) operation.  It might be sensible to
 	// optimise this if we find that there are nodes with very
 	// large numbers of properties, but for typical usage the
@@ -1067,30 +1125,6 @@ node::merge_node(node_ptr &other)
 			children.push_back(std::move(c));
 		}
 	}
-	children.erase(std::remove_if(children.begin(), children.end(),
-			[&](const node_ptr &p) {
-				string full_name = p->name;
-				if (p->unit_address != string())
-				{
-					full_name += '@';
-					full_name += p->unit_address;
-				}
-				if (other->deleted_children.count(full_name) > 0)
-				{
-					other->deleted_children.erase(full_name);
-					return true;
-				}
-				return false;
-			}), children.end());
-	props.erase(std::remove_if(props.begin(), props.end(),
-			[&](const property_ptr &p) {
-				if (other->deleted_props.count(p->get_key()) > 0)
-				{
-					other->deleted_props.erase(p->get_key());
-					return true;
-				}
-				return false;
-			}), props.end());
 }
 
 void
@@ -1169,6 +1203,7 @@ device_tree::collect_names_recursive(node_ptr &n, node_path &path)
 			{
 				node_names.insert(std::make_pair(name, n.get()));
 				node_paths.insert(std::make_pair(name, path));
+				ordered_node_paths.push_back({name, path});
 			}
 			else
 			{
@@ -1225,6 +1260,7 @@ device_tree::collect_names()
 	node_path p;
 	node_names.clear();
 	node_paths.clear();
+	ordered_node_paths.clear();
 	cross_references.clear();
 	fixups.clear();
 	collect_names_recursive(root, p);
@@ -1319,7 +1355,7 @@ device_tree::resolve_cross_references(uint32_t &phandle)
 		phandle_set.insert({&i.val, i});
 	}
 	std::vector<std::reference_wrapper<fixup>> sorted_phandles;
-	root->visit([&](node &n) {
+	root->visit([&](node &n, node *) {
 		for (auto &p : n.properties())
 		{
 			for (auto &v : *p)
@@ -1331,9 +1367,10 @@ device_tree::resolve_cross_references(uint32_t &phandle)
 				}
 			}
 		}
-	});
+		// Allow recursion
+		return node::VISIT_RECURSE;
+	}, nullptr);
 	assert(sorted_phandles.size() == fixups.size());
-
 	for (auto &i : sorted_phandles)
 	{
 		string target_name = i.get().val.string_data;
@@ -1421,6 +1458,103 @@ device_tree::resolve_cross_references(uint32_t &phandle)
 	}
 }
 
+bool
+device_tree::garbage_collect_marked_nodes()
+{
+	std::unordered_set<node*> previously_referenced_nodes;
+	std::unordered_set<node*> newly_referenced_nodes;
+
+	auto mark_referenced_nodes_used = [&](node &n)
+	{
+		for (auto &p : n.properties())
+		{
+			for (auto &v : *p)
+			{
+				if (v.is_phandle())
+				{
+					node *nx = node_names[v.string_data];
+					if (nx == nullptr)
+					{
+						// Try it again, but as a path
+						for (auto &s : node_paths)
+						{
+							if (v.string_data == s.second.to_string())
+							{
+								nx = node_names[s.first];
+								break;
+							}
+						}
+					}
+					if (nx == nullptr)
+					{
+						// Couldn't resolve this one?
+						continue;
+					}
+					// Only mark those currently unmarked
+					if (!nx->used)
+					{
+							nx->used = 1;
+							newly_referenced_nodes.insert(nx);
+					}
+				}
+			}
+		}
+	};
+
+	// Seed our referenced nodes with those that have been seen by a node that
+	// either will not be omitted if it's unreferenced or has a symbol.
+	// Nodes with symbols are explicitly not garbage collected because they may
+	// be expected for referencing by an overlay, and we do not want surprises
+	// there.
+	root->visit([&](node &n, node *) {
+		if (!n.omit_if_no_ref || (write_symbols && !n.labels.empty()))
+		{
+			mark_referenced_nodes_used(n);
+		}
+		// Recurse as normal
+		return node::VISIT_RECURSE;
+	}, nullptr);
+
+	while (!newly_referenced_nodes.empty())
+	{
+			previously_referenced_nodes = std::move(newly_referenced_nodes);
+			for (auto *n : previously_referenced_nodes)
+			{
+				mark_referenced_nodes_used(*n);
+			}
+	}
+
+	previously_referenced_nodes.clear();
+	bool children_deleted = false;
+
+	// Delete
+	root->visit([&](node &n, node *) {
+		bool gc_children = false;
+
+		for (auto &cn : n.child_nodes())
+		{
+				if (cn->omit_if_no_ref && !cn->used)
+				{
+					gc_children = true;
+					break;
+				}
+		}
+
+		if (gc_children)
+		{
+			children_deleted = true;
+			n.delete_children_if([](node_ptr &nx) {
+				return (nx->omit_if_no_ref && !nx->used);
+			});
+
+			return node::VISIT_CONTINUE;
+		}
+
+		return node::VISIT_RECURSE;
+	}, nullptr);
+
+	return children_deleted;
+}
 
 void
 device_tree::parse_file(text_input_buffer &input,
@@ -1429,11 +1563,11 @@ device_tree::parse_file(text_input_buffer &input,
 {
 	input.next_token();
 	// Read the header
-	if (input.consume("/dts-v1/;"))
+	while (input.consume("/dts-v1/;"))
 	{
 		read_header = true;
+		input.next_token();
 	}
-	input.next_token();
 	if (input.consume("/plugin/;"))
 	{
 		is_plugin = true;
@@ -1455,9 +1589,12 @@ device_tree::parse_file(text_input_buffer &input,
 		{
 			input.parse_error("Expected size on /memreserve/ node.");
 		}
+		else
+		{
+			reservations.push_back(reservation(start, len));
+		}
 		input.next_token();
 		input.consume(';');
-		reservations.push_back(reservation(start, len));
 		input.next_token();
 	}
 	while (valid && !input.finished())
@@ -1466,14 +1603,32 @@ device_tree::parse_file(text_input_buffer &input,
 		if (input.consume('/'))
 		{
 			input.next_token();
-			n = node::parse(input, string(), string_set(), string(), &defines);
+			n = node::parse(input, *this, string(), string_set(), string(), &defines);
 		}
 		else if (input.consume('&'))
 		{
 			input.next_token();
-			string name = input.parse_node_name();
+			string name;
+			bool name_is_path_reference = false;
+			// This is to deal with names intended as path references, e.g. &{/path}.
+			// While it may make sense in a non-plugin context, we don't support such
+			// usage at this time.
+			if (input.consume('{') && is_plugin)
+			{
+				name = input.parse_to('}');
+				input.consume('}');
+				name_is_path_reference = true;
+			}
+			else
+			{
+				name = input.parse_node_name();
+			}
 			input.next_token();
-			n = node::parse(input, std::move(name), string_set(), string(), &defines);
+			n = node::parse(input, *this, std::move(name), string_set(), string(), &defines);
+			if (n)
+			{
+				n->name_is_path_reference = name_is_path_reference;
+			}
 		}
 		else
 		{
@@ -1509,7 +1664,7 @@ device_tree::write(int fd)
 		reservation_writer.write_comment(string("Reservation start"));
 		reservation_writer.write_data(i.first);
 		reservation_writer.write_comment(string("Reservation length"));
-		reservation_writer.write_data(i.first);
+		reservation_writer.write_data(i.second);
 	}
 	// Write n spare reserve map entries, plus the trailing 0.
 	for (uint32_t i=0 ; i<=spare_reserve_map_entries ; i++)
@@ -1595,10 +1750,11 @@ device_tree::write_dts(int fd)
 	if (!reservations.empty())
 	{
 		const char msg[] = "/memreserve/";
-		fwrite(msg, sizeof(msg), 1, file);
+		// Exclude the null byte when we're writing it out to the file.
+		fwrite(msg, sizeof(msg) - 1, 1, file);
 		for (auto &i : reservations)
 		{
-			fprintf(file, " %" PRIx64 " %" PRIx64, i.first, i.second);
+			fprintf(file, " 0x%" PRIx64 " 0x%" PRIx64, i.first, i.second);
 		}
 		fputs(";\n\n", file);
 	}
@@ -1641,6 +1797,10 @@ device_tree::parse_dtb(const string &fn, FILE *)
 			fprintf(stderr, "Failed to read memory reservation table\n");
 			valid = false;
 			return;
+		}
+		if (start != 0 || length != 0)
+		{
+			reservations.push_back(reservation(start, length));
 		}
 	} while (!((start == 0) && (length == 0)));
 	input_buffer struct_table =
@@ -1702,11 +1862,21 @@ device_tree::create_fragment_wrapper(node_ptr &node, int &fragnum)
 	node_ptr newroot = node::create_special_node("", symbols);
 	node_ptr wrapper = node::create_special_node("__overlay__", symbols);
 
-	// Generate the fragment with target = <&name>
+	// Generate the fragment with $propname = <&name>
 	property_value v;
+	std::string propname;
 	v.string_data = node->name;
-	v.type = property_value::PHANDLE;
-	auto prop = std::make_shared<property>(std::string("target"));
+	if (!node->name_is_path_reference)
+	{
+		propname = "target";
+		v.type = property_value::PHANDLE;
+	}
+	else
+	{
+		propname = "target-path";
+		v.type = property_value::STRING;
+	}
+	auto prop = std::make_shared<property>(std::string(propname));
 	prop->add_value(v);
 	symbols.push_back(prop);
 
@@ -1845,6 +2015,12 @@ device_tree::parse_dts(const string &fn, FILE *depfile)
 		}
 	}
 	collect_names();
+	// Return value indicates whether we've dirtied the tree or not and need to
+	// recollect names
+	if (garbage_collect && garbage_collect_marked_nodes())
+	{
+		collect_names();
+	}
 	uint32_t phandle = 1;
 	// If we're writing symbols, go ahead and assign phandles to the entire
 	// tree. We'll do this before we resolve cross references, just to keep
@@ -1861,8 +2037,14 @@ device_tree::parse_dts(const string &fn, FILE *depfile)
 		// referenced by other plugins, so we create a __symbols__ node inside
 		// the root that contains mappings (properties) from label names to
 		// paths.
-		for (auto &s : node_paths)
+		for (auto i=ordered_node_paths.rbegin(), e=ordered_node_paths.rend() ; i!=e ; ++i)
 		{
+			auto &s = *i;
+			if (node_paths.find(s.first) == node_paths.end())
+			{
+				// Erased node, skip it.
+				continue;
+			}
 			property_value v;
 			v.string_data = s.second.to_string();
 			v.type = property_value::STRING;
@@ -1872,116 +2054,125 @@ device_tree::parse_dts(const string &fn, FILE *depfile)
 			symbols.push_back(prop);
 		}
 		root->add_child(node::create_special_node("__symbols__", symbols));
-		// If this is a plugin, then we also need to create two extra nodes.
-		// Internal phandles will need to be renumbered to avoid conflicts with
-		// already-loaded nodes and external references will need to be
-		// resolved.
-		if (is_plugin)
+	}
+	// If this is a plugin, then we also need to create two extra nodes.
+	// Internal phandles will need to be renumbered to avoid conflicts with
+	// already-loaded nodes and external references will need to be
+	// resolved.
+	if (is_plugin)
+	{
+		std::vector<property_ptr> symbols;
+		// Create the fixups entry.  This is of the form:
+		// {target} = {path}:{property name}:{offset}
+		auto create_fixup_entry = [&](fixup &i, string target)
+			{
+				string value = i.path.to_string();
+				value += ':';
+				value += i.prop->get_key();
+				value += ':';
+				value += std::to_string(i.prop->offset_of_value(i.val));
+				property_value v;
+				v.string_data = value;
+				v.type = property_value::STRING;
+				auto prop = std::make_shared<property>(std::move(target));
+				prop->add_value(v);
+				return prop;
+			};
+		// If we have any unresolved phandle references in this plugin,
+		// then we must update them to 0xdeadbeef and leave a property in
+		// the /__fixups__ node whose key is the label and whose value is
+		// as described above.
+		if (!unresolved_fixups.empty())
 		{
-			// Create the fixups entry.  This is of the form:
-			// {target} = {path}:{property name}:{offset}
-			auto create_fixup_entry = [&](fixup &i, string target)
-				{
-					string value = i.path.to_string();
-					value += ':';
-					value += i.prop->get_key();
-					value += ':';
-					value += std::to_string(i.prop->offset_of_value(i.val));
-					property_value v;
-					v.string_data = value;
-					v.type = property_value::STRING;
-					auto prop = std::make_shared<property>(std::move(target));
-					prop->add_value(v);
-					return prop;
-				};
-			// If we have any unresolved phandle references in this plugin,
-			// then we must update them to 0xdeadbeef and leave a property in
-			// the /__fixups__ node whose key is the label and whose value is
-			// as described above.
-			if (!unresolved_fixups.empty())
+			for (auto &i : unresolved_fixups)
 			{
-				symbols.clear();
-				for (auto &i : unresolved_fixups)
-				{
-					auto &val = i.get().val;
-					symbols.push_back(create_fixup_entry(i, val.string_data));
-					val.byte_data.push_back(0xde);
-					val.byte_data.push_back(0xad);
-					val.byte_data.push_back(0xbe);
-					val.byte_data.push_back(0xef);
-					val.type = property_value::BINARY;
-				}
-				root->add_child(node::create_special_node("__fixups__", symbols));
+				auto &val = i.get().val;
+				symbols.push_back(create_fixup_entry(i, val.string_data));
+				val.byte_data.push_back(0xde);
+				val.byte_data.push_back(0xad);
+				val.byte_data.push_back(0xbe);
+				val.byte_data.push_back(0xef);
+				val.type = property_value::BINARY;
 			}
-			symbols.clear();
-			// If we have any resolved phandle references in this plugin, then
-			// we must create a child in the __local_fixups__ node whose path
-			// matches the node path from the root and whose value contains the
-			// location of the reference within a property.
-			
-			// Create a local_fixups node that is initially empty.
-			node_ptr local_fixups = node::create_special_node("__local_fixups__", symbols);
-			for (auto &i : fixups)
+			root->add_child(node::create_special_node("__fixups__", symbols));
+		}
+		symbols.clear();
+		// If we have any resolved phandle references in this plugin, then
+		// we must create a child in the __local_fixups__ node whose path
+		// matches the node path from the root and whose value contains the
+		// location of the reference within a property.
+		
+		// Create a local_fixups node that is initially empty.
+		node_ptr local_fixups = node::create_special_node("__local_fixups__", symbols);
+		for (auto &i : fixups)
+		{
+			if (!i.val.is_phandle())
 			{
-				if (!i.val.is_phandle())
+				continue;
+			}
+			node *n = local_fixups.get();
+			for (auto &p : i.path)
+			{
+				// Skip the implicit root
+				if (p.first.empty())
 				{
 					continue;
 				}
-				node *n = local_fixups.get();
-				for (auto &p : i.path)
+				bool found = false;
+				for (auto &c : n->child_nodes())
 				{
-					// Skip the implicit root
-					if (p.first.empty())
+					if (c->name == p.first)
 					{
-						continue;
-					}
-					bool found = false;
-					for (auto &c : n->child_nodes())
-					{
-						if (c->name == p.first)
+						if (c->unit_address == p.second)
 						{
 							n = c.get();
 							found = true;
 							break;
 						}
 					}
-					if (!found)
-					{
-						n->add_child(node::create_special_node(p.first, symbols));
-						n = (--n->child_end())->get();
-					}
 				}
-				assert(n);
-				property_value pv;
-				push_big_endian(pv.byte_data, static_cast<uint32_t>(i.prop->offset_of_value(i.val)));
-				pv.type = property_value::BINARY;
-				auto key = i.prop->get_key();
-				property_ptr prop = n->get_property(key);
-				// If we don't have an existing property then create one and
-				// use this property value
-				if (!prop)
+				if (!found)
 				{
-					prop = std::make_shared<property>(std::move(key));
-					n->add_property(prop);
+					string path = p.first;
+					if (!(p.second.empty()))
+					{
+						path += '@';
+						path += p.second;
+					}
+					n->add_child(node::create_special_node(path, symbols));
+					n = (--n->child_end())->get();
+				}
+			}
+			assert(n);
+			property_value pv;
+			push_big_endian(pv.byte_data, static_cast<uint32_t>(i.prop->offset_of_value(i.val)));
+			pv.type = property_value::BINARY;
+			auto key = i.prop->get_key();
+			property_ptr prop = n->get_property(key);
+			// If we don't have an existing property then create one and
+			// use this property value
+			if (!prop)
+			{
+				prop = std::make_shared<property>(std::move(key));
+				n->add_property(prop);
+				prop->add_value(pv);
+			}
+			else
+			{
+				// If we do have an existing property value, try to append
+				// this value.
+				property_value &old_val = *(--prop->end());
+				if (!old_val.try_to_merge(pv))
+				{
 					prop->add_value(pv);
 				}
-				else
-				{
-					// If we do have an existing property value, try to append
-					// this value.
-					property_value &old_val = *(--prop->end());
-					if (!old_val.try_to_merge(pv))
-					{
-						prop->add_value(pv);
-					}
-				}
 			}
-			// We've iterated over all fixups, but only emit the
-			// __local_fixups__ if we found some that were resolved internally.
-			if (local_fixups->child_begin() != local_fixups->child_end())
-			{
-				root->add_child(std::move(local_fixups));
-			}
+		}
+		// We've iterated over all fixups, but only emit the
+		// __local_fixups__ if we found some that were resolved internally.
+		if (local_fixups->child_begin() != local_fixups->child_end())
+		{
+			root->add_child(std::move(local_fixups));
 		}
 	}
 }

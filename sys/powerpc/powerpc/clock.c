@@ -95,7 +95,7 @@ struct decr_state {
 	int	mode;	/* 0 - off, 1 - periodic, 2 - one-shot. */
 	int32_t	div;	/* Periodic divisor. */
 };
-static DPCPU_DEFINE(struct decr_state, decr_state);
+DPCPU_DEFINE_STATIC(struct decr_state, decr_state);
 
 static struct eventtimer	decr_et;
 static struct timecounter	decr_tc = {
@@ -303,13 +303,16 @@ decr_get_timecount(struct timecounter *tc)
 void
 DELAY(int n)
 {
-	u_quad_t	tb, ttb;
+	volatile u_quad_t	tb;
+	u_quad_t		ttb;
 
 	TSENTER();
 	tb = mftb();
 	ttb = tb + howmany((uint64_t)n * 1000000, ps_per_tick);
+	nop_prio_vlow();
 	while (tb < ttb)
 		tb = mftb();
+	nop_prio_medium();
 	TSEXIT();
 }
 

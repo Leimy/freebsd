@@ -16,68 +16,6 @@
     bsnmp
     ..
     c++
-        4.2
-            backward
-            ..
-            bits
-            ..
-            debug
-            ..
-            ext
-                pb_ds
-                    detail
-                        basic_tree_policy
-                        ..
-                        bin_search_tree_
-                        ..
-                        binary_heap_
-                        ..
-                        binomial_heap_
-                        ..
-                        binomial_heap_base_
-                        ..
-                        cc_hash_table_map_
-                        ..
-                        eq_fn
-                        ..
-                        gp_hash_table_map_
-                        ..
-                        hash_fn
-                        ..
-                        left_child_next_sibling_heap_
-                        ..
-                        list_update_map_
-                        ..
-                        list_update_policy
-                        ..
-                        ov_tree_map_
-                        ..
-                        pairing_heap_
-                        ..
-                        pat_trie_
-                        ..
-                        rb_tree_map_
-                        ..
-                        rc_binomial_heap_
-                        ..
-                        resize_policy
-                        ..
-                        splay_tree_
-                        ..
-                        thin_heap_
-                        ..
-                        tree_policy
-                        ..
-                        trie_policy
-                        ..
-                        unordered_iterator
-                        ..
-                    ..
-                ..
-            ..
-            tr1
-            ..
-        ..
         v1
             experimental
             ..
@@ -108,8 +46,6 @@
         ..
         an
         ..
-        bktr
-        ..
         ciss
         ..
         evdev
@@ -128,8 +64,6 @@
         ..
         io
         ..
-        lmc
-        ..
         mfi
         ..
         mlx5
@@ -139,8 +73,6 @@
         mpt
             mpilib
             ..
-        ..
-        nand
         ..
         nvme
         ..
@@ -154,11 +86,17 @@
         ..
         ppbus
         ..
+        pwm
+        ..
         smbus
         ..
         speaker
         ..
+        tcp_log
+        ..
         usb
+        ..
+        veriexec
         ..
         vkbd
         ..
@@ -179,8 +117,6 @@
         fdescfs
         ..
         msdosfs
-        ..
-        nandfs
         ..
         nfs
         ..
@@ -257,6 +193,8 @@
     ..
     lib80211
     ..
+    libipt
+    ..
     libmilter
     ..
     libxo
@@ -269,6 +207,8 @@
     ..
     net
         altq
+        ..
+        route
         ..
     ..
     net80211
@@ -285,6 +225,10 @@
     ..
     netinet
         cc
+        ..
+        netdump
+        ..
+        tcp_stacks
         ..
     ..
     netinet6
@@ -313,6 +257,18 @@
     ..
     nfsserver
     ..
+    opencsd
+        c_api
+        ..
+        etmv3
+        ..
+        etmv4
+        ..
+        ptm
+        ..
+        stm
+        ..
+    ..
     openssl
     ..
     pcap
@@ -338,8 +294,8 @@
         ..
         mac_partition
         ..
-    ..
-    ssp
+        mac_veriexec
+        ..
     ..
     sys
         disk

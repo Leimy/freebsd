@@ -18,7 +18,6 @@
 
 #include "common.h"
 
-int kqfd;
 
 static void
 add_and_delete(void)
@@ -115,9 +114,9 @@ oneshot(void)
 }
 
 void
-test_evfilt_user()
+test_evfilt_user(void)
 {
-	kqfd = kqueue();
+    kqfd = kqueue();
 
     add_and_delete();
     event_wait();
@@ -125,5 +124,5 @@ test_evfilt_user()
     oneshot();
     /* TODO: try different fflags operations */
 
-	close(kqfd);
+    close(kqfd);
 }

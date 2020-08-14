@@ -21,7 +21,8 @@
 
 /*
  * Copyright (c) 2005, 2010, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2011, 2016 by Delphix. All rights reserved.
+ * Copyright (c) 2011, 2020 by Delphix. All rights reserved.
+ * Copyright (c) 2017, Intel Corporation.
  */
 
 #ifndef _SYS_VDEV_H
@@ -71,6 +72,7 @@ extern void vdev_dtl_dirty(vdev_t *vd, vdev_dtl_type_t d,
 extern boolean_t vdev_dtl_contains(vdev_t *vd, vdev_dtl_type_t d,
     uint64_t txg, uint64_t size);
 extern boolean_t vdev_dtl_empty(vdev_t *vd, vdev_dtl_type_t d);
+extern boolean_t vdev_dtl_need_resilver(vdev_t *vd, uint64_t off, size_t size);
 extern void vdev_dtl_reassess(vdev_t *vd, uint64_t txg, uint64_t scrub_txg,
     int scrub_done);
 extern boolean_t vdev_dtl_required(vdev_t *vd);
@@ -82,7 +84,7 @@ extern uint64_t vdev_create_link_zap(vdev_t *vd, dmu_tx_t *tx);
 extern void vdev_construct_zaps(vdev_t *vd, dmu_tx_t *tx);
 extern void vdev_destroy_spacemaps(vdev_t *vd, dmu_tx_t *tx);
 extern void vdev_indirect_mark_obsolete(vdev_t *vd, uint64_t offset,
-    uint64_t size, uint64_t txg);
+    uint64_t size);
 extern void spa_vdev_indirect_mark_obsolete(spa_t *spa, uint64_t vdev,
     uint64_t offset, uint64_t size, dmu_tx_t *tx);
 
@@ -109,6 +111,8 @@ extern boolean_t vdev_children_are_offline(vdev_t *vd);
 extern void vdev_space_update(vdev_t *vd,
     int64_t alloc_delta, int64_t defer_delta, int64_t space_delta);
 
+extern int64_t vdev_deflated_space(vdev_t *vd, int64_t space);
+
 extern uint64_t vdev_psize_to_asize(vdev_t *vd, uint64_t psize);
 
 extern int vdev_fault(spa_t *spa, uint64_t guid, vdev_aux_t aux);
@@ -123,6 +127,7 @@ extern boolean_t vdev_readable(vdev_t *vd);
 extern boolean_t vdev_writeable(vdev_t *vd);
 extern boolean_t vdev_allocatable(vdev_t *vd);
 extern boolean_t vdev_accessible(vdev_t *vd, zio_t *zio);
+extern boolean_t vdev_is_spacemap_addressable(vdev_t *vd);
 
 extern void vdev_cache_init(vdev_t *vd);
 extern void vdev_cache_fini(vdev_t *vd);
@@ -134,6 +139,7 @@ extern void vdev_queue_init(vdev_t *vd);
 extern void vdev_queue_fini(vdev_t *vd);
 extern zio_t *vdev_queue_io(zio_t *zio);
 extern void vdev_queue_io_done(zio_t *zio);
+extern void vdev_queue_change_io_priority(zio_t *zio, zio_priority_t priority);
 extern int vdev_queue_length(vdev_t *vd);
 extern uint64_t vdev_queue_lastoffset(vdev_t *vd);
 extern void vdev_queue_register_lastoffset(vdev_t *vd, zio_t *zio);
@@ -165,6 +171,10 @@ extern uint64_t vdev_label_offset(uint64_t psize, int l, uint64_t offset);
 extern int vdev_label_number(uint64_t psise, uint64_t offset);
 extern nvlist_t *vdev_label_read_config(vdev_t *vd, uint64_t txg);
 extern void vdev_uberblock_load(vdev_t *, struct uberblock *, nvlist_t **);
+extern void vdev_label_write(zio_t *zio, vdev_t *vd, int l, abd_t *buf, uint64_t
+    offset, uint64_t size, zio_done_func_t *done, void *priv, int flags);
+extern int vdev_label_read_bootenv(vdev_t *, nvlist_t *);
+extern int vdev_label_write_bootenv(vdev_t *, char *);
 
 typedef enum {
 	VDEV_LABEL_CREATE,	/* create/add a new device */

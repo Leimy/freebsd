@@ -75,8 +75,10 @@ enum {
 	MIDI_MAX_INDEX,
 };
 
+#define	MIDI_DEFAULT_VENDOR_ID		USB_TEMPLATE_VENDOR
+#define	MIDI_DEFAULT_PRODUCT_ID		0x27de
 #define	MIDI_DEFAULT_INTERFACE		"MIDI interface"
-#define	MIDI_DEFAULT_MANUFACTURER	"FreeBSD foundation"
+#define	MIDI_DEFAULT_MANUFACTURER	USB_TEMPLATE_MANUFACTURER
 #define	MIDI_DEFAULT_PRODUCT		"MIDI Test Device"
 #define	MIDI_DEFAULT_SERIAL_NUMBER	"March 2008"
 
@@ -197,8 +199,8 @@ static const struct usb_temp_interface_desc *midi_interfaces[] = {
 
 static const struct usb_temp_config_desc midi_config_desc = {
 	.ppIfaceDesc = midi_interfaces,
-	.bmAttributes = UC_BUS_POWERED,
-	.bMaxPower = 25,		/* 50 mA */
+	.bmAttributes = 0,
+	.bMaxPower = 0,
 	.iConfiguration = MIDI_PRODUCT_INDEX,
 };
 
@@ -212,8 +214,8 @@ static usb_temp_get_string_desc_t midi_get_string_desc;
 struct usb_temp_device_desc usb_template_midi = {
 	.getStringDesc = &midi_get_string_desc,
 	.ppConfigDesc = midi_configs,
-	.idVendor = USB_TEMPLATE_VENDOR,
-	.idProduct = 0x00BB,
+	.idVendor = MIDI_DEFAULT_VENDOR_ID,
+	.idProduct = MIDI_DEFAULT_PRODUCT_ID,
 	.bcdDevice = 0x0100,
 	.bDeviceClass = 0,
 	.bDeviceSubClass = 0,
@@ -273,7 +275,7 @@ midi_init(void *arg __unused)
 
 	parent = SYSCTL_ADD_NODE(&midi_ctx_list,
 	    SYSCTL_STATIC_CHILDREN(_hw_usb_templates), OID_AUTO,
-	    parent_name, CTLFLAG_RW,
+	    parent_name, CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    0, "USB MIDI device side template");
 	SYSCTL_ADD_U16(&midi_ctx_list, SYSCTL_CHILDREN(parent), OID_AUTO,
 	    "vendor_id", CTLFLAG_RWTUN,

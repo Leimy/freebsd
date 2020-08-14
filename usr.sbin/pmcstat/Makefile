@@ -2,9 +2,10 @@
 # $FreeBSD$
 #
 
-PROG=	pmcstat
+PROG_CXX=	pmcstat
 MAN=	pmcstat.8
 
+CFLAGS+= -I${SRCTOP}/lib/libpmcstat
 LIBADD=	kvm pmc m ncursesw pmcstat elf
 
 SRCS=	pmcstat.c pmcstat.h pmcstat_log.c \

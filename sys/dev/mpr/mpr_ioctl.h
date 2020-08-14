@@ -27,13 +27,14 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Avago Technologies (LSI) MPT-Fusion Host Adapter FreeBSD userland interface
+ * Broadcom Inc. (LSI) MPT-Fusion Host Adapter FreeBSD userland interface
  *
  * $FreeBSD$
  */
 /*-
  * Copyright (c) 2011-2015 LSI Corp.
  * Copyright (c) 2013-2016 Avago Technologies
+ * Copyright 2000-2020 Broadcom Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -57,7 +58,7 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  *
- * Avago Technologies (LSI) MPT-Fusion Host Adapter FreeBSD
+ * Broadcom Inc. (LSI) MPT-Fusion Host Adapter FreeBSD
  *
  * $FreeBSD$
  */
@@ -362,6 +363,7 @@ typedef struct mpr_btdh_mapping
 #define	MPRIO_RAID_ACTION	_IOWR('M', 205, struct mpr_raid_action)
 #define	MPRIO_MPR_COMMAND	_IOWR('M', 210, struct mpr_usr_command)
 
+#ifndef MPTIOCTL
 #define	MPTIOCTL			('I')
 #define	MPTIOCTL_GET_ADAPTER_DATA	_IOWR(MPTIOCTL, 1,\
     struct mpr_adapter_data)
@@ -384,5 +386,6 @@ typedef struct mpr_btdh_mapping
     struct mpr_reg_access)
 #define	MPTIOCTL_BTDH_MAPPING		_IOWR(MPTIOCTL, 11,\
     struct mpr_btdh_mapping)
+#endif /* MPTIOCTL */
 
 #endif /* !_MPR_IOCTL_H_ */

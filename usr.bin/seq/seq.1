@@ -29,7 +29,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd August 12, 2016
+.Dd June 20, 2020
 .Dt SEQ 1
 .Os
 .Sh NAME
@@ -72,7 +72,7 @@ The
 .Nm
 utility accepts the following options:
 .Bl -tag -width Ar
-.It Fl f Ar format
+.It Fl f Ar format , Fl -format Ar format
 Use a
 .Xr printf 3
 style
@@ -98,7 +98,7 @@ defined in
 .St -ansiC .
 The default is
 .Cm %g .
-.It Fl s Ar string
+.It Fl s Ar string , Fl -separator Ar string
 Use
 .Ar string
 to separate numbers.
@@ -109,7 +109,7 @@ defined in
 .St -ansiC .
 The default is
 .Cm \en .
-.It Fl t Ar string
+.It Fl t Ar string , Fl -terminator Ar string
 Use
 .Ar string
 to terminate sequence of numbers.
@@ -121,7 +121,7 @@ defined in
 This option is useful when the default separator
 does not contain a
 .Cm \en .
-.It Fl w
+.It Fl w , Fl -fixed-width
 Equalize the widths of all numbers by padding with zeros as necessary.
 This option has no effect with the
 .Fl f
@@ -133,21 +133,50 @@ the default conversion is changed to
 .Sh EXIT STATUS
 .Ex -std
 .Sh EXAMPLES
+Generate a sequence from 1 to 3 (included) with a default increment of 1:
 .Bd -literal -offset indent
 # seq 1 3
 1
 2
 3
-
+.Ed
+.Pp
+Generate a sequence from 3 to 1 (included) with a default increment of -1:
+.Bd -literal -offset indent
 # seq 3 1
 3
 2
 1
-
+.Ed
+.Pp
+Generate a sequence from 0 to 0.1 (included) with an increment of 0.05 and padding
+with leading zeroes.
+.Bd -literal -offset indent
 # seq -w 0 .05 .1
 0.00
 0.05
 0.10
+.Ed
+.Pp
+Generate a sequence from 1 to 3 (included) with a default increment of 1,
+a custom separator string and a custom terminator:
+.Bd -literal -offset indent
+# seq -s "-->" -t "[end of list]\\n" 1 3
+1-->2-->3-->[end of list]
+.Ed
+.Pp
+Generate a sequence from 1 to 2 (included) with an increment of 0.2 and
+print the results with two digits after the decimal point (using a
+.Xr printf 3
+style format):
+.Bd -literal -offset indent
+# seq -f %.2f 1 0.2 2
+1.00
+1.20
+1.40
+1.60
+1.80
+2.00
 .Ed
 .Sh SEE ALSO
 .Xr jot 1 ,
@@ -165,12 +194,8 @@ command appeared in
 and was ported to
 .Fx 9.0 .
 This command was based on the command of the same name in
-.Tn "Plan 9 from Bell Labs"
-and the
-.Tn GNU
-core utilities.
-The
-.Tn GNU
+Plan 9 from Bell Labs and the GNU core utilities.
+The GNU
 .Nm
 command first appeared in the 1.13 shell utilities release.
 .Sh BUGS

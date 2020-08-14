@@ -60,6 +60,7 @@ ufs_disk_close(struct uufsd *disk)
 {
 	ERROR(disk, NULL);
 	close(disk->d_fd);
+	disk->d_fd = -1;
 	if (disk->d_inoblock != NULL) {
 		free(disk->d_inoblock);
 		disk->d_inoblock = NULL;
@@ -68,9 +69,10 @@ ufs_disk_close(struct uufsd *disk)
 		free((char *)(uintptr_t)disk->d_name);
 		disk->d_name = NULL;
 	}
-	if (disk->d_sbcsum != NULL) {
-		free(disk->d_sbcsum);
-		disk->d_sbcsum = NULL;
+	if (disk->d_si != NULL) {
+		free(disk->d_si->si_csp);
+		free(disk->d_si);
+		disk->d_si = NULL;
 	}
 	return (0);
 }
@@ -163,7 +165,7 @@ again:	if ((ret = stat(name, &st)) < 0) {
 	disk->d_mine = 0;
 	disk->d_ufs = 0;
 	disk->d_error = NULL;
-	disk->d_sbcsum = NULL;
+	disk->d_si = NULL;
 
 	if (oname != name) {
 		name = strdup(name);
@@ -181,19 +183,21 @@ again:	if ((ret = stat(name, &st)) < 0) {
 int
 ufs_disk_write(struct uufsd *disk)
 {
+	int fd;
+
 	ERROR(disk, NULL);
 
 	if (disk->d_mine & MINE_WRITE)
 		return (0);
 
-	close(disk->d_fd);
-
-	disk->d_fd = open(disk->d_name, O_RDWR);
-	if (disk->d_fd < 0) {
+	fd = open(disk->d_name, O_RDWR);
+	if (fd < 0) {
 		ERROR(disk, "failed to open disk for writing");
 		return (-1);
 	}
 
+	close(disk->d_fd);
+	disk->d_fd = fd;
 	disk->d_mine |= MINE_WRITE;
 
 	return (0);

@@ -186,13 +186,7 @@ extern struct pr_usrreqs sctp_usrreqs;
 #define sctp_free_remote_addr(__net) { \
 	if ((__net)) {  \
 		if (SCTP_DECREMENT_AND_CHECK_REFCOUNT(&(__net)->ref_count)) { \
-			(void)SCTP_OS_TIMER_STOP(&(__net)->rxt_timer.timer); \
-			(void)SCTP_OS_TIMER_STOP(&(__net)->pmtu_timer.timer); \
-			(void)SCTP_OS_TIMER_STOP(&(__net)->hb_timer.timer); \
-			if ((__net)->ro.ro_rt) { \
-				RTFREE((__net)->ro.ro_rt); \
-				(__net)->ro.ro_rt = NULL; \
-			} \
+			RO_NHFREE(&(__net)->ro); \
 			if ((__net)->src_addr_selected) { \
 				sctp_free_ifa((__net)->ro._s_addr); \
 				(__net)->ro._s_addr = NULL; \
@@ -341,12 +335,12 @@ int sctp_input(struct mbuf **, int *, int);
 void sctp_pathmtu_adjustment(struct sctp_tcb *, uint16_t);
 void sctp_drain(void);
 void sctp_init(void);
-void 
+void
 sctp_notify(struct sctp_inpcb *, struct sctp_tcb *, struct sctp_nets *,
     uint8_t, uint8_t, uint16_t, uint32_t);
 int sctp_flush(struct socket *, int);
 int sctp_shutdown(struct socket *);
-int 
+int
 sctp_bindx(struct socket *, int, struct sockaddr_storage *,
     int, int, struct proc *);
 

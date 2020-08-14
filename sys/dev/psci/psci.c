@@ -74,14 +74,14 @@ __FBSDID("$FreeBSD$");
 struct psci_softc {
 	device_t        dev;
 
-	psci_callfn_t	psci_call;
+	uint32_t	psci_version;
 	uint32_t	psci_fnids[PSCI_FN_MAX];
 };
 
 #ifdef FDT
-static int psci_v0_1_init(device_t dev);
+static int psci_v0_1_init(device_t dev, int default_version);
 #endif
-static int psci_v0_2_init(device_t dev);
+static int psci_v0_2_init(device_t dev, int default_version);
 
 struct psci_softc *psci_softc = NULL;
 
@@ -96,16 +96,69 @@ struct psci_softc *psci_softc = NULL;
 #endif
 
 #ifdef FDT
+struct psci_init_def {
+	int		default_version;
+	psci_initfn_t	psci_init;
+};
+
+static struct psci_init_def psci_v1_0_init_def = {
+	.default_version = (1 << 16) | 0,
+	.psci_init = psci_v0_2_init
+};
+
+static struct psci_init_def psci_v0_2_init_def = {
+	.default_version = (0 << 16) | 2,
+	.psci_init = psci_v0_2_init
+};
+
+static struct psci_init_def psci_v0_1_init_def = {
+	.default_version = (0 << 16) | 1,
+	.psci_init = psci_v0_1_init
+};
+
 static struct ofw_compat_data compat_data[] = {
-	{"arm,psci-1.0",        (uintptr_t)psci_v0_2_init},
-	{"arm,psci-0.2",        (uintptr_t)psci_v0_2_init},
-	{"arm,psci",            (uintptr_t)psci_v0_1_init},
+	{"arm,psci-1.0",        (uintptr_t)&psci_v1_0_init_def},
+	{"arm,psci-0.2",        (uintptr_t)&psci_v0_2_init_def},
+	{"arm,psci",            (uintptr_t)&psci_v0_1_init_def},
 	{NULL,                  0}
 };
 #endif
 
-static int psci_attach(device_t, psci_initfn_t);
+static int psci_attach(device_t, psci_initfn_t, int);
 static void psci_shutdown(void *, int);
+
+static int psci_find_callfn(psci_callfn_t *);
+static int psci_def_callfn(register_t, register_t, register_t, register_t,
+	register_t, register_t, register_t, register_t,
+	struct arm_smccc_res *res);
+
+psci_callfn_t psci_callfn = psci_def_callfn;
+
+static void
+psci_init(void *dummy)
+{
+	psci_callfn_t new_callfn;
+
+	if (psci_find_callfn(&new_callfn) != PSCI_RETVAL_SUCCESS) {
+		printf("No PSCI/SMCCC call function found\n");
+		return;
+	}
+
+	psci_callfn = new_callfn;
+}
+/* This needs to be before cpu_mp at SI_SUB_CPU, SI_ORDER_THIRD */
+SYSINIT(psci_start, SI_SUB_CPU, SI_ORDER_FIRST, psci_init, NULL);
+
+static int
+psci_def_callfn(register_t a __unused, register_t b __unused,
+    register_t c __unused, register_t d __unused,
+    register_t e __unused, register_t f __unused,
+    register_t g __unused, register_t h __unused,
+    struct arm_smccc_res *res __unused)
+{
+
+	panic("No PSCI/SMCCC call function set");
+}
 
 #ifdef FDT
 static int psci_fdt_probe(device_t dev);
@@ -138,9 +191,9 @@ psci_fdt_get_callfn(phandle_t node)
 
 	if ((OF_getprop(node, "method", method, sizeof(method))) > 0) {
 		if (strcmp(method, "hvc") == 0)
-			return (psci_hvc_despatch);
+			return (arm_smccc_hvc);
 		else if (strcmp(method, "smc") == 0)
-			return (psci_smc_despatch);
+			return (arm_smccc_smc);
 		else
 			printf("psci: PSCI conduit \"%s\" invalid\n", method);
 	} else
@@ -169,18 +222,14 @@ psci_fdt_probe(device_t dev)
 static int
 psci_fdt_attach(device_t dev)
 {
-	struct psci_softc *sc = device_get_softc(dev);
 	const struct ofw_compat_data *ocd;
-	psci_initfn_t psci_init;
-	phandle_t node;
+	struct psci_init_def *psci_init_def;
 
 	ocd = ofw_bus_search_compatible(dev, compat_data);
-	psci_init = (psci_initfn_t)ocd->ocd_data;
+	psci_init_def = (struct psci_init_def *)ocd->ocd_data;
 
-	node = ofw_bus_get_node(dev);
-	sc->psci_call = psci_fdt_get_callfn(node);
-
-	return (psci_attach(dev, psci_init));
+	return (psci_attach(dev, psci_init_def->psci_init,
+	    psci_init_def->default_version));
 }
 #endif
 
@@ -238,9 +287,9 @@ psci_acpi_get_callfn(int flags)
 
 	if ((flags & ACPI_FADT_PSCI_COMPLIANT) != 0) {
 		if ((flags & ACPI_FADT_PSCI_USE_HVC) != 0)
-			return (psci_hvc_despatch);
+			return (arm_smccc_hvc);
 		else
-			return (psci_smc_despatch);
+			return (arm_smccc_smc);
 	} else {
 		printf("psci: PSCI conduit not supplied in the device tree\n");
 	}
@@ -280,32 +329,21 @@ psci_acpi_probe(device_t dev)
 static int
 psci_acpi_attach(device_t dev)
 {
-	struct psci_softc *sc = device_get_softc(dev);
-	uintptr_t flags;
 
-	flags = (uintptr_t)acpi_get_private(dev);
-	if ((flags & ACPI_FADT_PSCI_USE_HVC) != 0)
-		sc->psci_call = psci_hvc_despatch;
-	else
-		sc->psci_call = psci_smc_despatch;
-
-	return (psci_attach(dev, psci_v0_2_init));
+	return (psci_attach(dev, psci_v0_2_init, PSCI_RETVAL_NOT_SUPPORTED));
 }
 #endif
 
 static int
-psci_attach(device_t dev, psci_initfn_t psci_init)
+psci_attach(device_t dev, psci_initfn_t psci_init, int default_version)
 {
 	struct psci_softc *sc = device_get_softc(dev);
 
 	if (psci_softc != NULL)
 		return (ENXIO);
 
-	if (sc->psci_call == NULL)
-		return (ENXIO);
-
 	KASSERT(psci_init != NULL, ("PSCI init function cannot be NULL"));
-	if (psci_init(dev))
+	if (psci_init(dev, default_version))
 		return (ENXIO);
 
 	psci_softc = sc;
@@ -321,7 +359,7 @@ _psci_get_version(struct psci_softc *sc)
 	/* PSCI version wasn't supported in v0.1. */
 	fnid = sc->psci_fnids[PSCI_FN_VERSION];
 	if (fnid)
-		return (sc->psci_call(fnid, 0, 0, 0));
+		return (psci_call(fnid, 0, 0, 0));
 
 	return (PSCI_RETVAL_NOT_SUPPORTED);
 }
@@ -368,40 +406,58 @@ psci_acpi_callfn(psci_callfn_t *callfn)
 }
 #endif
 
+static int
+psci_find_callfn(psci_callfn_t *callfn)
+{
+	int error;
+
+	*callfn = NULL;
+#ifdef FDT
+	if (USE_FDT) {
+		error = psci_fdt_callfn(callfn);
+		if (error != 0)
+			return (error);
+	}
+#endif
+#ifdef DEV_ACPI
+	if (*callfn == NULL && USE_ACPI) {
+		error = psci_acpi_callfn(callfn);
+		if (error != 0)
+			return (error);
+	}
+#endif
+
+	if (*callfn == NULL)
+		return (PSCI_MISSING);
+
+	return (PSCI_RETVAL_SUCCESS);
+}
+
+int32_t
+psci_features(uint32_t psci_func_id)
+{
+
+	if (psci_softc == NULL)
+		return (PSCI_RETVAL_NOT_SUPPORTED);
+
+	/* The feature flags were added to PSCI 1.0 */
+	if (PSCI_VER_MAJOR(psci_softc->psci_version) < 1)
+		return (PSCI_RETVAL_NOT_SUPPORTED);
+
+	return (psci_call(PSCI_FNID_FEATURES, psci_func_id, 0, 0));
+}
+
 int
 psci_cpu_on(unsigned long cpu, unsigned long entry, unsigned long context_id)
 {
-	psci_callfn_t callfn;
 	uint32_t fnid;
-	int error;
 
-	if (psci_softc == NULL) {
-		fnid = PSCI_FNID_CPU_ON;
-		callfn = NULL;
-#ifdef FDT
-		if (USE_FDT) {
-			error = psci_fdt_callfn(&callfn);
-			if (error != 0)
-				return (error);
-		}
-#endif
-#ifdef DEV_ACPI
-		if (callfn == NULL && USE_ACPI) {
-			error = psci_acpi_callfn(&callfn);
-			if (error != 0)
-				return (error);
-		}
-#endif
-
-		if (callfn == NULL)
-			return (PSCI_MISSING);
-	} else {
-		callfn = psci_softc->psci_call;
+	fnid = PSCI_FNID_CPU_ON;
+	if (psci_softc != NULL)
 		fnid = psci_softc->psci_fnids[PSCI_FN_CPU_ON];
-	}
 
 	/* PSCI v0.1 and v0.2 both support cpu_on. */
-	return (callfn(fnid, cpu, entry, context_id));
+	return (psci_call(fnid, cpu, entry, context_id));
 }
 
 static void
@@ -419,7 +475,7 @@ psci_shutdown(void *xsc, int howto)
 		fn = psci_softc->psci_fnids[PSCI_FN_SYSTEM_RESET];
 
 	if (fn)
-		psci_softc->psci_call(fn, 0, 0, 0);
+		psci_call(fn, 0, 0, 0);
 
 	/* System reset and off do not return. */
 }
@@ -434,7 +490,7 @@ psci_reset(void)
 #ifdef FDT
 /* Only support PSCI 0.1 on FDT */
 static int
-psci_v0_1_init(device_t dev)
+psci_v0_1_init(device_t dev, int default_version __unused)
 {
 	struct psci_softc *sc = device_get_softc(dev);
 	int psci_fn;
@@ -471,6 +527,7 @@ psci_v0_1_init(device_t dev)
 		sc->psci_fnids[PSCI_FN_MIGRATE] = psci_fnid;
 	}
 
+	sc->psci_version = (0 << 16) | 1;
 	if (bootverbose)
 		device_printf(dev, "PSCI version 0.1 available\n");
 
@@ -479,7 +536,7 @@ psci_v0_1_init(device_t dev)
 #endif
 
 static int
-psci_v0_2_init(device_t dev)
+psci_v0_2_init(device_t dev, int default_version)
 {
 	struct psci_softc *sc = device_get_softc(dev);
 	int version;
@@ -498,9 +555,22 @@ psci_v0_2_init(device_t dev)
 
 	version = _psci_get_version(sc);
 
-	if (version == PSCI_RETVAL_NOT_SUPPORTED)
-		return (1);
+	/*
+	 * U-Boot PSCI implementation doesn't have psci_get_version()
+	 * method implemented for many boards. In this case, use the version
+	 * readed from FDT as fallback. No fallback method for ACPI.
+	 */
+	if (version == PSCI_RETVAL_NOT_SUPPORTED) {
+		if (default_version == PSCI_RETVAL_NOT_SUPPORTED)
+			return (1);
 
+		version = default_version;
+		printf("PSCI get_version() function is not implemented, "
+		    " assuming v%d.%d\n", PSCI_VER_MAJOR(version),
+		    PSCI_VER_MINOR(version));
+	}
+
+	sc->psci_version = version;
 	if ((PSCI_VER_MAJOR(version) == 0 && PSCI_VER_MINOR(version) == 2) ||
 	    PSCI_VER_MAJOR(version) == 1) {
 		if (bootverbose)

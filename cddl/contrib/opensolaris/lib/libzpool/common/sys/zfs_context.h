@@ -330,9 +330,13 @@ typedef cond_t kcondvar_t;
 extern void cv_init(kcondvar_t *cv, char *name, int type, void *arg);
 extern void cv_destroy(kcondvar_t *cv);
 extern void cv_wait(kcondvar_t *cv, kmutex_t *mp);
+extern int cv_wait_sig(kcondvar_t *cv, kmutex_t *mp);
 extern clock_t cv_timedwait(kcondvar_t *cv, kmutex_t *mp, clock_t abstime);
+#define	cv_timedwait_sig(cvp, mp, t)	cv_timedwait(cvp, mp, t)
 extern clock_t cv_timedwait_hires(kcondvar_t *cvp, kmutex_t *mp, hrtime_t tim,
     hrtime_t res, int flag);
+#define	cv_timedwait_sig_hires(cvp, mp, t, r, f) \
+    cv_timedwait_hires(cvp, mp, t, r, f)
 extern void cv_signal(kcondvar_t *cv);
 extern void cv_broadcast(kcondvar_t *cv);
 
@@ -408,6 +412,7 @@ typedef struct taskq_ent {
 #define	TQ_NOQUEUE	0x02		/* Do not enqueue if can't dispatch */
 #define	TQ_FRONT	0x08		/* Queue in front */
 
+#define TASKQID_INVALID         ((taskqid_t)0)
 
 extern taskq_t *system_taskq;
 
@@ -421,6 +426,7 @@ extern void	taskq_dispatch_ent(taskq_t *, task_func_t, void *, uint_t,
     taskq_ent_t *);
 extern void	taskq_destroy(taskq_t *);
 extern void	taskq_wait(taskq_t *);
+extern void	taskq_wait_id(taskq_t *, taskqid_t);
 extern int	taskq_member(taskq_t *, void *);
 extern void	system_taskq_init(void);
 extern void	system_taskq_fini(void);
@@ -520,7 +526,7 @@ extern int fop_getattr(vnode_t *vp, vattr_t *vap);
 #define	VN_RELE_ASYNC(vp, taskq)	vn_close(vp, 0, NULL, NULL)
 
 #define	vn_lock(vp, type)
-#define	VOP_UNLOCK(vp, type)
+#define	VOP_UNLOCK(vp)
 
 extern int vn_open(char *path, int x1, int oflags, int mode, vnode_t **vpp,
     int x2, int x3);
@@ -559,6 +565,7 @@ extern void delay(clock_t ticks);
 	} while (0);
 
 #define	max_ncpus	64
+#define	boot_ncpus	(sysconf(_SC_NPROCESSORS_ONLN))
 
 #define	minclsyspri	60
 #define	maxclsyspri	99
@@ -666,6 +673,9 @@ extern zoneid_t getzoneid(void);
 #define	SIGPENDING(td)		(0)
 #define	root_mount_wait()	do { } while (0)
 #define	root_mounted()		(1)
+
+#define	noinline	__attribute__((noinline))
+#define	likely(x)	__builtin_expect((x), 1)
 
 struct file {
 	void *dummy;

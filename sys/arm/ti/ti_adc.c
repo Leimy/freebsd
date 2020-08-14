@@ -58,7 +58,7 @@ __FBSDID("$FreeBSD$");
 #include <dev/evdev/evdev.h>
 #endif
 
-#include <arm/ti/ti_prcm.h>
+#include <arm/ti/ti_sysc.h>
 #include <arm/ti/ti_adcreg.h>
 #include <arm/ti/ti_adcvar.h>
 
@@ -562,10 +562,10 @@ ti_adc_sysctl_init(struct ti_adc_softc *sc)
 	tree_node = device_get_sysctl_tree(sc->sc_dev);
 	tree = SYSCTL_CHILDREN(tree_node);
 	SYSCTL_ADD_PROC(ctx, tree, OID_AUTO, "clockdiv",
-	    CTLFLAG_RW | CTLTYPE_UINT,  sc, 0,
+	    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,  sc, 0,
 	    ti_adc_clockdiv_proc, "IU", "ADC clock prescaler");
 	inp_node = SYSCTL_ADD_NODE(ctx, tree, OID_AUTO, "ain",
-	    CTLFLAG_RD, NULL, "ADC inputs");
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "ADC inputs");
 	inp_tree = SYSCTL_CHILDREN(inp_node);
 
 	for (i = 0; i < sc->sc_adc_nchannels; i++) {
@@ -573,17 +573,20 @@ ti_adc_sysctl_init(struct ti_adc_softc *sc)
 
 		snprintf(pinbuf, sizeof(pinbuf), "%d", ain);
 		inpN_node = SYSCTL_ADD_NODE(ctx, inp_tree, OID_AUTO, pinbuf,
-		    CTLFLAG_RD, NULL, "ADC input");
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "ADC input");
 		inpN_tree = SYSCTL_CHILDREN(inpN_node);
 
 		SYSCTL_ADD_PROC(ctx, inpN_tree, OID_AUTO, "enable",
-		    CTLFLAG_RW | CTLTYPE_UINT, &ti_adc_inputs[ain], 0,
+		    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+		    &ti_adc_inputs[ain], 0,
 		    ti_adc_enable_proc, "IU", "Enable ADC input");
 		SYSCTL_ADD_PROC(ctx, inpN_tree, OID_AUTO, "open_delay",
-		    CTLFLAG_RW | CTLTYPE_UINT,  &ti_adc_inputs[ain], 0,
+		    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+		    &ti_adc_inputs[ain], 0,
 		    ti_adc_open_delay_proc, "IU", "ADC open delay");
 		SYSCTL_ADD_PROC(ctx, inpN_tree, OID_AUTO, "samples_avg",
-		    CTLFLAG_RW | CTLTYPE_UINT,  &ti_adc_inputs[ain], 0,
+		    CTLFLAG_RW | CTLTYPE_UINT | CTLFLAG_NEEDGIANT,
+		    &ti_adc_inputs[ain], 0,
 		    ti_adc_samples_avg_proc, "IU", "ADC samples average");
 		SYSCTL_ADD_INT(ctx, inpN_tree, OID_AUTO, "input",
 		    CTLFLAG_RD, &ti_adc_inputs[ain].value, 0,
@@ -777,8 +780,9 @@ ti_adc_attach(device_t dev)
 		if ((OF_getencprop(child, "ti,charge-delay", &cell,
 		    sizeof(cell))) > 0)
 			sc->sc_charge_delay = cell;
-		nwire_configs = OF_getencprop_alloc(child, "ti,wire-config",
-		    sizeof(*wire_configs), (void **)&wire_configs);
+		nwire_configs = OF_getencprop_alloc_multi(child,
+		    "ti,wire-config", sizeof(*wire_configs),
+		    (void **)&wire_configs);
 		if (nwire_configs != sc->sc_tsc_wires) {
 			device_printf(sc->sc_dev,
 			    "invalid number of ti,wire-config: %d (should be %d)\n",
@@ -795,8 +799,8 @@ ti_adc_attach(device_t dev)
 	/* Read "adc" node properties */
 	child = ofw_bus_find_child(node, "adc");
 	if (child != 0) {
-		sc->sc_adc_nchannels = OF_getencprop_alloc(child, "ti,adc-channels",
-		    sizeof(*channels), (void **)&channels);
+		sc->sc_adc_nchannels = OF_getencprop_alloc_multi(child,
+		    "ti,adc-channels", sizeof(*channels), (void **)&channels);
 		if (sc->sc_adc_nchannels > 0) {
 			for (i = 0; i < sc->sc_adc_nchannels; i++)
 				sc->sc_adc_channels[i] = channels[i];
@@ -820,7 +824,7 @@ ti_adc_attach(device_t dev)
 	}
 
 	/* Activate the ADC_TSC module. */
-	err = ti_prcm_clk_enable(TSC_ADC_CLK);
+	err = ti_sysc_clock_enable(device_get_parent(dev));
 	if (err)
 		return (err);
 
@@ -842,7 +846,7 @@ ti_adc_attach(device_t dev)
 	}
 
 	/* Check the ADC revision. */
-	rev = ADC_READ4(sc, ADC_REVISION);
+	rev = ADC_READ4(sc, ti_sysc_get_rev_address_offset_host(device_get_parent(dev)));
 	device_printf(dev,
 	    "scheme: %#x func: %#x rtl: %d rev: %d.%d custom rev: %d\n",
 	    (rev & ADC_REV_SCHEME_MSK) >> ADC_REV_SCHEME_SHIFT,
@@ -960,6 +964,7 @@ static devclass_t ti_adc_devclass;
 DRIVER_MODULE(ti_adc, simplebus, ti_adc_driver, ti_adc_devclass, 0, 0);
 MODULE_VERSION(ti_adc, 1);
 MODULE_DEPEND(ti_adc, simplebus, 1, 1, 1);
+MODULE_DEPEND(ti_adc, ti_sysc, 1, 1, 1);
 #ifdef EVDEV_SUPPORT
 MODULE_DEPEND(ti_adc, evdev, 1, 1, 1);
 #endif

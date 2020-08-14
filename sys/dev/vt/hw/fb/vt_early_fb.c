@@ -60,6 +60,7 @@ static struct vt_driver vt_fb_early_driver = {
 	.vd_init = vt_efb_init,
 	.vd_blank = vt_fb_blank,
 	.vd_bitblt_text = vt_fb_bitblt_text,
+	.vd_invalidate_text = vt_fb_invalidate_text,
 	.vd_bitblt_bmp = vt_fb_bitblt_bitmap,
 	.vd_drawrect = vt_fb_drawrect,
 	.vd_setpixel = vt_fb_setpixel,
@@ -224,7 +225,7 @@ vt_efb_init(struct vt_device *vd)
 	 * remapped for us when relocation turns on.
 	 */
 	if (OF_getproplen(node, "address") == sizeof(info->fb_pbase)) {
-	 	/* XXX We assume #address-cells is 1 at this point. */
+		/* XXX We assume #address-cells is 1 at this point. */
 		OF_getencprop(node, "address", &info->fb_pbase,
 		    sizeof(info->fb_pbase));
 
@@ -232,10 +233,6 @@ vt_efb_init(struct vt_device *vd)
 		sc->sc_memt = &bs_be_tag;
 		bus_space_map(sc->sc_memt, info->fb_pbase, info->fb_size,
 		    BUS_SPACE_MAP_PREFETCHABLE, &info->fb_vbase);
-	#elif defined(__sparc64__)
-		OF_decode_addr(node, 0, &space, &phys);
-		sc->sc_memt = &vt_efb_memt[0];
-		info->addr = sparc64_fake_bustag(space, fb_phys, sc->sc_memt);
 	#else
 		bus_space_map(fdtbus_bs_tag, info->fb_pbase, info->fb_size,
 		    BUS_SPACE_MAP_PREFETCHABLE,
@@ -273,11 +270,6 @@ vt_efb_init(struct vt_device *vd)
 	#if defined(__powerpc__)
 		OF_decode_addr(node, info->fb_pbase, &sc->sc_memt,
 		    &info->fb_vbase);
-	#elif defined(__sparc64__)
-		OF_decode_addr(node, info->fb_pbase, &space, &info->fb_pbase);
-		sc->sc_memt = &vt_efb_memt[0];
-		info->fb_vbase = sparc64_fake_bustag(space, info->fb_pbase,
-		    sc->sc_memt);
 	#else
 		bus_space_map(fdtbus_bs_tag, info->fb_pbase, info->fb_size,
 		    BUS_SPACE_MAP_PREFETCHABLE,

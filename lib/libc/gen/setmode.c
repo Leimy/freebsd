@@ -32,10 +32,8 @@
  * SUCH DAMAGE.
  */
 
-#if defined(LIBC_SCCS) && !defined(lint)
-static char sccsid[] = "@(#)setmode.c	8.2 (Berkeley) 3/25/94";
-#endif /* LIBC_SCCS and not lint */
 #include <sys/cdefs.h>
+__SCCSID("@(#)setmode.c	8.2 (Berkeley) 3/25/94");
 __FBSDID("$FreeBSD$");
 
 #include "namespace.h"
@@ -72,7 +70,7 @@ typedef struct bitcmd {
 #define	CMD2_OBITS	0x08
 #define	CMD2_UBITS	0x10
 
-static mode_t	 getumask(void);
+static mode_t	 get_current_umask(void);
 static BITCMD	*addcmd(BITCMD *, mode_t, mode_t, mode_t, mode_t);
 static void	 compress_mode(BITCMD *);
 #ifdef SETMODE_DEBUG
@@ -188,7 +186,7 @@ setmode(const char *p)
 	 * Get a copy of the mask for the permissions that are mask relative.
 	 * Flip the bits, we want what's not set.
 	 */
-	mask = ~getumask();
+	mask = ~get_current_umask();
 
 	setlen = SET_LEN + 2;
 
@@ -345,13 +343,14 @@ out:
 }
 
 static mode_t
-getumask(void)
+get_current_umask(void)
 {
 	sigset_t sigset, sigoset;
 	size_t len;
 	mode_t mask;
 	u_short smask;
 
+#ifdef KERN_PROC_UMASK
 	/*
 	 * First try requesting the umask without temporarily modifying it.
 	 * Note that this does not work if the sysctl
@@ -361,7 +360,7 @@ getumask(void)
 	if (sysctl((int[4]){ CTL_KERN, KERN_PROC, KERN_PROC_UMASK, 0 },
 	    4, &smask, &len, NULL, 0) == 0)
 		return (smask);
-
+#endif
 	/*
 	 * Since it's possible that the caller is opening files inside a signal
 	 * handler, protect them as best we can.

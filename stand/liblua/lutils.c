@@ -77,6 +77,14 @@ lua_perform(lua_State *L)
 	return 1;
 }
 
+static int
+lua_command_error(lua_State *L)
+{
+
+	lua_pushstring(L, command_errbuf);
+	return 1;
+}
+
 /*
  * Accepts a space-delimited loader command and runs it through the standard
  * loader parsing, as if it were executed at the loader prompt by the user.
@@ -341,6 +349,7 @@ lua_writefile(lua_State *L)
 #define REG_SIMPLE(n)	{ #n, lua_ ## n }
 static const struct luaL_Reg loaderlib[] = {
 	REG_SIMPLE(delay),
+	REG_SIMPLE(command_error),
 	REG_SIMPLE(command),
 	REG_SIMPLE(interpret),
 	REG_SIMPLE(parse),
@@ -375,6 +384,8 @@ luaopen_loader(lua_State *L)
 	lua_setfield(L, -2, "machine");
 	lua_pushstring(L, MACHINE_ARCH);
 	lua_setfield(L, -2, "machine_arch");
+	lua_pushstring(L, LUA_PATH);
+	lua_setfield(L, -2, "lua_path");
 	/* Set global printc to loader.printc */
 	lua_register(L, "printc", lua_printc);
 	return 1;

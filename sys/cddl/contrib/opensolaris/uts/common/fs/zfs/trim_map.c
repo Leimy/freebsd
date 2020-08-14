@@ -82,7 +82,8 @@ static u_int trim_max_interval = 1;	/* 1s delays between TRIMs */
 static u_int trim_vdev_max_pending = 10000; /* Keep up to 10K segments */
 
 SYSCTL_DECL(_vfs_zfs);
-SYSCTL_NODE(_vfs_zfs, OID_AUTO, trim, CTLFLAG_RD, 0, "ZFS TRIM");
+SYSCTL_NODE(_vfs_zfs, OID_AUTO, trim, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "ZFS TRIM");
 
 SYSCTL_UINT(_vfs_zfs_trim, OID_AUTO, txg_delay, CTLFLAG_RWTUN, &trim_txg_delay,
     0, "Delay TRIMs by up to this many TXGs");
@@ -360,16 +361,13 @@ trim_map_write_start(zio_t *zio)
 		return (B_FALSE);
 	}
 
-	ts = avl_find(&tm->tm_queued_frees, &tsearch, NULL);
-	if (ts != NULL) {
-		/*
-		 * Loop until all overlapping segments are removed.
-		 */
-		do {
-			trim_map_segment_remove(tm, ts, start, end);
-			ts = avl_find(&tm->tm_queued_frees, &tsearch, NULL);
-		} while (ts != NULL);
+	/*
+	 * Loop until all overlapping segments are removed.
+	 */
+	while ((ts = avl_find(&tm->tm_queued_frees, &tsearch, NULL)) != NULL) {
+		trim_map_segment_remove(tm, ts, start, end);
 	}
+
 	avl_add(&tm->tm_inflight_writes, zio);
 
 	mutex_exit(&tm->tm_lock);

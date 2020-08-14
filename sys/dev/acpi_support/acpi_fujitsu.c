@@ -228,16 +228,15 @@ acpi_fujitsu_probe(device_t dev)
 {
 	char *name;
 	char buffer[64];
+	int rv;
 
-	name = ACPI_ID_PROBE(device_get_parent(dev), dev, fujitsu_ids);
-	if (acpi_disabled("fujitsu") || name == NULL ||
-	    device_get_unit(dev) > 1)
+	rv =  ACPI_ID_PROBE(device_get_parent(dev), dev, fujitsu_ids, &name);
+	if (acpi_disabled("fujitsu") || rv > 0 || device_get_unit(dev) > 1)
 		return (ENXIO);
-
 	sprintf(buffer, "Fujitsu Function Hotkeys %s", name);
 	device_set_desc_copy(dev, buffer);
 
-	return (0);
+	return (rv);
 }
 
 static int
@@ -386,7 +385,7 @@ acpi_fujitsu_init(struct acpi_fujitsu_softc *sc)
 	sysctl_ctx_init(&sc->sysctl_ctx);
 	sc->sysctl_tree = SYSCTL_ADD_NODE(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(acpi_sc->acpi_sysctl_tree),
-	    OID_AUTO, "fujitsu", CTLFLAG_RD, 0, "");
+	    OID_AUTO, "fujitsu", CTLFLAG_RD | CTLFLAG_MPSAFE, 0, "");
 
 	for (i = 0; sysctl_table[i].name != NULL; i++) {
 		switch(sysctl_table[i].method) {
@@ -419,8 +418,8 @@ acpi_fujitsu_init(struct acpi_fujitsu_softc *sc)
 		SYSCTL_ADD_PROC(&sc->sysctl_ctx,
 		    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 		    sysctl_table[i].name,
-		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY,
-		    sc, i, acpi_fujitsu_sysctl, "I",
+		    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY |
+		    CTLFLAG_NEEDGIANT, sc, i, acpi_fujitsu_sysctl, "I",
 		    sysctl_table[i].description);
 	}
 

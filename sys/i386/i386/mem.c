@@ -92,9 +92,6 @@ memrw(struct cdev *dev, struct uio *uio, int flags)
 		return EIO;
 
 	if (dev2unit(dev) == CDEV_MINOR_KMEM && uio->uio_resid > 0) {
-		if (uio->uio_offset < (vm_offset_t)VADDR(PTDPTDI, 0))
-				return (EFAULT);
-
 		if (!kernacc((caddr_t)(int)uio->uio_offset, uio->uio_resid,
 		    uio->uio_rw == UIO_READ ?  VM_PROT_READ : VM_PROT_WRITE))
 			return (EFAULT);
@@ -151,7 +148,6 @@ memrw(struct cdev *dev, struct uio *uio, int flags)
 		error = uiomove((caddr_t)&ptvmmap[o], (int)c, uio);
 		pmap_qremove((vm_offset_t)ptvmmap, 1);
 		sx_xunlock(&memsxlock);
-		
 	}
 
 	return (error);

@@ -37,10 +37,13 @@ SRCS+=	ifgif.c			# GIF reversed header workaround
 SRCS+=	ifipsec.c		# IPsec VTI
 
 SRCS+=	sfp.c			# SFP/SFP+ information
-LIBADD+=	m
+LIBADD+=	ifconfig m util
+CFLAGS+=	-I${SRCTOP}/lib/libifconfig -I${OBJTOP}/lib/libifconfig
 
+.if ${MK_WIRELESS_SUPPORT} != "no"
 SRCS+=	ifieee80211.c		# SIOC[GS]IEEE80211 support
 LIBADD+=	80211
+.endif
 
 SRCS+=	carp.c			# SIOC[GS]VH support
 SRCS+=	ifgroup.c		# ...
@@ -51,13 +54,17 @@ SRCS+=	ifpfsync.c		# pfsync(4) support
 SRCS+=	ifbridge.c		# bridge support
 SRCS+=	iflagg.c		# lagg support
 
+.if ${MK_EXPERIMENTAL} != "no"
+CFLAGS+= -DDRAFT_IETF_6MAN_IPV6ONLY_FLAG
+CFLAGS+= -DEXPERIMENTAL
+.endif
 .if ${MK_INET6_SUPPORT} != "no"
 CFLAGS+= -DINET6
 .endif
 .if ${MK_INET_SUPPORT} != "no"
 CFLAGS+= -DINET
 .endif
-.if ${MK_JAIL} != "no" && !defined(RELEASE_CRUNCH) && !defined(RESCUE)
+.if ${MK_JAIL} != "no" && !defined(RESCUE)
 CFLAGS+= -DJAIL
 LIBADD+=	jail
 .endif

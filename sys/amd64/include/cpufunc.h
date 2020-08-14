@@ -116,6 +116,13 @@ clflushopt(u_long addr)
 }
 
 static __inline void
+clwb(u_long addr)
+{
+
+	__asm __volatile("clwb %0" : : "m" (*(char *)addr));
+}
+
+static __inline void
 clts(void)
 {
 
@@ -160,7 +167,8 @@ enable_intr(void)
 static __inline __pure2 int
 ffsl(long mask)
 {
-	return (mask == 0 ? mask : (int)bsfq((u_long)mask) + 1);
+
+	return (__builtin_ffsl(mask));
 }
 
 #define	HAVE_INLINE_FFSLL
@@ -224,7 +232,7 @@ inl(u_int port)
 static __inline void
 insb(u_int port, void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; insb"
+	__asm __volatile("rep; insb"
 			 : "+D" (addr), "+c" (count)
 			 : "d" (port)
 			 : "memory");
@@ -233,7 +241,7 @@ insb(u_int port, void *addr, size_t count)
 static __inline void
 insw(u_int port, void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; insw"
+	__asm __volatile("rep; insw"
 			 : "+D" (addr), "+c" (count)
 			 : "d" (port)
 			 : "memory");
@@ -242,7 +250,7 @@ insw(u_int port, void *addr, size_t count)
 static __inline void
 insl(u_int port, void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; insl"
+	__asm __volatile("rep; insl"
 			 : "+D" (addr), "+c" (count)
 			 : "d" (port)
 			 : "memory");
@@ -278,7 +286,7 @@ outl(u_int port, u_int data)
 static __inline void
 outsb(u_int port, const void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; outsb"
+	__asm __volatile("rep; outsb"
 			 : "+S" (addr), "+c" (count)
 			 : "d" (port));
 }
@@ -286,7 +294,7 @@ outsb(u_int port, const void *addr, size_t count)
 static __inline void
 outsw(u_int port, const void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; outsw"
+	__asm __volatile("rep; outsw"
 			 : "+S" (addr), "+c" (count)
 			 : "d" (port));
 }
@@ -294,7 +302,7 @@ outsw(u_int port, const void *addr, size_t count)
 static __inline void
 outsl(u_int port, const void *addr, size_t count)
 {
-	__asm __volatile("cld; rep; outsl"
+	__asm __volatile("rep; outsl"
 			 : "+S" (addr), "+c" (count)
 			 : "d" (port));
 }
@@ -383,6 +391,15 @@ rdtsc(void)
 	uint32_t low, high;
 
 	__asm __volatile("rdtsc" : "=a" (low), "=d" (high));
+	return (low | ((uint64_t)high << 32));
+}
+
+static __inline uint64_t
+rdtscp(void)
+{
+	uint32_t low, high;
+
+	__asm __volatile("rdtscp" : "=a" (low), "=d" (high) : : "ecx");
 	return (low | ((uint64_t)high << 32));
 }
 
@@ -611,6 +628,22 @@ cpu_mwait(u_long extensions, u_int hints)
 	__asm __volatile("mwait" : : "a" (hints), "c" (extensions));
 }
 
+static __inline uint32_t
+rdpkru(void)
+{
+	uint32_t res;
+
+	__asm __volatile("rdpkru" :  "=a" (res) : "c" (0) : "edx");
+	return (res);
+}
+
+static __inline void
+wrpkru(uint32_t mask)
+{
+
+	__asm __volatile("wrpkru" :  : "a" (mask),  "c" (0), "d" (0));
+}
+
 #ifdef _KERNEL
 /* This is defined in <machine/specialreg.h> but is too painful to get to */
 #ifndef	MSR_FSBASE
@@ -719,6 +752,15 @@ static __inline void
 lldt(u_short sel)
 {
 	__asm __volatile("lldt %0" : : "r" (sel));
+}
+
+static __inline u_short
+sldt(void)
+{
+	u_short sel;
+
+	__asm __volatile("sldt %0" : "=r" (sel));
+	return (sel);
 }
 
 static __inline void

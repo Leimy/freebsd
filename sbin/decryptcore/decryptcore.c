@@ -35,6 +35,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/wait.h>
 
 #include <ctype.h>
+#include <capsicum_helpers.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -118,8 +119,9 @@ static bool
 decrypt(int ofd, const char *privkeyfile, const char *keyfile,
     const char *input)
 {
-	uint8_t buf[KERNELDUMP_BUFFER_SIZE], key[KERNELDUMP_KEY_MAX_SIZE];
-	EVP_CIPHER_CTX ctx;
+	uint8_t buf[KERNELDUMP_BUFFER_SIZE], key[KERNELDUMP_KEY_MAX_SIZE],
+	    chachaiv[4 * 4];
+	EVP_CIPHER_CTX *ctx;
 	const EVP_CIPHER *cipher;
 	FILE *fp;
 	struct kerneldumpkey *kdk;
@@ -133,6 +135,7 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 	PJDLOG_ASSERT(keyfile != NULL);
 	PJDLOG_ASSERT(input != NULL);
 
+	ctx = NULL;
 	privkey = NULL;
 
 	/*
@@ -167,7 +170,8 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 		goto failed;
 	}
 
-	if (cap_enter() < 0 && errno != ENOSYS) {
+	caph_cache_catpages();
+	if (caph_enter() < 0) {
 		pjdlog_errno(LOG_ERR, "Unable to enter capability mode");
 		goto failed;
 	}
@@ -178,7 +182,9 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 		    ERR_error_string(ERR_get_error(), NULL));
 		goto failed;
 	}
-	EVP_CIPHER_CTX_init(&ctx);
+	ctx = EVP_CIPHER_CTX_new();
+	if (ctx == NULL)
+		goto failed;
 
 	kdk = read_key(kfd);
 	close(kfd);
@@ -203,12 +209,19 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 	case KERNELDUMP_ENC_AES_256_CBC:
 		cipher = EVP_aes_256_cbc();
 		break;
+	case KERNELDUMP_ENC_CHACHA20:
+		cipher = EVP_chacha20();
+		break;
 	default:
 		pjdlog_error("Invalid encryption algorithm.");
 		goto failed;
 	}
 
 	if (RSA_private_decrypt(kdk->kdk_encryptedkeysize,
+	    kdk->kdk_encryptedkey, key, privkey,
+	    RSA_PKCS1_OAEP_PADDING) != sizeof(key) &&
+	    /* Fallback to deprecated, formerly-used PKCS 1.5 padding. */
+	    RSA_private_decrypt(kdk->kdk_encryptedkeysize,
 	    kdk->kdk_encryptedkey, key, privkey,
 	    RSA_PKCS1_PADDING) != sizeof(key)) {
 		pjdlog_error("Unable to decrypt key: %s",
@@ -218,8 +231,24 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 	RSA_free(privkey);
 	privkey = NULL;
 
-	EVP_DecryptInit_ex(&ctx, cipher, NULL, key, kdk->kdk_iv);
-	EVP_CIPHER_CTX_set_padding(&ctx, 0);
+	if (kdk->kdk_encryption == KERNELDUMP_ENC_CHACHA20) {
+		/*
+		 * OpenSSL treats the IV as 4 little-endian 32 bit integers.
+		 *
+		 * The first two represent a 64-bit counter, where the low half
+		 * is the first 32-bit word.
+		 *
+		 * Start at counter block zero...
+		 */
+		memset(chachaiv, 0, 4 * 2);
+		/*
+		 * And use the IV specified by the dump.
+		 */
+		memcpy(&chachaiv[4 * 2], kdk->kdk_iv, 4 * 2);
+		EVP_DecryptInit_ex(ctx, cipher, NULL, key, chachaiv);
+	} else
+		EVP_DecryptInit_ex(ctx, cipher, NULL, key, kdk->kdk_iv);
+	EVP_CIPHER_CTX_set_padding(ctx, 0);
 
 	explicit_bzero(key, sizeof(key));
 
@@ -232,13 +261,13 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 		}
 
 		if (bytes > 0) {
-			if (EVP_DecryptUpdate(&ctx, buf, &olen, buf,
+			if (EVP_DecryptUpdate(ctx, buf, &olen, buf,
 			    bytes) == 0) {
 				pjdlog_error("Unable to decrypt core.");
 				goto failed;
 			}
 		} else {
-			if (EVP_DecryptFinal_ex(&ctx, buf, &olen) == 0) {
+			if (EVP_DecryptFinal_ex(ctx, buf, &olen) == 0) {
 				pjdlog_error("Unable to decrypt core.");
 				goto failed;
 			}
@@ -251,13 +280,14 @@ decrypt(int ofd, const char *privkeyfile, const char *keyfile,
 	} while (bytes > 0);
 
 	explicit_bzero(buf, sizeof(buf));
-	EVP_CIPHER_CTX_cleanup(&ctx);
+	EVP_CIPHER_CTX_free(ctx);
 	exit(0);
 failed:
 	explicit_bzero(key, sizeof(key));
 	explicit_bzero(buf, sizeof(buf));
 	RSA_free(privkey);
-	EVP_CIPHER_CTX_cleanup(&ctx);
+	if (ctx != NULL)
+		EVP_CIPHER_CTX_free(ctx);
 	exit(1);
 }
 

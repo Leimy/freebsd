@@ -39,7 +39,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_ktrace.h"
 
 #include <sys/param.h>
@@ -48,12 +47,12 @@ __FBSDID("$FreeBSD$");
 #include <sys/capsicum.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
+#include <sys/ktr.h>
 #include <sys/malloc.h>
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/procdesc.h>
-#include <sys/pioctl.h>
 #include <sys/jail.h>
 #include <sys/tty.h>
 #include <sys/wait.h>
@@ -97,25 +96,15 @@ dtrace_execexit_func_t	dtrace_fasttrap_exit;
 SDT_PROVIDER_DECLARE(proc);
 SDT_PROBE_DEFINE1(proc, , , exit, "int");
 
-/* Hook for NFS teardown procedure. */
-void (*nlminfo_release_p)(struct proc *p);
-
-EVENTHANDLER_LIST_DECLARE(process_exit);
-
 struct proc *
 proc_realparent(struct proc *child)
 {
 	struct proc *p, *parent;
 
 	sx_assert(&proctree_lock, SX_LOCKED);
-	if ((child->p_treeflag & P_TREE_ORPHANED) == 0) {
-		if (child->p_oppid == 0 ||
-		    child->p_pptr->p_pid == child->p_oppid)
-			parent = child->p_pptr;
-		else
-			parent = initproc;
-		return (parent);
-	}
+	if ((child->p_treeflag & P_TREE_ORPHANED) == 0)
+		return (child->p_pptr->p_pid == child->p_oppid ?
+			    child->p_pptr : initproc);
 	for (p = child; (p->p_treeflag & P_TREE_FIRST_ORPHAN) == 0;) {
 		/* Cannot use LIST_PREV(), since the list head is not known. */
 		p = __containerof(p->p_orphan.le_prev, struct proc,
@@ -145,7 +134,7 @@ reaper_abandon_children(struct proc *p, bool exiting)
 		LIST_INSERT_HEAD(&p1->p_reaplist, p2, p_reapsibling);
 		if (exiting && p2->p_pptr == p) {
 			PROC_LOCK(p2);
-			proc_reparent(p2, p1);
+			proc_reparent(p2, p1, true);
 			PROC_UNLOCK(p2);
 		}
 	}
@@ -154,7 +143,28 @@ reaper_abandon_children(struct proc *p, bool exiting)
 }
 
 static void
-clear_orphan(struct proc *p)
+reaper_clear(struct proc *p)
+{
+	struct proc *p1;
+	bool clear;
+
+	sx_assert(&proctree_lock, SX_LOCKED);
+	LIST_REMOVE(p, p_reapsibling);
+	if (p->p_reapsubtree == 1)
+		return;
+	clear = true;
+	LIST_FOREACH(p1, &p->p_reaper->p_reaplist, p_reapsibling) {
+		if (p1->p_reapsubtree == p->p_reapsubtree) {
+			clear = false;
+			break;
+		}
+	}
+	if (clear)
+		proc_id_clear(PROC_ID_REAP, p->p_reapsubtree);
+}
+
+void
+proc_clear_orphan(struct proc *p)
 {
 	struct proc *p1;
 
@@ -203,6 +213,7 @@ exit1(struct thread *td, int rval, int signo)
 	 * XXX in case we're rebooting we just let init die in order to
 	 * work around an unsolved stack overflow seen very late during
 	 * shutdown on sparc64 when the gmirror worker process exists.
+	 * XXX what to do now that sparc64 is gone... remove if?
 	 */
 	if (p == initproc && rebooting == 0) {
 		printf("init died (signal %d, exit %d)\n", signo, rval);
@@ -266,15 +277,6 @@ exit1(struct thread *td, int rval, int signo)
 	p->p_xsig = signo;
 
 	/*
-	 * Wakeup anyone in procfs' PIOCWAIT.  They should have a hold
-	 * on our vmspace, so we should block below until they have
-	 * released their reference to us.  Note that if they have
-	 * requested S_EXIT stops we will block here until they ack
-	 * via PIOCCONT.
-	 */
-	_STOPEVENT(p, S_EXIT, 0);
-
-	/*
 	 * Ignore any pending request to stop due to a stop signal.
 	 * Once P_WEXIT is set, future requests will be ignored as
 	 * well.
@@ -282,13 +284,8 @@ exit1(struct thread *td, int rval, int signo)
 	p->p_flag &= ~P_STOPPED_SIG;
 	KASSERT(!P_SHOULDSTOP(p), ("exiting process is stopped"));
 
-	/*
-	 * Note that we are exiting and do another wakeup of anyone in
-	 * PIOCWAIT in case they aren't listening for S_EXIT stops or
-	 * decided to wait again after we told them we are exiting.
-	 */
+	/* Note that we are exiting. */
 	p->p_flag |= P_WEXIT;
-	wakeup(&p->p_stype);
 
 	/*
 	 * Wait for any processes that have a hold on our vmspace to
@@ -341,7 +338,6 @@ exit1(struct thread *td, int rval, int signo)
 	 */
 	PROC_LOCK(p);
 	stopprofclock(p);
-	p->p_flag &= ~(P_TRACED | P_PPWAIT | P_PPTRACE);
 	p->p_ptevents = 0;
 
 	/*
@@ -365,12 +361,6 @@ exit1(struct thread *td, int rval, int signo)
 	 * F_SETOWN with our pid.
 	 */
 	funsetownlst(&p->p_sigiolst);
-
-	/*
-	 * If this process has an nlminfo data area (for lockd), release it
-	 */
-	if (nlminfo_release_p != NULL && p->p_nlminfo != NULL)
-		(*nlminfo_release_p)(p);
 
 	/*
 	 * Close open files and release open-file table.
@@ -433,16 +423,17 @@ exit1(struct thread *td, int rval, int signo)
 
 	WITNESS_WARN(WARN_PANIC, NULL, "process (pid %d) exiting", p->p_pid);
 
-	sx_xlock(&proctree_lock);
 	/*
-	 * Remove proc from allproc queue and pidhash chain.
-	 * Place onto zombproc.  Unlink from parent's child list.
+	 * Remove from allproc. It still sits in the hash.
 	 */
 	sx_xlock(&allproc_lock);
 	LIST_REMOVE(p, p_list);
-	LIST_INSERT_HEAD(&zombproc, p, p_list);
-	LIST_REMOVE(p, p_hash);
 	sx_xunlock(&allproc_lock);
+
+	sx_xlock(&proctree_lock);
+	PROC_LOCK(p);
+	p->p_flag &= ~(P_TRACED | P_PPWAIT | P_PPTRACE);
+	PROC_UNLOCK(p);
 
 	/*
 	 * Reparent all children processes:
@@ -458,8 +449,8 @@ exit1(struct thread *td, int rval, int signo)
 		PROC_LOCK(q);
 		q->p_sigparent = SIGCHLD;
 
-		if (!(q->p_flag & P_TRACED)) {
-			proc_reparent(q, q->p_reaper);
+		if ((q->p_flag & P_TRACED) == 0) {
+			proc_reparent(q, q->p_reaper, true);
 			if (q->p_state == PRS_ZOMBIE) {
 				/*
 				 * Inform reaper about the reparented
@@ -481,6 +472,12 @@ exit1(struct thread *td, int rval, int signo)
 				PROC_LOCK(q->p_reaper);
 				pksignal(q->p_reaper, SIGCHLD, ksi1);
 				PROC_UNLOCK(q->p_reaper);
+			} else if (q->p_pdeathsig > 0) {
+				/*
+				 * The child asked to received a signal
+				 * when we exit.
+				 */
+				kern_psignal(q, q->p_pdeathsig);
 			}
 		} else {
 			/*
@@ -489,10 +486,10 @@ exit1(struct thread *td, int rval, int signo)
 			 */
 			t = proc_realparent(q);
 			if (t == p) {
-				proc_reparent(q, q->p_reaper);
+				proc_reparent(q, q->p_reaper, true);
 			} else {
 				PROC_LOCK(t);
-				proc_reparent(q, t);
+				proc_reparent(q, t, true);
 				PROC_UNLOCK(t);
 			}
 			/*
@@ -501,7 +498,7 @@ exit1(struct thread *td, int rval, int signo)
 			 * list due to present P_TRACED flag. Clear
 			 * orphan link for q now while q is locked.
 			 */
-			clear_orphan(q);
+			proc_clear_orphan(q);
 			q->p_flag &= ~(P_TRACED | P_STOPPED_TRACE);
 			q->p_flag2 &= ~P2_PTRACE_FSTP;
 			q->p_ptevents = 0;
@@ -521,11 +518,34 @@ exit1(struct thread *td, int rval, int signo)
 	 */
 	while ((q = LIST_FIRST(&p->p_orphans)) != NULL) {
 		PROC_LOCK(q);
+		KASSERT(q->p_oppid == p->p_pid,
+		    ("orphan %p of %p has unexpected oppid %d", q, p,
+		    q->p_oppid));
+		q->p_oppid = q->p_reaper->p_pid;
+
+		/*
+		 * If we are the real parent of this process
+		 * but it has been reparented to a debugger, then
+		 * check if it asked for a signal when we exit.
+		 */
+		if (q->p_pdeathsig > 0)
+			kern_psignal(q, q->p_pdeathsig);
 		CTR2(KTR_PTRACE, "exit: pid %d, clearing orphan %d", p->p_pid,
 		    q->p_pid);
-		clear_orphan(q);
+		proc_clear_orphan(q);
 		PROC_UNLOCK(q);
 	}
+
+#ifdef KDTRACE_HOOKS
+	if (SDT_PROBES_ENABLED()) {
+		int reason = CLD_EXITED;
+		if (WCOREDUMP(signo))
+			reason = CLD_DUMPED;
+		else if (WIFSIGNALED(signo))
+			reason = CLD_KILLED;
+		SDT_PROBE1(proc, , , exit, reason);
+	}
+#endif
 
 	/* Save exit status. */
 	PROC_LOCK(p);
@@ -544,15 +564,6 @@ exit1(struct thread *td, int rval, int signo)
 	 * Notify interested parties of our demise.
 	 */
 	KNOTE_LOCKED(p->p_klist, NOTE_EXIT);
-
-#ifdef KDTRACE_HOOKS
-	int reason = CLD_EXITED;
-	if (WCOREDUMP(signo))
-		reason = CLD_DUMPED;
-	else if (WIFSIGNALED(signo))
-		reason = CLD_KILLED;
-	SDT_PROBE1(proc, , , exit, reason);
-#endif
 
 	/*
 	 * If this is a process with a descriptor, we may not need to deliver
@@ -577,7 +588,7 @@ exit1(struct thread *td, int rval, int signo)
 			mtx_unlock(&p->p_pptr->p_sigacts->ps_mtx);
 			pp = p->p_pptr;
 			PROC_UNLOCK(pp);
-			proc_reparent(p, p->p_reaper);
+			proc_reparent(p, p->p_reaper, true);
 			p->p_sigparent = SIGCHLD;
 			PROC_LOCK(p->p_pptr);
 
@@ -651,7 +662,6 @@ exit1(struct thread *td, int rval, int signo)
 	 */
 	thread_exit();
 }
-
 
 #ifndef _SYS_SYSPROTO_H_
 struct abort2_args {
@@ -728,7 +738,6 @@ out:
 	exit1(td, 0, sig);
 	return (0);
 }
-
 
 #ifdef COMPAT_43
 /*
@@ -843,7 +852,7 @@ proc_reap(struct thread *td, struct proc *p, int *status, int options)
 	 * If we got the child via a ptrace 'attach', we need to give it back
 	 * to the old parent.
 	 */
-	if (p->p_oppid != 0 && p->p_oppid != p->p_pptr->p_pid) {
+	if (p->p_oppid != p->p_pptr->p_pid) {
 		PROC_UNLOCK(p);
 		t = proc_realparent(p);
 		PROC_LOCK(t);
@@ -851,8 +860,7 @@ proc_reap(struct thread *td, struct proc *p, int *status, int options)
 		CTR2(KTR_PTRACE,
 		    "wait: traced child %d moved back to parent %d", p->p_pid,
 		    t->p_pid);
-		proc_reparent(p, t);
-		p->p_oppid = 0;
+		proc_reparent(p, t, false);
 		PROC_UNLOCK(p);
 		pksignal(t, SIGCHLD, p->p_ksi);
 		wakeup(t);
@@ -861,26 +869,27 @@ proc_reap(struct thread *td, struct proc *p, int *status, int options)
 		sx_xunlock(&proctree_lock);
 		return;
 	}
-	p->p_oppid = 0;
 	PROC_UNLOCK(p);
 
 	/*
 	 * Remove other references to this process to ensure we have an
 	 * exclusive reference.
 	 */
-	sx_xlock(&allproc_lock);
-	LIST_REMOVE(p, p_list);	/* off zombproc */
-	sx_xunlock(&allproc_lock);
+	sx_xlock(PIDHASHLOCK(p->p_pid));
+	LIST_REMOVE(p, p_hash);
+	sx_xunlock(PIDHASHLOCK(p->p_pid));
 	LIST_REMOVE(p, p_sibling);
 	reaper_abandon_children(p, true);
-	LIST_REMOVE(p, p_reapsibling);
+	reaper_clear(p);
 	PROC_LOCK(p);
-	clear_orphan(p);
+	proc_clear_orphan(p);
 	PROC_UNLOCK(p);
 	leavepgrp(p);
 	if (p->p_procdesc != NULL)
 		procdesc_reap(p);
 	sx_xunlock(&proctree_lock);
+
+	proc_id_clear(PROC_ID_PID, p->p_pid);
 
 	PROC_LOCK(p);
 	knlist_detach(p->p_klist);
@@ -919,8 +928,7 @@ proc_reap(struct thread *td, struct proc *p, int *status, int options)
 	/*
 	 * Free credentials, arguments, and sigacts.
 	 */
-	crfree(p->p_ucred);
-	proc_set_cred(p, NULL);
+	proc_unset_cred(p);
 	pargs_drop(p->p_args);
 	p->p_args = NULL;
 	sigacts_free(p->p_sigacts);
@@ -959,11 +967,14 @@ proc_to_reap(struct thread *td, struct proc *p, idtype_t idtype, id_t id,
 
 	switch (idtype) {
 	case P_ALL:
-		if (p->p_procdesc != NULL) {
-			PROC_UNLOCK(p);
-			return (0);
+		if (p->p_procdesc == NULL ||
+		   (p->p_pptr == td->td_proc &&
+		   (p->p_flag & P_TRACED) != 0)) {
+			break;
 		}
-		break;
+
+		PROC_UNLOCK(p);
+		return (0);
 	case P_PID:
 		if (p->p_pid != (pid_t)id) {
 			PROC_UNLOCK(p);
@@ -1316,12 +1327,30 @@ loop_locked:
 	goto loop;
 }
 
+void
+proc_add_orphan(struct proc *child, struct proc *parent)
+{
+
+	sx_assert(&proctree_lock, SX_XLOCKED);
+	KASSERT((child->p_flag & P_TRACED) != 0,
+	    ("proc_add_orphan: not traced"));
+
+	if (LIST_EMPTY(&parent->p_orphans)) {
+		child->p_treeflag |= P_TREE_FIRST_ORPHAN;
+		LIST_INSERT_HEAD(&parent->p_orphans, child, p_orphan);
+	} else {
+		LIST_INSERT_AFTER(LIST_FIRST(&parent->p_orphans),
+		    child, p_orphan);
+	}
+	child->p_treeflag |= P_TREE_ORPHANED;
+}
+
 /*
  * Make process 'parent' the new parent of process 'child'.
  * Must be called with an exclusive hold of proctree lock.
  */
 void
-proc_reparent(struct proc *child, struct proc *parent)
+proc_reparent(struct proc *child, struct proc *parent, bool set_oppid)
 {
 
 	sx_assert(&proctree_lock, SX_XLOCKED);
@@ -1335,18 +1364,12 @@ proc_reparent(struct proc *child, struct proc *parent)
 	LIST_REMOVE(child, p_sibling);
 	LIST_INSERT_HEAD(&parent->p_children, child, p_sibling);
 
-	clear_orphan(child);
-	if (child->p_flag & P_TRACED) {
-		if (LIST_EMPTY(&child->p_pptr->p_orphans)) {
-			child->p_treeflag |= P_TREE_FIRST_ORPHAN;
-			LIST_INSERT_HEAD(&child->p_pptr->p_orphans, child,
-			    p_orphan);
-		} else {
-			LIST_INSERT_AFTER(LIST_FIRST(&child->p_pptr->p_orphans),
-			    child, p_orphan);
-		}
-		child->p_treeflag |= P_TREE_ORPHANED;
+	proc_clear_orphan(child);
+	if ((child->p_flag & P_TRACED) != 0) {
+		proc_add_orphan(child, child->p_pptr);
 	}
 
 	child->p_pptr = parent;
+	if (set_oppid)
+		child->p_oppid = parent->p_pid;
 }

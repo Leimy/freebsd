@@ -47,11 +47,14 @@
 #include <dev/mlx4/cmd.h>
 #include <dev/mlx4/cq.h>
 
+#include <sys/eventhandler.h>
 #include <sys/sockio.h>
 #include <sys/sysctl.h>
 
 #include "en.h"
 #include "en_port.h"
+
+DEBUGNET_DEFINE(mlx4_en);
 
 static void mlx4_en_sysctl_stat(struct mlx4_en_priv *priv);
 static void mlx4_en_sysctl_conf(struct mlx4_en_priv *priv);
@@ -614,31 +617,30 @@ static void mlx4_en_clear_uclist(struct net_device *dev)
 	}
 }
 
+static u_int mlx4_copy_addr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct mlx4_en_priv *priv = arg;
+	struct mlx4_en_addr_list *tmp;
+
+	if (sdl->sdl_alen != ETHER_ADDR_LEN)	/* XXXGL: can that happen? */
+		return (0);
+	tmp = kzalloc(sizeof(struct mlx4_en_addr_list), GFP_ATOMIC);
+	if (tmp == NULL) {
+		en_err(priv, "Failed to allocate address list\n");
+		return (0);
+	}
+	memcpy(tmp->addr, LLADDR(sdl), ETH_ALEN);
+	list_add_tail(&tmp->list, &priv->uc_list);
+
+	return (1);
+}
+
 static void mlx4_en_cache_uclist(struct net_device *dev)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_addr_list *tmp;
-	struct ifaddr *ifa;
 
 	mlx4_en_clear_uclist(dev);
-
-	if_addr_rlock(dev);
-	TAILQ_FOREACH(ifa, &dev->if_addrhead, ifa_link) {
-		if (ifa->ifa_addr->sa_family != AF_LINK)
-			continue;
-		if (((struct sockaddr_dl *)ifa->ifa_addr)->sdl_alen !=
-				ETHER_ADDR_LEN)
-			continue;
-		tmp = kzalloc(sizeof(struct mlx4_en_addr_list), GFP_ATOMIC);
-		if (tmp == NULL) {
-			en_err(priv, "Failed to allocate address list\n");
-			break;
-		}
-		memcpy(tmp->addr,
-			LLADDR((struct sockaddr_dl *)ifa->ifa_addr), ETH_ALEN);
-		list_add_tail(&tmp->list, &priv->uc_list);
-	}
-	if_addr_runlock(dev);
+	if_foreach_lladdr(dev, mlx4_copy_addr, priv);
 }
 
 static void mlx4_en_clear_mclist(struct net_device *dev)
@@ -652,31 +654,29 @@ static void mlx4_en_clear_mclist(struct net_device *dev)
 	}
 }
 
+static u_int mlx4_copy_maddr(void *arg, struct sockaddr_dl *sdl, u_int count)
+{
+	struct mlx4_en_priv *priv = arg;
+	struct mlx4_en_addr_list *tmp;
+
+	if (sdl->sdl_alen != ETHER_ADDR_LEN)	/* XXXGL: can that happen? */
+		return (0);
+	tmp = kzalloc(sizeof(struct mlx4_en_addr_list), GFP_ATOMIC);
+	if (tmp == NULL) {
+		en_err(priv, "Failed to allocate address list\n");
+		return (0);
+	}
+	memcpy(tmp->addr, LLADDR(sdl), ETH_ALEN);
+	list_add_tail(&tmp->list, &priv->mc_list);
+	return (1);
+}
+
 static void mlx4_en_cache_mclist(struct net_device *dev)
 {
 	struct mlx4_en_priv *priv = netdev_priv(dev);
-	struct mlx4_en_addr_list *tmp;
-	struct ifmultiaddr *ifma;
 
 	mlx4_en_clear_mclist(dev);
-
-	if_maddr_rlock(dev);
-	TAILQ_FOREACH(ifma, &dev->if_multiaddrs, ifma_link) {
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-		if (((struct sockaddr_dl *)ifma->ifma_addr)->sdl_alen !=
-				ETHER_ADDR_LEN)
-			continue;
-		tmp = kzalloc(sizeof(struct mlx4_en_addr_list), GFP_ATOMIC);
-		if (tmp == NULL) {
-			en_err(priv, "Failed to allocate address list\n");
-			break;
-		}
-		memcpy(tmp->addr,
-			LLADDR((struct sockaddr_dl *)ifma->ifma_addr), ETH_ALEN);
-		list_add_tail(&tmp->list, &priv->mc_list);
-	}
-	if_maddr_runlock(dev);
+	if_foreach_llmaddr(dev, mlx4_copy_maddr, priv);
 }
 
 static void update_addr_list_flags(struct mlx4_en_priv *priv,
@@ -850,9 +850,11 @@ static void mlx4_en_do_multicast(struct mlx4_en_priv *priv,
 	int err = 0;
 	u64 mcast_addr = 0;
 
-
-	/* Enable/disable the multicast filter according to IFF_ALLMULTI */
-	if (dev->if_flags & IFF_ALLMULTI) {
+	/*
+	 * Enable/disable the multicast filter according to
+	 * IFF_ALLMULTI and IFF_PROMISC:
+	 */
+	if (dev->if_flags & (IFF_ALLMULTI | IFF_PROMISC)) {
 		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
 					  0, MLX4_MCAST_DISABLE);
 		if (err)
@@ -903,28 +905,6 @@ static void mlx4_en_do_multicast(struct mlx4_en_priv *priv,
 			if (err)
 				en_err(priv, "Failed disabling multicast promiscuous mode\n");
 			priv->flags &= ~MLX4_EN_FLAG_MC_PROMISC;
-		}
-
-		/* Update unicast list */
-		mlx4_en_cache_uclist(dev);
-
-		update_addr_list_flags(priv, &priv->curr_uc_list, &priv->uc_list);
-
-		list_for_each_entry_safe(addr_list, tmp, &priv->curr_uc_list, list) {
-			if (addr_list->action == MLX4_ADDR_LIST_REM) {
-				mlx4_en_uc_steer_release(priv, addr_list->addr,
-							       priv->rss_map.indir_qp.qpn,
-							       addr_list->reg_id);
-				/* remove from list */
-				list_del(&addr_list->list);
-				kfree(addr_list);
-			} else if (addr_list->action == MLX4_ADDR_LIST_ADD) {
-				err = mlx4_en_uc_steer_add(priv, addr_list->addr,
-							   &priv->rss_map.indir_qp.qpn,
-							   &addr_list->reg_id);
-				if (err)
-					en_err(priv, "Fail to add unicast address\n");
-			}
 		}
 
 		err = mlx4_SET_MCAST_FLTR(mdev->dev, priv->port, 0,
@@ -996,6 +976,36 @@ static void mlx4_en_do_multicast(struct mlx4_en_priv *priv,
 	}
 }
 
+static void mlx4_en_do_unicast(struct mlx4_en_priv *priv,
+			       struct net_device *dev,
+			       struct mlx4_en_dev *mdev)
+{
+	struct mlx4_en_addr_list *addr_list, *tmp;
+	int err;
+
+	/* Update unicast list */
+	mlx4_en_cache_uclist(dev);
+
+	update_addr_list_flags(priv, &priv->curr_uc_list, &priv->uc_list);
+
+	list_for_each_entry_safe(addr_list, tmp, &priv->curr_uc_list, list) {
+		if (addr_list->action == MLX4_ADDR_LIST_REM) {
+			mlx4_en_uc_steer_release(priv, addr_list->addr,
+						 priv->rss_map.indir_qp.qpn,
+						 addr_list->reg_id);
+			/* remove from list */
+			list_del(&addr_list->list);
+			kfree(addr_list);
+		} else if (addr_list->action == MLX4_ADDR_LIST_ADD) {
+			err = mlx4_en_uc_steer_add(priv, addr_list->addr,
+						   &priv->rss_map.indir_qp.qpn,
+						   &addr_list->reg_id);
+			if (err)
+				en_err(priv, "Fail to add unicast address\n");
+		}
+	}
+}
+
 static void mlx4_en_do_set_rx_mode(struct work_struct *work)
 {
 	struct mlx4_en_priv *priv = container_of(work, struct mlx4_en_priv,
@@ -1026,17 +1036,19 @@ static void mlx4_en_do_set_rx_mode(struct work_struct *work)
 		}
 	}
 
+	/* Set unicast rules */
+	mlx4_en_do_unicast(priv, dev, mdev);
+
 	/* Promsicuous mode: disable all filters */
 	if ((dev->if_flags & IFF_PROMISC) ||
 	    (priv->flags & MLX4_EN_FLAG_FORCE_PROMISC)) {
 		mlx4_en_set_promisc_mode(priv, mdev);
-		goto out;
+	} else if (priv->flags & MLX4_EN_FLAG_PROMISC) {
+		/* Not in promiscuous mode */
+		mlx4_en_clear_promisc_mode(priv, mdev);
 	}
 
-	/* Not in promiscuous mode */
-	if (priv->flags & MLX4_EN_FLAG_PROMISC)
-		mlx4_en_clear_promisc_mode(priv, mdev);
-
+	/* Set multicast rules */
 	mlx4_en_do_multicast(priv, dev, mdev);
 out:
 	mutex_unlock(&mdev->state_lock);
@@ -1564,9 +1576,12 @@ static void mlx4_en_restart(struct work_struct *work)
 	if (priv->blocked == 0 || priv->port_up == 0)
 		return;
 	for (i = 0; i < priv->tx_ring_num; i++) {
+		int watchdog_time;
+
 		ring = priv->tx_ring[i];
-		if (ring->blocked &&
-				ring->watchdog_time + MLX4_EN_WATCHDOG_TIMEOUT < ticks)
+		watchdog_time = READ_ONCE(ring->watchdog_time);
+		if (watchdog_time != 0 &&
+		    time_after(ticks, ring->watchdog_time))
 			goto reset;
 	}
 	return;
@@ -1668,7 +1683,7 @@ void mlx4_en_free_resources(struct mlx4_en_priv *priv)
 	for (i = 0; i < priv->rx_ring_num; i++) {
 		if (priv->rx_ring[i])
 			mlx4_en_destroy_rx_ring(priv, &priv->rx_ring[i],
-				priv->prof->rx_ring_size, priv->stride);
+				priv->prof->rx_ring_size);
 		if (priv->rx_cq[i])
 			mlx4_en_destroy_cq(priv, &priv->rx_cq[i]);
 	}
@@ -1719,8 +1734,7 @@ err:
 	for (i = 0; i < priv->rx_ring_num; i++) {
 		if (priv->rx_ring[i])
 			mlx4_en_destroy_rx_ring(priv, &priv->rx_ring[i],
-						prof->rx_ring_size,
-						priv->stride);
+						prof->rx_ring_size);
 		if (priv->rx_cq[i])
 			mlx4_en_destroy_cq(priv, &priv->rx_cq[i]);
 	}
@@ -1764,16 +1778,13 @@ void mlx4_en_destroy_netdev(struct net_device *dev)
 	if (priv->vlan_detach != NULL)
 		EVENTHANDLER_DEREGISTER(vlan_unconfig, priv->vlan_detach);
 
-	/* Unregister device - this will close the port if it was up */
-	if (priv->registered) {
-		mutex_lock(&mdev->state_lock);
-		ether_ifdetach(dev);
-		mutex_unlock(&mdev->state_lock);
-	}
-
 	mutex_lock(&mdev->state_lock);
 	mlx4_en_stop_port(dev);
 	mutex_unlock(&mdev->state_lock);
+
+	/* Unregister device - this will close the port if it was up */
+	if (priv->registered)
+		ether_ifdetach(dev);
 
 	if (priv->allocated)
 		mlx4_free_hwq_res(mdev->dev, &priv->res, MLX4_EN_PAGE_SIZE);
@@ -1997,6 +2008,7 @@ static int mlx4_en_ioctl(struct ifnet *dev, u_long command, caddr_t data)
 
 			if (IFCAP_TSO4 & dev->if_capenable &&
 			    !(IFCAP_TXCSUM & dev->if_capenable)) {
+				mask &= ~IFCAP_TSO4;
 				dev->if_capenable &= ~IFCAP_TSO4;
 				dev->if_hwassist &= ~CSUM_IP_TSO;
 				if_printf(dev,
@@ -2009,6 +2021,7 @@ static int mlx4_en_ioctl(struct ifnet *dev, u_long command, caddr_t data)
 
 			if (IFCAP_TSO6 & dev->if_capenable &&
 			    !(IFCAP_TXCSUM_IPV6 & dev->if_capenable)) {
+				mask &= ~IFCAP_TSO6;
 				dev->if_capenable &= ~IFCAP_TSO6;
 				dev->if_hwassist &= ~CSUM_IP6_TSO;
 				if_printf(dev,
@@ -2058,7 +2071,7 @@ out:
 	case SIOCGI2C: {
 		struct ifi2creq i2c;
 
-		error = copyin(ifr->ifr_data, &i2c, sizeof(i2c));
+		error = copyin(ifr_data_get_ptr(ifr), &i2c, sizeof(i2c));
 		if (error)
 			break;
 		if (i2c.len > sizeof(i2c.data)) {
@@ -2075,7 +2088,7 @@ out:
 			error = -error;
 			break;
 		}
-		error = copyout(&i2c, ifr->ifr_data, sizeof(i2c));
+		error = copyout(&i2c, ifr_data_get_ptr(ifr), sizeof(i2c));
 		break;
 	}
 #endif
@@ -2222,9 +2235,6 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
                 goto out;
         }
 
-	priv->stride = roundup_pow_of_two(sizeof(struct mlx4_en_rx_desc) +
-					  DS_SIZE);
-
 	mlx4_en_sysctl_conf(priv);
 
 	err = mlx4_en_alloc_resources(priv);
@@ -2297,6 +2307,8 @@ int mlx4_en_init_netdev(struct mlx4_en_dev *mdev, int port,
 	ifmedia_add(&priv->media, IFM_ETHER | IFM_FDX | IFM_40G_CR4, 0, NULL);
 	ifmedia_add(&priv->media, IFM_ETHER | IFM_AUTO, 0, NULL);
 	ifmedia_set(&priv->media, IFM_ETHER | IFM_AUTO);
+
+	DEBUGNET_SET(dev, mlx4_en);
 
 	en_warn(priv, "Using %d TX rings\n", prof->tx_ring_num);
 	en_warn(priv, "Using %d RX rings\n", prof->rx_ring_num);
@@ -2656,9 +2668,10 @@ static void mlx4_en_sysctl_conf(struct mlx4_en_priv *priv)
 
         sysctl_ctx_init(ctx);
         priv->conf_sysctl = SYSCTL_ADD_NODE(ctx, SYSCTL_STATIC_CHILDREN(_hw),
-            OID_AUTO, dev->if_xname, CTLFLAG_RD, 0, "mlx4 10gig ethernet");
+            OID_AUTO, dev->if_xname, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+	    "mlx4 10gig ethernet");
         node = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(priv->conf_sysctl), OID_AUTO,
-            "conf", CTLFLAG_RD, NULL, "Configuration");
+            "conf", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Configuration");
         node_list = SYSCTL_CHILDREN(node);
 
         SYSCTL_ADD_UINT(ctx, node_list, OID_AUTO, "msg_enable",
@@ -2690,7 +2703,8 @@ static void mlx4_en_sysctl_conf(struct mlx4_en_priv *priv)
 	    "PCI device name");
         /* Add coalescer configuration. */
         coal = SYSCTL_ADD_NODE(ctx, node_list, OID_AUTO,
-            "coalesce", CTLFLAG_RD, NULL, "Interrupt coalesce configuration");
+            "coalesce", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+	    "Interrupt coalesce configuration");
         coal_list = SYSCTL_CHILDREN(coal);
         SYSCTL_ADD_UINT(ctx, coal_list, OID_AUTO, "pkt_rate_low",
             CTLFLAG_RW, &priv->pkt_rate_low, 0,
@@ -2730,7 +2744,7 @@ static void mlx4_en_sysctl_stat(struct mlx4_en_priv *priv)
 	ctx = &priv->stat_ctx;
 	sysctl_ctx_init(ctx);
 	priv->stat_sysctl = SYSCTL_ADD_NODE(ctx, SYSCTL_CHILDREN(priv->conf_sysctl), OID_AUTO,
-	    "stat", CTLFLAG_RD, NULL, "Statistics");
+	    "stat", CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Statistics");
 	node_list = SYSCTL_CHILDREN(priv->stat_sysctl);
 
 #ifdef MLX4_EN_PERF_STAT
@@ -2852,7 +2866,7 @@ static void mlx4_en_sysctl_stat(struct mlx4_en_priv *priv)
 		tx_ring = priv->tx_ring[i];
 		snprintf(namebuf, sizeof(namebuf), "tx_ring%d", i);
 		ring_node = SYSCTL_ADD_NODE(ctx, node_list, OID_AUTO, namebuf,
-		    CTLFLAG_RD, NULL, "TX Ring");
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "TX Ring");
 		ring_list = SYSCTL_CHILDREN(ring_node);
 		SYSCTL_ADD_U64(ctx, ring_list, OID_AUTO, "packets",
 		    CTLFLAG_RD, &tx_ring->packets, 0, "TX packets");
@@ -2869,7 +2883,7 @@ static void mlx4_en_sysctl_stat(struct mlx4_en_priv *priv)
 		rx_ring = priv->rx_ring[i];
 		snprintf(namebuf, sizeof(namebuf), "rx_ring%d", i);
 		ring_node = SYSCTL_ADD_NODE(ctx, node_list, OID_AUTO, namebuf,
-		    CTLFLAG_RD, NULL, "RX Ring");
+		    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "RX Ring");
 		ring_list = SYSCTL_CHILDREN(ring_node);
 		SYSCTL_ADD_U64(ctx, ring_list, OID_AUTO, "packets",
 		    CTLFLAG_RD, &rx_ring->packets, 0, "RX packets");
@@ -2879,3 +2893,54 @@ static void mlx4_en_sysctl_stat(struct mlx4_en_priv *priv)
 		    CTLFLAG_RD, &rx_ring->errors, 0, "RX soft errors");
 	}
 }
+
+#ifdef DEBUGNET
+static void
+mlx4_en_debugnet_init(struct ifnet *dev, int *nrxr, int *ncl, int *clsize)
+{
+	struct mlx4_en_priv *priv;
+
+	priv = if_getsoftc(dev);
+	mutex_lock(&priv->mdev->state_lock);
+	*nrxr = priv->rx_ring_num;
+	*ncl = DEBUGNET_MAX_IN_FLIGHT;
+	*clsize = priv->rx_mb_size;
+	mutex_unlock(&priv->mdev->state_lock);
+}
+
+static void
+mlx4_en_debugnet_event(struct ifnet *dev, enum debugnet_ev event)
+{
+}
+
+static int
+mlx4_en_debugnet_transmit(struct ifnet *dev, struct mbuf *m)
+{
+	struct mlx4_en_priv *priv;
+	int err;
+
+	priv = if_getsoftc(dev);
+	if ((if_getdrvflags(dev) & (IFF_DRV_RUNNING | IFF_DRV_OACTIVE)) !=
+	    IFF_DRV_RUNNING || !priv->link_state)
+		return (ENOENT);
+
+	err = mlx4_en_xmit(priv, 0, &m);
+	if (err != 0 && m != NULL)
+		m_freem(m);
+	return (err);
+}
+
+static int
+mlx4_en_debugnet_poll(struct ifnet *dev, int count)
+{
+	struct mlx4_en_priv *priv;
+
+	priv = if_getsoftc(dev);
+	if ((if_getdrvflags(dev) & IFF_DRV_RUNNING) == 0 || !priv->link_state)
+		return (ENOENT);
+
+	mlx4_poll_interrupts(priv->mdev->dev);
+
+	return (0);
+}
+#endif /* DEBUGNET */

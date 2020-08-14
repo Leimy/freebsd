@@ -57,10 +57,9 @@ device		bpf			# Berkeley packet filter
 
 # Pseudo devices.
 device		loop			# Network loopback
-device		random			# Entropy device
 device		ether			# Ethernet support
 #device		vlan			# 802.1Q VLAN support
-#device		tun			# Packet tunnel.
+#device		tuntap			# Packet tunnel.
 #device		md			# Memory "disks"
 #device		gif			# IPv6 and IPv4 tunneling
 #device		firmware		# firmware assist module
@@ -121,6 +120,7 @@ device		wlan_amrr		# AMRR transmit rate control algorithm
 options 	FDT			# Configure using FDT/DTB data
 options 	FDT_DTB_STATIC
 makeoptions	FDT_DTS_FILE=efikamx.dts
+device  	fdt_pinctrl		# FDT pinmux driver
 
 # NOTE: serial console will be disabled if syscons enabled
 # Uncomment following lines for framebuffer/syscons support
@@ -130,5 +130,3 @@ options 	SC_DFLT_FONT		# compile font in
 makeoptions	SC_DFLT_FONT=cp437
 device		ukbd			# Allow keyboard like HIDs to control console
 device		ums
-
-options 	INTRNG

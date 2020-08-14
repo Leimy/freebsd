@@ -4,7 +4,6 @@
  * Copyright (c) 2000 Paul Saab <ps@freebsd.org>
  * All rights reserved.
  * Copyright (c) 2000 John Baldwin <jhb@freebsd.org>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -147,7 +146,7 @@ typedef struct {
 	PXENV_STATUS_t	Status;
 	ADDR32_t	ProtocolIni;	/* Phys addr of a copy of the driver module */
 	uint8_t		reserved[8];
-} PACKED t_PXENV_UNDI_INITALIZE;
+} PACKED t_PXENV_UNDI_INITIALIZE;
 
 
 #define	MAXNUM_MCADDR		8
@@ -245,7 +244,6 @@ typedef struct {
 #	define ETHER_TYPE	1
 #	define EXP_ETHER_TYPE	2
 #	define IEEE_TYPE	6
-#	define ARCNET_TYPE	7
 
 	uint16_t	HwAddrLen;		/* Length of hardware address */
 	MAC_ADDR	CurrentNodeAddress;	/* Current hardware address */

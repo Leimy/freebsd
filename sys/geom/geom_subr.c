@@ -53,7 +53,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/mutex.h>
 #include <sys/errno.h>
 #include <sys/sbuf.h>
+#include <sys/sdt.h>
 #include <geom/geom.h>
+#include <geom/geom_dbg.h>
 #include <geom/geom_int.h>
 #include <machine/stdarg.h>
 
@@ -64,6 +66,8 @@ __FBSDID("$FreeBSD$");
 #ifdef KDB
 #include <sys/kdb.h>
 #endif
+
+SDT_PROVIDER_DEFINE(geom);
 
 struct class_list_head g_classes = LIST_HEAD_INITIALIZER(g_classes);
 static struct g_tailq_head geoms = TAILQ_HEAD_INITIALIZER(geoms);
@@ -76,6 +80,44 @@ struct g_hh00 {
 	int			error;
 	int			post;
 };
+
+void
+g_dbg_printf(const char *classname, int lvl, struct bio *bp,
+    const char *format,
+    ...)
+{
+#ifndef PRINTF_BUFR_SIZE
+#define PRINTF_BUFR_SIZE 64
+#endif
+	char bufr[PRINTF_BUFR_SIZE];
+	struct sbuf sb, *sbp __unused;
+	va_list ap;
+
+	sbp = sbuf_new(&sb, bufr, sizeof(bufr), SBUF_FIXEDLEN);
+	KASSERT(sbp != NULL, ("sbuf_new misused?"));
+
+	sbuf_set_drain(&sb, sbuf_printf_drain, NULL);
+
+	sbuf_cat(&sb, classname);
+	if (lvl >= 0)
+		sbuf_printf(&sb, "[%d]", lvl);
+	
+	va_start(ap, format);
+	sbuf_vprintf(&sb, format, ap);
+	va_end(ap);
+
+	if (bp != NULL) {
+		sbuf_putc(&sb, ' ');
+		g_format_bio(&sb, bp);
+	}
+
+	/* Terminate the debug line with a single '\n'. */
+	sbuf_nl_terminate(&sb);
+
+	/* Flush line to printf. */
+	sbuf_finish(&sb);
+	sbuf_delete(&sb);
+}
 
 /*
  * This event offers a new class a chance to taste all preexisting providers.
@@ -349,7 +391,6 @@ g_new_geomf(struct g_class *mp, const char *fmt, ...)
 	gp->rank = 1;
 	LIST_INIT(&gp->consumer);
 	LIST_INIT(&gp->provider);
-	LIST_INIT(&gp->aliases);
 	LIST_INSERT_HEAD(&mp->geom, gp, geom);
 	TAILQ_INSERT_HEAD(&geoms, gp, geoms);
 	strcpy(gp->name, sbuf_data(sb));
@@ -370,7 +411,6 @@ g_new_geomf(struct g_class *mp, const char *fmt, ...)
 void
 g_destroy_geom(struct g_geom *gp)
 {
-	struct g_geom_alias *gap, *gaptmp;
 
 	g_topology_assert();
 	G_VALID_GEOM(gp);
@@ -384,8 +424,6 @@ g_destroy_geom(struct g_geom *gp)
 	g_cancel_event(gp);
 	LIST_REMOVE(gp, geom);
 	TAILQ_REMOVE(&geoms, gp, geoms);
-	LIST_FOREACH_SAFE(gap, &gp->aliases, ga_next, gaptmp)
-		g_free(gap);
 	g_free(gp->name);
 	g_free(gp);
 }
@@ -589,6 +627,7 @@ g_new_providerf(struct g_geom *gp, const char *fmt, ...)
 	strcpy(pp->name, sbuf_data(sb));
 	sbuf_delete(sb);
 	LIST_INIT(&pp->consumers);
+	LIST_INIT(&pp->aliases);
 	pp->error = ENXIO;
 	pp->geom = gp;
 	pp->stat = devstat_new_entry(pp, -1, 0, DEVSTAT_ALL_SUPPORTED,
@@ -596,6 +635,37 @@ g_new_providerf(struct g_geom *gp, const char *fmt, ...)
 	LIST_INSERT_HEAD(&gp->provider, pp, provider);
 	g_post_event(g_new_provider_event, pp, M_WAITOK, pp, gp, NULL);
 	return (pp);
+}
+
+void
+g_provider_add_alias(struct g_provider *pp, const char *fmt, ...)
+{
+	struct sbuf *sb;
+	struct g_geom_alias *gap;
+	va_list ap;
+
+	/*
+	 * Generate the alias string and save it in the list.
+	 */
+	sb = sbuf_new_auto();
+	va_start(ap, fmt);
+	sbuf_vprintf(sb, fmt, ap);
+	va_end(ap);
+	sbuf_finish(sb);
+
+	LIST_FOREACH(gap, &pp->aliases, ga_next) {
+		if (strcmp(gap->ga_alias, sbuf_data(sb)) != 0)
+			continue;
+		/* Don't re-add the same alias. */
+		sbuf_delete(sb);
+		return;
+	}
+
+	gap = g_malloc(sizeof(*gap) + sbuf_len(sb) + 1, M_WAITOK | M_ZERO);
+	memcpy((char *)(gap + 1), sbuf_data(sb), sbuf_len(sb));
+	sbuf_delete(sb);
+	gap->ga_alias = (const char *)(gap + 1);
+	LIST_INSERT_HEAD(&pp->aliases, gap, ga_next);
 }
 
 void
@@ -690,10 +760,6 @@ g_resize_provider(struct g_provider *pp, off_t size)
 	g_post_event(g_resize_provider_event, hh, M_WAITOK, NULL);
 }
 
-#ifndef	_PATH_DEV
-#define	_PATH_DEV	"/dev/"
-#endif
-
 struct g_provider *
 g_provider_by_name(char const *arg)
 {
@@ -726,6 +792,7 @@ void
 g_destroy_provider(struct g_provider *pp)
 {
 	struct g_geom *gp;
+	struct g_geom_alias *gap, *gaptmp;
 
 	g_topology_assert();
 	G_VALID_PROVIDER(pp);
@@ -744,7 +811,8 @@ g_destroy_provider(struct g_provider *pp)
 	 */
 	if (gp->providergone != NULL)
 		gp->providergone(pp);
-
+	LIST_FOREACH_SAFE(gap, &pp->aliases, ga_next, gaptmp)
+		g_free(gap);
 	g_free(pp);
 	if ((gp->flags & G_GEOM_WITHER))
 		g_do_wither();
@@ -897,6 +965,9 @@ g_access(struct g_consumer *cp, int dcr, int dcw, int dce)
 	KASSERT(cp->acw + dcw >= 0, ("access resulting in negative acw"));
 	KASSERT(cp->ace + dce >= 0, ("access resulting in negative ace"));
 	KASSERT(dcr != 0 || dcw != 0 || dce != 0, ("NOP access request"));
+	KASSERT(cp->acr + dcr != 0 || cp->acw + dcw != 0 ||
+	    cp->ace + dce != 0 || cp->nstart == cp->nend,
+	    ("Last close with active requests"));
 	KASSERT(gp->access != NULL, ("NULL geom->access"));
 
 	/*
@@ -944,7 +1015,7 @@ g_access(struct g_consumer *cp, int dcr, int dcw, int dce)
 	    pp, pp->name);
 
 	/* If foot-shooting is enabled, any open on rank#1 is OK */
-	if ((g_debugflags & 16) && gp->rank == 1)
+	if ((g_debugflags & G_F_FOOTSHOOTING) && gp->rank == 1)
 		;
 	/* If we try exclusive but already write: fail */
 	else if (dce > 0 && pw > 0)
@@ -1050,16 +1121,16 @@ g_handleattr(struct bio *bp, const char *attribute, const void *val, int len)
 		bzero(bp->bio_data, bp->bio_length);
 		if (strlcpy(bp->bio_data, val, bp->bio_length) >=
 		    bp->bio_length) {
-			printf("%s: %s bio_length %jd len %zu -> EFAULT\n",
-			    __func__, bp->bio_to->name,
+			printf("%s: %s %s bio_length %jd strlen %zu -> EFAULT\n",
+			    __func__, bp->bio_to->name, attribute,
 			    (intmax_t)bp->bio_length, strlen(val));
 			error = EFAULT;
 		}
 	} else if (bp->bio_length == len) {
 		bcopy(val, bp->bio_data, len);
 	} else {
-		printf("%s: %s bio_length %jd len %d -> EFAULT\n", __func__,
-		    bp->bio_to->name, (intmax_t)bp->bio_length, len);
+		printf("%s: %s %s bio_length %jd len %d -> EFAULT\n", __func__,
+		    bp->bio_to->name, attribute, (intmax_t)bp->bio_length, len);
 		error = EFAULT;
 	}
 	if (error == 0)
@@ -1089,8 +1160,11 @@ g_std_done(struct bio *bp)
 	bp2->bio_completed += bp->bio_completed;
 	g_destroy_bio(bp);
 	bp2->bio_inbed++;
-	if (bp2->bio_children == bp2->bio_inbed)
+	if (bp2->bio_children == bp2->bio_inbed) {
+		if (bp2->bio_cmd == BIO_SPEEDUP)
+			bp2->bio_completed = bp2->bio_length;
 		g_io_deliver(bp2, bp2->bio_error);
+	}
 }
 
 /* XXX: maybe this is only g_slice_spoiled */
@@ -1268,18 +1342,6 @@ g_compare_names(const char *namea, const char *nameb)
 	return (0);
 }
 
-void
-g_geom_add_alias(struct g_geom *gp, const char *alias)
-{
-	struct g_geom_alias *gap;
-
-	gap = (struct g_geom_alias *)g_malloc(
-		sizeof(struct g_geom_alias) + strlen(alias) + 1, M_WAITOK);
-	strcpy((char *)(gap + 1), alias);
-	gap->ga_alias = (const char *)(gap + 1);
-	LIST_INSERT_HEAD(&gp->aliases, gap, ga_next);
-}
-
 #if defined(DIAGNOSTIC) || defined(DDB)
 /*
  * This function walks the mesh and returns a non-zero integer if it
@@ -1384,8 +1446,10 @@ db_show_geom_consumer(int indent, struct g_consumer *cp)
 		}
 		gprintln("  access:   r%dw%de%d", cp->acr, cp->acw, cp->ace);
 		gprintln("  flags:    0x%04x", cp->flags);
+#ifdef INVARIANTS
 		gprintln("  nstart:   %u", cp->nstart);
 		gprintln("  nend:     %u", cp->nend);
+#endif
 	} else {
 		gprintf("consumer: %p (%s), access=r%dw%de%d", cp,
 		    cp->provider != NULL ? cp->provider->name : "none",
@@ -1409,16 +1473,14 @@ db_show_geom_provider(int indent, struct g_provider *pp)
 		gprintln("  geom:         %s (%p)", pp->geom->name, pp->geom);
 		gprintln("  mediasize:    %jd", (intmax_t)pp->mediasize);
 		gprintln("  sectorsize:   %u", pp->sectorsize);
-		gprintln("  stripesize:   %u", pp->stripesize);
-		gprintln("  stripeoffset: %u", pp->stripeoffset);
+		gprintln("  stripesize:   %ju", (uintmax_t)pp->stripesize);
+		gprintln("  stripeoffset: %ju", (uintmax_t)pp->stripeoffset);
 		gprintln("  access:       r%dw%de%d", pp->acr, pp->acw,
 		    pp->ace);
 		gprintln("  flags:        %s (0x%04x)",
 		    provider_flags_to_string(pp, flags, sizeof(flags)),
 		    pp->flags);
 		gprintln("  error:        %d", pp->error);
-		gprintln("  nstart:       %u", pp->nstart);
-		gprintln("  nend:         %u", pp->nend);
 		if (LIST_EMPTY(&pp->consumers))
 			gprintln("  consumers:    none");
 	} else {

@@ -46,24 +46,39 @@ static const char copyright[] =
 static const char sccsid[] = "@(#)tail.c	8.1 (Berkeley) 6/6/93";
 #endif
 
+#include <sys/capsicum.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include <capsicum_helpers.h>
 #include <err.h>
 #include <errno.h>
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <libcasper.h>
+#include <casper/cap_fileargs.h>
+
 #include "extern.h"
 
 int Fflag, fflag, qflag, rflag, rval, no_files;
+fileargs_t *fa;
 
 static file_info_t *files;
 
 static void obsolete(char **);
 static void usage(void);
+
+static const struct option long_opts[] =
+{
+	{"blocks",	required_argument,	NULL, 'b'},
+	{"bytes",	required_argument,	NULL, 'c'},
+	{"lines",	required_argument,	NULL, 'n'},
+	{NULL,		no_argument,		NULL, 0}
+};
 
 int
 main(int argc, char *argv[])
@@ -76,6 +91,7 @@ main(int argc, char *argv[])
 	int i, ch, first;
 	file_info_t *file;
 	char *p;
+	cap_rights_t rights;
 
 	/*
 	 * Tail's options are weird.  First, -n10 is the same as -n-10, not
@@ -113,7 +129,8 @@ main(int argc, char *argv[])
 	obsolete(argv);
 	style = NOTSET;
 	off = 0;
-	while ((ch = getopt(argc, argv, "Fb:c:fn:qr")) != -1)
+	while ((ch = getopt_long(argc, argv, "+Fb:c:fn:qr", long_opts, NULL)) !=
+	    -1)
 		switch(ch) {
 		case 'F':	/* -F is superset of (and implies) -f */
 			Fflag = fflag = 1;
@@ -144,6 +161,22 @@ main(int argc, char *argv[])
 	argv += optind;
 
 	no_files = argc ? argc : 1;
+
+	cap_rights_init(&rights, CAP_FSTAT, CAP_FSTATFS, CAP_FCNTL,
+	    CAP_MMAP_R);
+	if (fflag)
+		cap_rights_set(&rights, CAP_EVENT);
+	if (caph_rights_limit(STDIN_FILENO, &rights) < 0 ||
+	    caph_limit_stderr() < 0 || caph_limit_stdout() < 0)
+		err(1, "can't limit stdio rights");
+
+	fa = fileargs_init(argc, argv, O_RDONLY, 0, &rights, FA_OPEN);
+	if (fa == NULL)
+		err(1, "unable to init casper");
+
+	caph_cache_catpages();
+	if (caph_enter_casper() < 0)
+		err(1, "unable to enter capability mode");
 
 	/*
 	 * If displaying in reverse, don't permit follow option, and convert
@@ -182,7 +215,8 @@ main(int argc, char *argv[])
 			file->file_name = strdup(fn);
 			if (! file->file_name)
 				errx(1, "Couldn't malloc space for file name.");
-			if ((file->fp = fopen(file->file_name, "r")) == NULL ||
+			file->fp = fileargs_fopen(fa, file->file_name, "r");
+			if (file->fp == NULL ||
 			    fstat(fileno(file->fp), &file->st)) {
 				if (file->fp != NULL) {
 					fclose(file->fp);
@@ -199,7 +233,7 @@ main(int argc, char *argv[])
 		free(files);
 	} else if (*argv) {
 		for (first = 1; (fn = *argv++);) {
-			if ((fp = fopen(fn, "r")) == NULL ||
+			if ((fp = fileargs_fopen(fa, fn, "r")) == NULL ||
 			    fstat(fileno(fp), &sb)) {
 				ierr(fn);
 				continue;
@@ -237,6 +271,7 @@ main(int argc, char *argv[])
 		else
 			forward(stdin, fn, style, off, &sb);
 	}
+	fileargs_free(fa);
 	exit(rval);
 }
 

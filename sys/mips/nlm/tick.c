@@ -62,13 +62,13 @@ uint64_t counter_freq;
 
 struct timecounter *platform_timecounter;
 
-static DPCPU_DEFINE(uint32_t, cycles_per_tick);
+DPCPU_DEFINE_STATIC(uint32_t, cycles_per_tick);
 static uint32_t cycles_per_usec;
 
-static DPCPU_DEFINE(volatile uint32_t, counter_upper);
-static DPCPU_DEFINE(volatile uint32_t, counter_lower_last);
-static DPCPU_DEFINE(uint32_t, compare_ticks);
-static DPCPU_DEFINE(uint32_t, lost_ticks);
+DPCPU_DEFINE_STATIC(volatile uint32_t, counter_upper);
+DPCPU_DEFINE_STATIC(volatile uint32_t, counter_lower_last);
+DPCPU_DEFINE_STATIC(uint32_t, compare_ticks);
+DPCPU_DEFINE_STATIC(uint32_t, lost_ticks);
 
 struct clock_softc {
 	int intr_rid;
@@ -179,8 +179,9 @@ sysctl_machdep_counter_freq(SYSCTL_HANDLER_ARGS)
 	return (error);
 }
 
-SYSCTL_PROC(_machdep, OID_AUTO, counter_freq, CTLTYPE_U64 | CTLFLAG_RW,
-    NULL, 0, sysctl_machdep_counter_freq, "QU",
+SYSCTL_PROC(_machdep, OID_AUTO, counter_freq,
+    CTLTYPE_U64 | CTLFLAG_RW | CTLFLAG_NEEDGIANT, NULL, 0,
+    sysctl_machdep_counter_freq, "QU",
     "Timecounter frequency in Hz");
 
 static unsigned

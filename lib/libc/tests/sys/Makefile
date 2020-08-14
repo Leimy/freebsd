@@ -4,7 +4,11 @@ PACKAGE=			tests
 
 .include <bsd.own.mk>
 
+.if ${MACHINE_CPUARCH} != "aarch64" && ${MACHINE_CPUARCH} != "riscv"
+ATF_TESTS_C+=			brk_test
+.endif
 ATF_TESTS_C+=			queue_test
+ATF_TESTS_C+=			sendfile_test
 
 # TODO: clone, lwp_create, lwp_ctl, posix_fadvise, recvmmsg,
 # swapcontext
@@ -92,7 +96,11 @@ truncate_test_FILESGRP= wheel
 truncate_test_FILESPACKAGE=	${PACKAGE}
 
 CLEANFILES=	truncate_test.root_owned
+# The dd status=none option is non-standard. Only use it when this test succeeds
+# rather than require dd to be a bootstrap tool.
+DD_NOSTATUS!=(dd status=none count=0 2> /dev/null && echo status=none) || true
+DD=dd ${DD_NOSTATUS}
 truncate_test.root_owned:
-	dd if=/dev/null bs=1 count=1 of=${.TARGET} status=none
+	${DD} if=/dev/null bs=1 count=1 of=${.TARGET}
 
 .include <bsd.test.mk>

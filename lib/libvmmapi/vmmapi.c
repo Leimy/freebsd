@@ -34,7 +34,9 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/sysctl.h>
 #include <sys/ioctl.h>
+#include <sys/linker.h>
 #include <sys/mman.h>
+#include <sys/module.h>
 #include <sys/_iovec.h>
 #include <sys/cpuset.h>
 
@@ -42,6 +44,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/specialreg.h>
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -51,8 +54,10 @@ __FBSDID("$FreeBSD$");
 
 #include <libutil.h>
 
+#include <vm/vm.h>
 #include <machine/vmm.h>
 #include <machine/vmm_dev.h>
+#include <machine/vmm_snapshot.h>
 
 #include "vmmapi.h"
 
@@ -85,25 +90,27 @@ struct vmctx {
 static int
 vm_device_open(const char *name)
 {
-        int fd, len;
-        char *vmfile;
+	int fd, len;
+	char *vmfile;
 
 	len = strlen("/dev/vmm/") + strlen(name) + 1;
 	vmfile = malloc(len);
 	assert(vmfile != NULL);
 	snprintf(vmfile, len, "/dev/vmm/%s", name);
 
-        /* Open the device file */
-        fd = open(vmfile, O_RDWR, 0);
+	/* Open the device file */
+	fd = open(vmfile, O_RDWR, 0);
 
 	free(vmfile);
-        return (fd);
+	return (fd);
 }
 
 int
 vm_create(const char *name)
 {
-
+	/* Try to load vmm(4) module before creating a guest. */
+	if (modfind("vmm") < 0)
+		kldload("vmm");
 	return (CREATE((char *)name));
 }
 
@@ -231,6 +238,17 @@ vm_mmap_memseg(struct vmctx *ctx, vm_paddr_t gpa, int segid, vm_ooffset_t off,
 
 	error = ioctl(ctx->fd, VM_MMAP_MEMSEG, &memmap);
 	return (error);
+}
+
+int
+vm_get_guestmem_from_ctx(struct vmctx *ctx, char **guest_baseaddr,
+    size_t *lowmem_size, size_t *highmem_size)
+{
+
+	*guest_baseaddr = ctx->baseaddr;
+	*lowmem_size = ctx->lowmem;
+	*highmem_size = ctx->highmem;
+	return (0);
 }
 
 int
@@ -362,7 +380,7 @@ vm_setup_memory(struct vmctx *ctx, size_t memsize, enum vm_mmap_style vms)
 	size_t objsize, len;
 	vm_paddr_t gpa;
 	char *baseaddr, *ptr;
-	int error, flags;
+	int error;
 
 	assert(vms == VM_MMAP_ALL);
 
@@ -389,8 +407,7 @@ vm_setup_memory(struct vmctx *ctx, size_t memsize, enum vm_mmap_style vms)
 	 * and the adjoining guard regions.
 	 */
 	len = VM_MMAP_GUARD_SIZE + objsize + VM_MMAP_GUARD_SIZE;
-	flags = MAP_PRIVATE | MAP_ANON | MAP_NOCORE | MAP_ALIGNED_SUPER;
-	ptr = mmap(NULL, len, PROT_NONE, flags, -1, 0);
+	ptr = mmap(NULL, len, PROT_NONE, MAP_GUARD | MAP_ALIGNED_SUPER, -1, 0);
 	if (ptr == MAP_FAILED)
 		return (-1);
 
@@ -445,6 +462,34 @@ vm_map_gpa(struct vmctx *ctx, vm_paddr_t gaddr, size_t len)
 	return (NULL);
 }
 
+vm_paddr_t
+vm_rev_map_gpa(struct vmctx *ctx, void *addr)
+{
+	vm_paddr_t offaddr;
+
+	offaddr = (char *)addr - ctx->baseaddr;
+
+	if (ctx->lowmem > 0)
+		if (offaddr >= 0 && offaddr <= ctx->lowmem)
+			return (offaddr);
+
+	if (ctx->highmem > 0)
+		if (offaddr >= 4*GB && offaddr < 4*GB + ctx->highmem)
+			return (offaddr);
+
+	return ((vm_paddr_t)-1);
+}
+
+/* TODO: maximum size for vmname */
+int
+vm_get_name(struct vmctx *ctx, char *buf, size_t max_len)
+{
+
+	if (strlcpy(buf, ctx->name, max_len) >= max_len)
+		return (EINVAL);
+	return (0);
+}
+
 size_t
 vm_get_lowmem_size(struct vmctx *ctx)
 {
@@ -492,8 +537,8 @@ vm_create_devmem(struct vmctx *ctx, int segid, const char *name, size_t len)
 	 * adjoining guard regions.
 	 */
 	len2 = VM_MMAP_GUARD_SIZE + len + VM_MMAP_GUARD_SIZE;
-	flags = MAP_PRIVATE | MAP_ANON | MAP_NOCORE | MAP_ALIGNED_SUPER;
-	base = mmap(NULL, len2, PROT_NONE, flags, -1, 0);
+	base = mmap(NULL, len2, PROT_NONE, MAP_GUARD | MAP_ALIGNED_SUPER, -1,
+	    0);
 	if (base == MAP_FAILED)
 		goto done;
 
@@ -754,6 +799,25 @@ vm_ioapic_pincount(struct vmctx *ctx, int *pincount)
 }
 
 int
+vm_readwrite_kernemu_device(struct vmctx *ctx, int vcpu, vm_paddr_t gpa,
+    bool write, int size, uint64_t *value)
+{
+	struct vm_readwrite_kernemu_device irp = {
+		.vcpuid = vcpu,
+		.access_width = fls(size) - 1,
+		.gpa = gpa,
+		.value = write ? *value : ~0ul,
+	};
+	long cmd = (write ? VM_SET_KERNEMU_DEV : VM_GET_KERNEMU_DEV);
+	int rc;
+
+	rc = ioctl(ctx->fd, cmd, &irp);
+	if (rc == 0 && !write)
+		*value = irp.value;
+	return (rc);
+}
+
+int
 vm_isa_assert_irq(struct vmctx *ctx, int atpic_irq, int ioapic_irq)
 {
 	struct vm_isa_irq isa_irq;
@@ -813,16 +877,13 @@ vm_inject_nmi(struct vmctx *ctx, int vcpu)
 	return (ioctl(ctx->fd, VM_INJECT_NMI, &vmnmi));
 }
 
-static struct {
-	const char	*name;
-	int		type;
-} capstrmap[] = {
-	{ "hlt_exit",		VM_CAP_HALT_EXIT },
-	{ "mtrap_exit",		VM_CAP_MTRAP_EXIT },
-	{ "pause_exit",		VM_CAP_PAUSE_EXIT },
-	{ "unrestricted_guest",	VM_CAP_UNRESTRICTED_GUEST },
-	{ "enable_invpcid",	VM_CAP_ENABLE_INVPCID },
-	{ 0 }
+static const char *capstrmap[] = {
+	[VM_CAP_HALT_EXIT]  = "hlt_exit",
+	[VM_CAP_MTRAP_EXIT] = "mtrap_exit",
+	[VM_CAP_PAUSE_EXIT] = "pause_exit",
+	[VM_CAP_UNRESTRICTED_GUEST] = "unrestricted_guest",
+	[VM_CAP_ENABLE_INVPCID] = "enable_invpcid",
+	[VM_CAP_BPT_EXIT] = "bpt_exit",
 };
 
 int
@@ -830,9 +891,9 @@ vm_capability_name2type(const char *capname)
 {
 	int i;
 
-	for (i = 0; capstrmap[i].name != NULL && capname != NULL; i++) {
-		if (strcmp(capstrmap[i].name, capname) == 0)
-			return (capstrmap[i].type);
+	for (i = 0; i < nitems(capstrmap); i++) {
+		if (strcmp(capstrmap[i], capname) == 0)
+			return (i);
 	}
 
 	return (-1);
@@ -841,12 +902,8 @@ vm_capability_name2type(const char *capname)
 const char *
 vm_capability_type2name(int type)
 {
-	int i;
-
-	for (i = 0; capstrmap[i].name != NULL; i++) {
-		if (capstrmap[i].type == type)
-			return (capstrmap[i].name);
-	}
+	if (type >= 0 && type < nitems(capstrmap))
+		return (capstrmap[type]);
 
 	return (NULL);
 }
@@ -876,7 +933,7 @@ vm_set_capability(struct vmctx *ctx, int vcpu, enum vm_cap_type cap, int val)
 	vmcap.cpuid = vcpu;
 	vmcap.captype = cap;
 	vmcap.capval = val;
-	
+
 	return (ioctl(ctx->fd, VM_SET_CAPABILITY, &vmcap));
 }
 
@@ -1374,6 +1431,13 @@ vm_suspended_cpus(struct vmctx *ctx, cpuset_t *cpus)
 }
 
 int
+vm_debug_cpus(struct vmctx *ctx, cpuset_t *cpus)
+{
+
+	return (vm_get_cpus(ctx, VM_DEBUG_CPUS, cpus));
+}
+
+int
 vm_activate_cpu(struct vmctx *ctx, int vcpu)
 {
 	struct vm_activate_cpu ac;
@@ -1382,6 +1446,30 @@ vm_activate_cpu(struct vmctx *ctx, int vcpu)
 	bzero(&ac, sizeof(struct vm_activate_cpu));
 	ac.vcpuid = vcpu;
 	error = ioctl(ctx->fd, VM_ACTIVATE_CPU, &ac);
+	return (error);
+}
+
+int
+vm_suspend_cpu(struct vmctx *ctx, int vcpu)
+{
+	struct vm_activate_cpu ac;
+	int error;
+
+	bzero(&ac, sizeof(struct vm_activate_cpu));
+	ac.vcpuid = vcpu;
+	error = ioctl(ctx->fd, VM_SUSPEND_CPU, &ac);
+	return (error);
+}
+
+int
+vm_resume_cpu(struct vmctx *ctx, int vcpu)
+{
+	struct vm_activate_cpu ac;
+	int error;
+
+	bzero(&ac, sizeof(struct vm_activate_cpu));
+	ac.vcpuid = vcpu;
+	error = ioctl(ctx->fd, VM_RESUME_CPU, &ac);
 	return (error);
 }
 
@@ -1475,6 +1563,61 @@ vm_restart_instruction(void *arg, int vcpu)
 }
 
 int
+vm_snapshot_req(struct vm_snapshot_meta *meta)
+{
+
+	if (ioctl(meta->ctx->fd, VM_SNAPSHOT_REQ, meta) == -1) {
+#ifdef SNAPSHOT_DEBUG
+		fprintf(stderr, "%s: snapshot failed for %s: %d\r\n",
+		    __func__, meta->dev_name, errno);
+#endif
+		return (-1);
+	}
+	return (0);
+}
+
+int
+vm_restore_time(struct vmctx *ctx)
+{
+	int dummy;
+
+	dummy = 0;
+	return (ioctl(ctx->fd, VM_RESTORE_TIME, &dummy));
+}
+
+int
+vm_set_topology(struct vmctx *ctx,
+    uint16_t sockets, uint16_t cores, uint16_t threads, uint16_t maxcpus)
+{
+	struct vm_cpu_topology topology;
+
+	bzero(&topology, sizeof (struct vm_cpu_topology));
+	topology.sockets = sockets;
+	topology.cores = cores;
+	topology.threads = threads;
+	topology.maxcpus = maxcpus;
+	return (ioctl(ctx->fd, VM_SET_TOPOLOGY, &topology));
+}
+
+int
+vm_get_topology(struct vmctx *ctx,
+    uint16_t *sockets, uint16_t *cores, uint16_t *threads, uint16_t *maxcpus)
+{
+	struct vm_cpu_topology topology;
+	int error;
+
+	bzero(&topology, sizeof (struct vm_cpu_topology));
+	error = ioctl(ctx->fd, VM_GET_TOPOLOGY, &topology);
+	if (error == 0) {
+		*sockets = topology.sockets;
+		*cores = topology.cores;
+		*threads = topology.threads;
+		*maxcpus = topology.maxcpus;
+	}
+	return (error);
+}
+
+int
 vm_get_device_fd(struct vmctx *ctx)
 {
 
@@ -1491,6 +1634,7 @@ vm_get_ioctls(size_t *len)
 	    VM_MMAP_GETNEXT, VM_SET_REGISTER, VM_GET_REGISTER,
 	    VM_SET_SEGMENT_DESCRIPTOR, VM_GET_SEGMENT_DESCRIPTOR,
 	    VM_SET_REGISTER_SET, VM_GET_REGISTER_SET,
+	    VM_SET_KERNEMU_DEV, VM_GET_KERNEMU_DEV,
 	    VM_INJECT_EXCEPTION, VM_LAPIC_IRQ, VM_LAPIC_LOCAL_IRQ,
 	    VM_LAPIC_MSI, VM_IOAPIC_ASSERT_IRQ, VM_IOAPIC_DEASSERT_IRQ,
 	    VM_IOAPIC_PULSE_IRQ, VM_IOAPIC_PINCOUNT, VM_ISA_ASSERT_IRQ,
@@ -1501,9 +1645,10 @@ vm_get_ioctls(size_t *len)
 	    VM_SET_X2APIC_STATE, VM_GET_X2APIC_STATE,
 	    VM_GET_HPET_CAPABILITIES, VM_GET_GPA_PMAP, VM_GLA2GPA,
 	    VM_GLA2GPA_NOFAULT,
-	    VM_ACTIVATE_CPU, VM_GET_CPUS, VM_SET_INTINFO, VM_GET_INTINFO,
+	    VM_ACTIVATE_CPU, VM_GET_CPUS, VM_SUSPEND_CPU, VM_RESUME_CPU,
+	    VM_SET_INTINFO, VM_GET_INTINFO,
 	    VM_RTC_WRITE, VM_RTC_READ, VM_RTC_SETTIME, VM_RTC_GETTIME,
-	    VM_RESTART_INSTRUCTION };
+	    VM_RESTART_INSTRUCTION, VM_SET_TOPOLOGY, VM_GET_TOPOLOGY };
 
 	if (len == NULL) {
 		cmds = malloc(sizeof(vm_ioctl_cmds));
@@ -1516,4 +1661,3 @@ vm_get_ioctls(size_t *len)
 	*len = nitems(vm_ioctl_cmds);
 	return (NULL);
 }
-

@@ -105,9 +105,7 @@ struct hifn_dma {
 
 
 struct hifn_session {
-	int hs_used;
 	int hs_mlen;
-	u_int8_t hs_iv[HIFN_MAX_IV_LENGTH];
 };
 
 #define	HIFN_RING_SYNC(sc, r, i, f)					\
@@ -161,9 +159,8 @@ struct hifn_softc {
 	int			sc_cmdk, sc_srck, sc_dstk, sc_resk;
 
 	int32_t			sc_cid;
+	uint16_t		sc_ena;
 	int			sc_maxses;
-	int			sc_nsessions;
-	struct hifn_session	*sc_sessions;
 	int			sc_ramsize;
 	int			sc_flags;
 #define	HIFN_HAS_RNG		0x1	/* includes random number generator */
@@ -260,39 +257,32 @@ struct hifn_softc {
  *
  */
 struct hifn_operand {
-	union {
-		struct mbuf *m;
-		struct uio *io;
-	} u;
 	bus_dmamap_t	map;
 	bus_size_t	mapsize;
 	int		nsegs;
 	bus_dma_segment_t segs[MAX_SCATTER];
 };
 struct hifn_command {
-	u_int16_t session_num;
+	struct hifn_session *session;
 	u_int16_t base_masks, cry_masks, mac_masks;
-	u_int8_t iv[HIFN_MAX_IV_LENGTH], *ck, mac[HIFN_MAC_KEY_LENGTH];
+	u_int8_t iv[HIFN_MAX_IV_LENGTH], mac[HIFN_MAC_KEY_LENGTH];
+	const uint8_t *ck;
 	int cklen;
 	int sloplen, slopidx;
 
 	struct hifn_operand src;
 	struct hifn_operand dst;
+	struct mbuf *dst_m;
 
 	struct hifn_softc *softc;
 	struct cryptop *crp;
-	struct cryptodesc *enccrd, *maccrd;
 };
 
-#define	src_m		src.u.m
-#define	src_io		src.u.io
 #define	src_map		src.map
 #define	src_mapsize	src.mapsize
 #define	src_segs	src.segs
 #define	src_nsegs	src.nsegs
 
-#define	dst_m		dst.u.m
-#define	dst_io		dst.u.io
 #define	dst_map		dst.map
 #define	dst_mapsize	dst.mapsize
 #define	dst_segs	dst.segs
@@ -329,14 +319,6 @@ struct hifn_command {
  *                              behaviour was requested.
  *
  *************************************************************************/
-
-/*
- * Convert back and forth from 'sid' to 'card' and 'session'
- */
-#define HIFN_CARD(sid)		(((sid) & 0xf0000000) >> 28)
-#define HIFN_SESSION(sid)	((sid) & 0x000007ff)
-#define HIFN_SID(crd,ses)	(((crd) << 28) | ((ses) & 0x7ff))
-
 #endif /* _KERNEL */
 
 struct hifn_stats {

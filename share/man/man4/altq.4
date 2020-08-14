@@ -25,7 +25,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd August 28, 2017
+.Dd October 9, 2019
 .Dt ALTQ 4
 .Os
 .Sh NAME
@@ -45,7 +45,8 @@
 .Sh DESCRIPTION
 The
 .Nm
-framework provides several disciplines for queuing outgoing network packets.
+system is a framework which provides several disciplines for queuing outgoing
+network packets.
 This is done by modifications to the interface packet queues.
 See
 .Xr altq 9
@@ -59,7 +60,7 @@ utility, so please refer to the
 .Xr pfctl 8
 and the
 .Xr pf.conf 5
-manpages for a complete description of the
+man pages for a complete description of the
 .Nm
 capabilities and how to use it.
 .Ss Kernel Options
@@ -189,9 +190,34 @@ and
 .Xr ng_iface 4
 pseudo drivers also do support
 .Nm .
+.Pp
+The
+.Xr vlan 4
+driver does not directly support
+.Nm ,
+but as packets (mbufs) are passed to the underlying interface, a queue
+can be defined for the underlying interface, and any packets directed
+to the queue will be processed at the interface level.
+An example:
+.Pp
+.Bd -literal -offset indent
+altq on igb0 cbq queue { def aq }
+queue def bandwidth 90% cbq (default borrow)
+queue aq bandwidth 10Mb cbq
+
+pass in on igb0.10 proto udp all queue aq keep state
+.Ed
 .Sh SEE ALSO
 .Xr pf 4 ,
 .Xr pf.conf 5 ,
 .Xr ipfw 8 ,
 .Xr pfctl 8 ,
 .Xr altq 9
+.Sh HISTORY
+The
+.Nm
+system first appeared in March 1997 and found home in the KAME project
+(http://www.kame.net).
+It was imported to
+.Fx
+in 5.3 .

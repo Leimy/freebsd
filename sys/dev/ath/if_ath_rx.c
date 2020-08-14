@@ -363,6 +363,11 @@ ath_recv_mgmt(struct ieee80211_node *ni, struct mbuf *m,
 	ATH_VAP(vap)->av_recv_mgmt(ni, m, subtype, rxs, rssi, nf);
 	switch (subtype) {
 	case IEEE80211_FC0_SUBTYPE_BEACON:
+		/*
+		 * Always update the per-node beacon RSSI if we're hearing
+		 * beacons from that node.
+		 */
+		ATH_RSSI_LPF(ATH_NODE(ni)->an_node_stats.ns_avgbrssi, rssi);
 
 		/*
 		 * Only do the following processing if it's for
@@ -374,11 +379,11 @@ ath_recv_mgmt(struct ieee80211_node *ni, struct mbuf *m,
 		 * trying to sync / merge to BSSes that aren't
 		 * actually us.
 		 */
-		if (IEEE80211_ADDR_EQ(ni->ni_bssid, vap->iv_bss->ni_bssid)) {
+		if ((vap->iv_opmode != IEEE80211_M_HOSTAP) &&
+		    IEEE80211_ADDR_EQ(ni->ni_bssid, vap->iv_bss->ni_bssid)) {
 			/* update rssi statistics for use by the hal */
 			/* XXX unlocked check against vap->iv_bss? */
 			ATH_RSSI_LPF(sc->sc_halstats.ns_avgbrssi, rssi);
-
 
 			tsf_beacon = ((uint64_t) le32dec(ni->ni_tstamp.data + 4)) << 32;
 			tsf_beacon |= le32dec(ni->ni_tstamp.data);
@@ -422,8 +427,9 @@ ath_recv_mgmt(struct ieee80211_node *ni, struct mbuf *m,
 				tsf_remainder = (tsf_beacon - tsf_beacon_old) % tsf_intval;
 			}
 
-			DPRINTF(sc, ATH_DEBUG_BEACON, "%s: old_tsf=%llu (%u), new_tsf=%llu (%u), target_tsf=%llu (%u), delta=%lld, bmiss=%d, remainder=%d\n",
+			DPRINTF(sc, ATH_DEBUG_BEACON, "%s: %s: old_tsf=%llu (%u), new_tsf=%llu (%u), target_tsf=%llu (%u), delta=%lld, bmiss=%d, remainder=%d\n",
 			    __func__,
+			    ieee80211_get_vap_ifname(vap),
 			    (unsigned long long) tsf_beacon_old,
 			    (unsigned int) (tsf_beacon_old >> 10),
 			    (unsigned long long) tsf_beacon,
@@ -434,17 +440,28 @@ ath_recv_mgmt(struct ieee80211_node *ni, struct mbuf *m,
 			    tsf_delta_bmiss,
 			    tsf_remainder);
 
-			DPRINTF(sc, ATH_DEBUG_BEACON, "%s: tsf=%llu (%u), nexttbtt=%llu (%u), delta=%d\n",
+			DPRINTF(sc, ATH_DEBUG_BEACON, "%s: %s: ni=%6D bssid=%6D tsf=%llu (%u), nexttbtt=%llu (%u), delta=%d\n",
 			    __func__,
+			    ieee80211_get_vap_ifname(vap),
+			    ni->ni_bssid, ":",
+			    vap->iv_bss->ni_bssid, ":",
 			    (unsigned long long) tsf_beacon,
 			    (unsigned int) (tsf_beacon >> 10),
 			    (unsigned long long) nexttbtt,
 			    (unsigned int) (nexttbtt >> 10),
 			    (int32_t) tsf_beacon - (int32_t) nexttbtt + tsf_intval);
 
-			/* We only do syncbeacon on STA VAPs; not on IBSS */
+			/*
+			 * We only do syncbeacon on STA VAPs; not on IBSS;
+			 * but don't do it with swbmiss enabled or we
+			 * may end up overwriting AP mode beacon config.
+			 *
+			 * The driver (and net80211) should be smarter about
+			 * this..
+			 */
 			if (vap->iv_opmode == IEEE80211_M_STA &&
 			    sc->sc_syncbeacon &&
+			    (!sc->sc_swbmiss) &&
 			    ni == vap->iv_bss &&
 			    (vap->iv_state == IEEE80211_S_RUN || vap->iv_state == IEEE80211_S_SLEEP)) {
 				DPRINTF(sc, ATH_DEBUG_BEACON,
@@ -650,6 +667,8 @@ ath_rx_pkt(struct ath_softc *sc, struct ath_rx_status *rs, HAL_STATUS status,
 	struct ieee80211_node *ni;
 	int is_good = 0;
 	struct ath_rx_edma *re = &sc->sc_rxedma[qtype];
+
+	NET_EPOCH_ASSERT();
 
 	/*
 	 * Calculate the correct 64 bit TSF given
@@ -946,6 +965,21 @@ rx_accept:
 			m->m_flags |= M_AMPDU;
 
 		/*
+		 * Inform rate control about the received RSSI.
+		 * It can then use this information to potentially drastically
+		 * alter the available rate based on the RSSI estimate.
+		 *
+		 * This is super important when associating to a far away station;
+		 * you don't want to waste time trying higher rates at some low
+		 * packet exchange rate (like during DHCP) just to establish
+		 * that higher MCS rates aren't available.
+		 */
+		ATH_RSSI_LPF(ATH_NODE(ni)->an_node_stats.ns_avgrssi,
+		    rs->rs_rssi);
+		ath_rate_update_rx_rssi(sc, ATH_NODE(ni),
+		    ATH_RSSI(ATH_NODE(ni)->an_node_stats.ns_avgrssi));
+
+		/*
 		 * Sending station is known, dispatch directly.
 		 */
 		(void) ieee80211_add_rx_params(m, &rxs);
@@ -973,7 +1007,7 @@ rx_accept:
 	 */
 
 	/*
-	 * Track rx rssi and do any rx antenna management.
+	 * Track legacy station RX rssi and do any rx antenna management.
 	 */
 	ATH_RSSI_LPF(sc->sc_halstats.ns_avgrssi, rs->rs_rssi);
 	if (sc->sc_diversity) {
@@ -1053,6 +1087,8 @@ ath_rx_proc(struct ath_softc *sc, int resched)
 	int npkts = 0;
 	int kickpcu = 0;
 	int ret;
+
+	NET_EPOCH_ASSERT();
 
 	/* XXX we must not hold the ATH_LOCK here */
 	ATH_UNLOCK_ASSERT(sc);
@@ -1228,7 +1264,7 @@ rx_proc_next:
 		ath_hal_putrxbuf(ah, bf->bf_daddr, HAL_RX_QUEUE_HP);
 		ath_hal_rxena(ah);		/* enable recv descriptors */
 		ath_mode_init(sc);		/* set filters, etc. */
-		ath_hal_startpcurecv(ah);	/* re-enable PCU/DMA engine */
+		ath_hal_startpcurecv(ah, (!! sc->sc_scanning));	/* re-enable PCU/DMA engine */
 #endif
 
 		ath_hal_intrset(ah, sc->sc_imask);
@@ -1273,6 +1309,7 @@ static void
 ath_legacy_rx_tasklet(void *arg, int npending)
 {
 	struct ath_softc *sc = arg;
+	struct epoch_tracker et;
 
 	ATH_KTR(sc, ATH_KTR_RXPROC, 1, "ath_rx_proc: pending=%d", npending);
 	DPRINTF(sc, ATH_DEBUG_RX_PROC, "%s: pending %u\n", __func__, npending);
@@ -1285,14 +1322,18 @@ ath_legacy_rx_tasklet(void *arg, int npending)
 	}
 	ATH_PCU_UNLOCK(sc);
 
+	NET_EPOCH_ENTER(et);
 	ath_rx_proc(sc, 1);
+	NET_EPOCH_EXIT(et);
 }
 
 static void
 ath_legacy_flushrecv(struct ath_softc *sc)
 {
-
+	struct epoch_tracker et;
+	NET_EPOCH_ENTER(et);
 	ath_rx_proc(sc, 0);
+	NET_EPOCH_EXIT(et);
 }
 
 static void
@@ -1444,7 +1485,7 @@ ath_legacy_startrecv(struct ath_softc *sc)
 	ath_hal_putrxbuf(ah, bf->bf_daddr, HAL_RX_QUEUE_HP);
 	ath_hal_rxena(ah);		/* enable recv descriptors */
 	ath_mode_init(sc);		/* set filters, etc. */
-	ath_hal_startpcurecv(ah);	/* re-enable PCU/DMA engine */
+	ath_hal_startpcurecv(ah, (!! sc->sc_scanning));	/* re-enable PCU/DMA engine */
 
 	ATH_RX_UNLOCK(sc);
 	return 0;

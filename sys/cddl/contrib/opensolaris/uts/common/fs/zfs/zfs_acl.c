@@ -892,7 +892,7 @@ zfs_mode_compute(uint64_t fmode, zfs_acl_t *aclp,
 	int		entry_type;
 	mode_t		mode;
 	mode_t		seen = 0;
-	zfs_ace_hdr_t 	*acep = NULL;
+	zfs_ace_hdr_t	*acep = NULL;
 	uint64_t	who;
 	uint16_t	iflags, type;
 	uint32_t	access_mask;
@@ -1146,6 +1146,7 @@ zfs_acl_chown_setattr(znode_t *zp)
 
 	ASSERT_VOP_ELOCKED(ZTOV(zp), __func__);
 	ASSERT(MUTEX_HELD(&zp->z_acl_lock));
+	ASSERT_VOP_IN_SEQC(ZTOV(zp));
 
 	if ((error = zfs_acl_node_read(zp, &aclp, B_FALSE)) == 0)
 		zp->z_mode = zfs_mode_compute(zp->z_mode, aclp,
@@ -1172,6 +1173,8 @@ zfs_aclset_common(znode_t *zp, zfs_acl_t *aclp, cred_t *cr, dmu_tx_t *tx)
 	uint64_t		ctime[2];
 	int			count = 0;
 	zfs_acl_phys_t		acl_phys;
+
+	ASSERT_VOP_IN_SEQC(ZTOV(zp));
 
 	mode = zp->z_mode;
 
@@ -1245,7 +1248,7 @@ zfs_aclset_common(znode_t *zp, zfs_acl_t *aclp, cred_t *cr, dmu_tx_t *tx)
 				    otype == DMU_OT_ACL ?
 				    DMU_OT_SYSACL : DMU_OT_NONE,
 				    otype == DMU_OT_ACL ?
-				    DN_MAX_BONUSLEN : 0, tx);
+				    DN_OLD_MAX_BONUSLEN : 0, tx);
 			} else {
 				(void) dmu_object_set_blocksize(zfsvfs->z_os,
 				    aoid, aclp->z_acl_bytes, 0, tx);
@@ -1320,12 +1323,12 @@ zfs_acl_chmod(vtype_t vtype, uint64_t mode, boolean_t split, boolean_t trim,
 	uint64_t	who;
 	int		new_count, new_bytes;
 	int		ace_size;
-	int 		entry_type;
+	int		entry_type;
 	uint16_t	iflags, type;
 	uint32_t	access_mask;
 	zfs_acl_node_t	*newnode;
-	size_t 		abstract_size = aclp->z_ops.ace_abstract_size();
-	void 		*zacep;
+	size_t		abstract_size = aclp->z_ops.ace_abstract_size();
+	void		*zacep;
 	boolean_t	isdir;
 	trivial_acl_t	masks;
 
@@ -1655,7 +1658,9 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
 				acl_ids->z_fgid = 0;
 		}
 		if (acl_ids->z_fgid == 0) {
+#ifndef __FreeBSD_kernel__
 			if (dzp->z_mode & S_ISGID) {
+#endif
 				char		*domain;
 				uint32_t	rid;
 
@@ -1674,15 +1679,13 @@ zfs_acl_ids_create(znode_t *dzp, int flag, vattr_t *vap, cred_t *cr,
 					    FUID_INDEX(acl_ids->z_fgid),
 					    acl_ids->z_fgid, ZFS_GROUP);
 				}
+#ifndef __FreeBSD_kernel__
 			} else {
 				acl_ids->z_fgid = zfs_fuid_create_cred(zfsvfs,
 				    ZFS_GROUP, cr, &acl_ids->z_fuidp);
-#ifdef __FreeBSD_kernel__
-				gid = acl_ids->z_fgid = dzp->z_gid;
-#else
 				gid = crgetgid(cr);
-#endif
 			}
+#endif
 		}
 	}
 
@@ -1773,7 +1776,7 @@ zfs_getacl(znode_t *zp, vsecattr_t *vsecp, boolean_t skipaclchk, cred_t *cr)
 	zfs_acl_t	*aclp;
 	ulong_t		mask;
 	int		error;
-	int 		count = 0;
+	int		count = 0;
 	int		largeace = 0;
 
 	mask = vsecp->vsa_mask & (VSA_ACE | VSA_ACECNT |
@@ -2104,7 +2107,7 @@ zfs_zaccess_aces_check(znode_t *zp, uint32_t *working_mode,
 	zfs_acl_t	*aclp;
 	int		error;
 	uid_t		uid = crgetuid(cr);
-	uint64_t 	who;
+	uint64_t	who;
 	uint16_t	type, iflags;
 	uint16_t	entry_type;
 	uint32_t	access_mask;
@@ -2299,6 +2302,40 @@ zfs_zaccess_append(znode_t *zp, uint32_t *working_mode, boolean_t *check_privs,
 	    check_privs, B_FALSE, cr));
 }
 
+/*
+ * Check if VEXEC is allowed.
+ *
+ * This routine is based on zfs_fastaccesschk_execute which has slowpath
+ * calling zfs_zaccess. This would be incorrect on FreeBSD (see
+ * zfs_freebsd_access for the difference). Thus this variant let's the
+ * caller handle the slowpath (if necessary).
+ *
+ * We only check for ZFS_NO_EXECS_DENIED and fail early. This routine can
+ * be extended to cover more cases, but the flag covers the majority.
+ */
+int
+zfs_freebsd_fastaccesschk_execute(struct vnode *vp, cred_t *cr)
+{
+	boolean_t is_attr;
+	znode_t *zdp = VTOZ(vp);
+
+	ASSERT_VOP_LOCKED(vp, __func__);
+
+	if (zdp->z_pflags & ZFS_AV_QUARANTINED)
+		return (1);
+
+	is_attr = ((zdp->z_pflags & ZFS_XATTR) &&
+	    (ZTOV(zdp)->v_type == VDIR));
+	if (is_attr)
+		return (1);
+
+	if (zdp->z_pflags & ZFS_NO_EXECS_DENIED)
+		return (0);
+
+	return (1);
+}
+
+#ifdef illumos
 int
 zfs_fastaccesschk_execute(znode_t *zdp, cred_t *cr)
 {
@@ -2365,11 +2402,12 @@ slow:
 	ZFS_EXIT(zdp->z_zfsvfs);
 	return (error);
 }
+#endif
 
 /*
  * Determine whether Access should be granted/denied.
  *
- * The least priv subsytem is always consulted as a basic privilege
+ * The least priv subsystem is always consulted as a basic privilege
  * can define any form of access.
  */
 int
@@ -2378,9 +2416,9 @@ zfs_zaccess(znode_t *zp, int mode, int flags, boolean_t skipaclchk, cred_t *cr)
 	uint32_t	working_mode;
 	int		error;
 	int		is_attr;
-	boolean_t 	check_privs;
+	boolean_t	check_privs;
 	znode_t		*xzp;
-	znode_t 	*check_zp = zp;
+	znode_t		*check_zp = zp;
 	mode_t		needed_bits;
 	uid_t		owner;
 

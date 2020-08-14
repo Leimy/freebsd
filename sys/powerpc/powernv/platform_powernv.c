@@ -49,6 +49,8 @@ __FBSDID("$FreeBSD$");
 #include <machine/trap.h>
 
 #include <dev/ofw/openfirm.h>
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
 #include <machine/ofw_machdep.h>
 #include <powerpc/aim/mmu_oea64.h>
 
@@ -59,10 +61,13 @@ __FBSDID("$FreeBSD$");
 extern void *ap_pcpu;
 #endif
 
+void (*powernv_smp_ap_extra_init)(void);
+
 static int powernv_probe(platform_t);
 static int powernv_attach(platform_t);
 void powernv_mem_regions(platform_t, struct mem_region *phys, int *physsz,
     struct mem_region *avail, int *availsz);
+static void powernv_numa_mem_regions(platform_t plat, struct numa_mem_region *phys, int *physsz);
 static u_long powernv_timebase_freq(platform_t, struct cpuref *cpuref);
 static int powernv_smp_first_cpu(platform_t, struct cpuref *cpuref);
 static int powernv_smp_next_cpu(platform_t, struct cpuref *cpuref);
@@ -70,16 +75,19 @@ static int powernv_smp_get_bsp(platform_t, struct cpuref *cpuref);
 static void powernv_smp_ap_init(platform_t);
 #ifdef SMP
 static int powernv_smp_start_cpu(platform_t, struct pcpu *cpu);
+static void powernv_smp_probe_threads(platform_t);
 static struct cpu_group *powernv_smp_topo(platform_t plat);
 #endif
 static void powernv_reset(platform_t);
 static void powernv_cpu_idle(sbintime_t sbt);
 static int powernv_cpuref_init(void);
+static int powernv_node_numa_domain(platform_t platform, phandle_t node);
 
 static platform_method_t powernv_methods[] = {
 	PLATFORMMETHOD(platform_probe, 		powernv_probe),
 	PLATFORMMETHOD(platform_attach,		powernv_attach),
 	PLATFORMMETHOD(platform_mem_regions,	powernv_mem_regions),
+	PLATFORMMETHOD(platform_numa_mem_regions,	powernv_numa_mem_regions),
 	PLATFORMMETHOD(platform_timebase_freq,	powernv_timebase_freq),
 	
 	PLATFORMMETHOD(platform_smp_ap_init,	powernv_smp_ap_init),
@@ -88,8 +96,10 @@ static platform_method_t powernv_methods[] = {
 	PLATFORMMETHOD(platform_smp_get_bsp,	powernv_smp_get_bsp),
 #ifdef SMP
 	PLATFORMMETHOD(platform_smp_start_cpu,	powernv_smp_start_cpu),
+	PLATFORMMETHOD(platform_smp_probe_threads,	powernv_smp_probe_threads),
 	PLATFORMMETHOD(platform_smp_topo,	powernv_smp_topo),
 #endif
+	PLATFORMMETHOD(platform_node_numa_domain,	powernv_node_numa_domain),
 
 	PLATFORMMETHOD(platform_reset,		powernv_reset),
 
@@ -105,6 +115,7 @@ static platform_def_t powernv_platform = {
 static struct cpuref platform_cpuref[MAXCPU];
 static int platform_cpuref_cnt;
 static int platform_cpuref_valid;
+static int platform_associativity;
 
 PLATFORM_DEF(powernv_platform);
 
@@ -125,8 +136,10 @@ powernv_attach(platform_t plat)
 	uint32_t nptlp, shift = 0, slb_encoding = 0;
 	int32_t lp_size, lp_encoding;
 	char buf[255];
+	pcell_t refpoints[3];
 	pcell_t prop;
 	phandle_t cpu;
+	phandle_t opal;
 	int res, len, idx;
 	register_t msr;
 
@@ -138,6 +151,13 @@ powernv_attach(platform_t plat)
 #else
 	opal_call(OPAL_REINIT_CPUS, 1 /* Big endian */);
 #endif
+	opal = OF_finddevice("/ibm,opal");
+
+	platform_associativity = 4; /* Skiboot default. */
+	if (OF_getencprop(opal, "ibm,associativity-reference-points", refpoints,
+	    sizeof(refpoints)) > 0) {
+		platform_associativity = refpoints[0];
+	}
 
        if (cpu_idle_hook == NULL)
                 cpu_idle_hook = powernv_cpu_idle;
@@ -152,13 +172,13 @@ powernv_attach(platform_t plat)
 	mtspr(SPR_LPID, 0);
 	isync();
 
-	mtspr(SPR_LPCR, LPCR_LPES);
+	if (cpu_features2 & PPC_FEATURE2_ARCH_3_00)
+		lpcr |= LPCR_HVICE;
+
+	mtspr(SPR_LPCR, lpcr);
 	isync();
 
 	mtmsr(msr);
-
-	/* Init CPU bits */
-	powernv_smp_ap_init(plat);
 
 	powernv_cpuref_init();
 
@@ -246,6 +266,13 @@ powernv_mem_regions(platform_t plat, struct mem_region *phys, int *physsz,
 	ofw_mem_regions(phys, physsz, avail, availsz);
 }
 
+static void
+powernv_numa_mem_regions(platform_t plat, struct numa_mem_region *phys, int *physsz)
+{
+
+	ofw_numa_mem_regions(phys, physsz);
+}
+
 static u_long
 powernv_timebase_freq(platform_t plat, struct cpuref *cpuref)
 {
@@ -307,17 +334,18 @@ powernv_cpuref_init(void)
 	for (cpu = OF_child(dev); cpu != 0; cpu = OF_peer(cpu)) {
 		res = OF_getprop(cpu, "device_type", buf, sizeof(buf));
 		if (res > 0 && strcmp(buf, "cpu") == 0) {
+			if (!ofw_bus_node_status_okay(cpu))
+				continue;
 			res = OF_getproplen(cpu, "ibm,ppc-interrupt-server#s");
 			if (res > 0) {
-
-
 				OF_getencprop(cpu, "ibm,ppc-interrupt-server#s",
 				    interrupt_servers, res);
 
 				for (a = 0; a < res/sizeof(cell_t); a++) {
 					tmp_cpuref[tmp_cpuref_cnt].cr_hwref = interrupt_servers[a];
 					tmp_cpuref[tmp_cpuref_cnt].cr_cpuid = tmp_cpuref_cnt;
-
+					tmp_cpuref[tmp_cpuref_cnt].cr_domain =
+					    powernv_node_numa_domain(NULL, cpu);
 					if (interrupt_servers[a] == (uint32_t)powernv_boot_pir)
 						bsp = tmp_cpuref_cnt;
 
@@ -331,11 +359,13 @@ powernv_cpuref_init(void)
 	for (a = bsp; a < tmp_cpuref_cnt; a++) {
 		platform_cpuref[platform_cpuref_cnt].cr_hwref = tmp_cpuref[a].cr_hwref;
 		platform_cpuref[platform_cpuref_cnt].cr_cpuid = platform_cpuref_cnt;
+		platform_cpuref[platform_cpuref_cnt].cr_domain = tmp_cpuref[a].cr_domain;
 		platform_cpuref_cnt++;
 	}
 	for (a = 0; a < bsp; a++) {
 		platform_cpuref[platform_cpuref_cnt].cr_hwref = tmp_cpuref[a].cr_hwref;
 		platform_cpuref[platform_cpuref_cnt].cr_cpuid = platform_cpuref_cnt;
+		platform_cpuref[platform_cpuref_cnt].cr_domain = tmp_cpuref[a].cr_domain;
 		platform_cpuref_cnt++;
 	}
 
@@ -352,6 +382,7 @@ powernv_smp_first_cpu(platform_t plat, struct cpuref *cpuref)
 
 	cpuref->cr_cpuid = 0;
 	cpuref->cr_hwref = platform_cpuref[0].cr_hwref;
+	cpuref->cr_domain = platform_cpuref[0].cr_domain;
 
 	return (0);
 }
@@ -370,6 +401,7 @@ powernv_smp_next_cpu(platform_t plat, struct cpuref *cpuref)
 
 	cpuref->cr_cpuid = platform_cpuref[id].cr_cpuid;
 	cpuref->cr_hwref = platform_cpuref[id].cr_hwref;
+	cpuref->cr_domain = platform_cpuref[id].cr_domain;
 
 	return (0);
 }
@@ -380,6 +412,7 @@ powernv_smp_get_bsp(platform_t plat, struct cpuref *cpuref)
 
 	cpuref->cr_cpuid = platform_cpuref[0].cr_cpuid;
 	cpuref->cr_hwref = platform_cpuref[0].cr_hwref;
+	cpuref->cr_domain = platform_cpuref[0].cr_domain;
 	return (0);
 }
 
@@ -402,8 +435,8 @@ powernv_smp_start_cpu(platform_t plat, struct pcpu *pc)
 	return (0);
 }
 
-static struct cpu_group *
-powernv_smp_topo(platform_t plat)
+static void
+powernv_smp_probe_threads(platform_t plat)
 {
 	char buf[8];
 	phandle_t cpu, dev, root;
@@ -434,18 +467,27 @@ powernv_smp_topo(platform_t plat)
 		break;
 	}
 
-	if (mp_ncpus % nthreads != 0) {
+	smp_threads_per_core = nthreads;
+	if (mp_ncpus % nthreads == 0)
+		mp_ncores = mp_ncpus / nthreads;
+}
+
+static struct cpu_group *
+powernv_smp_topo(platform_t plat)
+{
+	if (mp_ncpus % smp_threads_per_core != 0) {
 		printf("WARNING: Irregular SMP topology. Performance may be "
 		     "suboptimal (%d threads, %d on first core)\n",
-		     mp_ncpus, nthreads);
+		     mp_ncpus, smp_threads_per_core);
 		return (smp_topo_none());
 	}
 
 	/* Don't do anything fancier for non-threaded SMP */
-	if (nthreads == 1)
+	if (smp_threads_per_core == 1)
 		return (smp_topo_none());
 
-	return (smp_topo_1level(CG_SHARE_L1, nthreads, CG_FLAG_SMT));
+	return (smp_topo_1level(CG_SHARE_L1, smp_threads_per_core,
+	    CG_FLAG_SMT));
 }
 
 #endif
@@ -460,9 +502,66 @@ powernv_reset(platform_t platform)
 static void
 powernv_smp_ap_init(platform_t platform)
 {
+
+	if (powernv_smp_ap_extra_init != NULL)
+		powernv_smp_ap_extra_init();
 }
 
 static void
 powernv_cpu_idle(sbintime_t sbt)
 {
 }
+
+static int
+powernv_node_numa_domain(platform_t platform, phandle_t node)
+{
+	/* XXX: Is locking necessary in here? */
+	static int numa_domains[MAXMEMDOM];
+	static int numa_max_domain;
+	cell_t associativity[5];
+	int i, res;
+
+#ifndef NUMA
+	return (0);
+#endif
+	if (vm_ndomains == 1)
+		return (0);
+
+	res = OF_getencprop(node, "ibm,associativity",
+		associativity, sizeof(associativity));
+
+	/*
+	 * If this node doesn't have associativity, or if there are not
+	 * enough elements in it, check its parent.
+	 */
+	if (res < (int)(sizeof(cell_t) * (platform_associativity + 1))) {
+		node = OF_parent(node);
+		/* If already at the root, use default domain. */
+		if (node == 0)
+			return (0);
+		return (powernv_node_numa_domain(platform, node));
+	}
+
+	for (i = 0; i < numa_max_domain; i++) {
+		if (numa_domains[i] == associativity[platform_associativity])
+			return (i);
+	}
+	if (i < MAXMEMDOM)
+		numa_domains[numa_max_domain++] =
+		    associativity[platform_associativity];
+	else
+		i = 0;
+
+	return (i);
+}
+
+/* Set up the Nest MMU on POWER9 relatively early, but after pmap is setup. */
+static void
+powernv_setup_nmmu(void *unused)
+{
+	if (opal_check() != 0)
+		return;
+	opal_call(OPAL_NMMU_SET_PTCR, -1, mfspr(SPR_PTCR));
+}
+
+SYSINIT(powernv_setup_nmmu, SI_SUB_CPU, SI_ORDER_ANY, powernv_setup_nmmu, NULL);

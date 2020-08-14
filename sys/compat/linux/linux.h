@@ -29,6 +29,56 @@
 #ifndef _LINUX_MI_H_
 #define _LINUX_MI_H_
 
+#include <sys/queue.h>
+
+#define	LINUX_IFHWADDRLEN	6
+#define	LINUX_IFNAMSIZ		16
+
+/*
+ * Criteria for interface name translation
+ */
+#define	IFP_IS_ETH(ifp)		(ifp->if_type == IFT_ETHER)
+#define	IFP_IS_LOOP(ifp)	(ifp->if_type == IFT_LOOP)
+
+struct l_sockaddr {
+	unsigned short	sa_family;
+	char		sa_data[14];
+};
+
+#define	LINUX_ARPHRD_ETHER	1
+#define	LINUX_ARPHRD_LOOPBACK	772
+
+/*
+ * Supported address families
+ */
+#define	LINUX_AF_UNSPEC		0
+#define	LINUX_AF_UNIX		1
+#define	LINUX_AF_INET		2
+#define	LINUX_AF_AX25		3
+#define	LINUX_AF_IPX		4
+#define	LINUX_AF_APPLETALK	5
+#define	LINUX_AF_INET6		10
+
+/*
+ * net device flags
+ */
+#define	LINUX_IFF_UP		0x0001
+#define	LINUX_IFF_BROADCAST	0x0002
+#define	LINUX_IFF_DEBUG		0x0004
+#define	LINUX_IFF_LOOPBACK	0x0008
+#define	LINUX_IFF_POINTOPOINT	0x0010
+#define	LINUX_IFF_NOTRAILERS	0x0020
+#define	LINUX_IFF_RUNNING	0x0040
+#define	LINUX_IFF_NOARP		0x0080
+#define	LINUX_IFF_PROMISC	0x0100
+#define	LINUX_IFF_ALLMULTI	0x0200
+#define	LINUX_IFF_MASTER	0x0400
+#define	LINUX_IFF_SLAVE		0x0800
+#define	LINUX_IFF_MULTICAST	0x1000
+#define	LINUX_IFF_PORTSEL	0x2000
+#define	LINUX_IFF_AUTOMEDIA	0x4000
+#define	LINUX_IFF_DYNAMIC	0x8000
+
 /* sigaltstack */
 #define	LINUX_SS_ONSTACK	1
 #define	LINUX_SS_DISABLE	2
@@ -91,5 +141,55 @@ void bsd_to_linux_sigset(sigset_t *, l_sigset_t *);
 
 int linux_to_bsd_signal(int sig);
 int bsd_to_linux_signal(int sig);
+
+extern LIST_HEAD(futex_list, futex) futex_list;
+extern struct mtx futex_mtx;
+
+void linux_dev_shm_create(void);
+void linux_dev_shm_destroy(void);
+
+/*
+ * mask=0 is not sensible for this application, so it will be taken to mean
+ * a mask equivalent to the value.  Otherwise, (word & mask) == value maps to
+ * (word & ~mask) | value in a bitfield for the platform we're converting to.
+ */
+struct bsd_to_linux_bitmap {
+	int	bsd_mask;
+	int	bsd_value;
+	int	linux_mask;
+	int	linux_value;
+};
+
+int bsd_to_linux_bits_(int value, struct bsd_to_linux_bitmap *bitmap,
+    size_t mapcnt, int no_value);
+int linux_to_bsd_bits_(int value, struct bsd_to_linux_bitmap *bitmap,
+    size_t mapcnt, int no_value);
+
+/*
+ * These functions are used for simplification of BSD <-> Linux bit conversions.
+ * Given `value`, a bit field, these functions will walk the given bitmap table
+ * and set the appropriate bits for the target platform.  If any bits were
+ * successfully converted, then the return value is the equivalent of value
+ * represented with the bit values appropriate for the target platform.
+ * Otherwise, the value supplied as `no_value` is returned.
+ */
+#define	bsd_to_linux_bits(_val, _bmap, _noval) \
+    bsd_to_linux_bits_((_val), (_bmap), nitems((_bmap)), (_noval))
+#define	linux_to_bsd_bits(_val, _bmap, _noval) \
+    linux_to_bsd_bits_((_val), (_bmap), nitems((_bmap)), (_noval))
+
+/*
+ * Easy mapping helpers.  BITMAP_EASY_LINUX represents a single bit to be
+ * translated, and the FreeBSD and Linux values are supplied.  BITMAP_1t1_LINUX
+ * is the extreme version of this, where not only is it a single bit, but the
+ * name of the macro used to represent the Linux version of a bit literally has
+ * LINUX_ prepended to the normal name.
+ */
+#define	BITMAP_EASY_LINUX(_name, _linux_name)	\
+	{					\
+		.bsd_value = (_name),		\
+		.linux_value = (_linux_name),	\
+	}
+#define	BITMAP_1t1_LINUX(_name)	BITMAP_EASY_LINUX(_name, LINUX_##_name)
 
 #endif /* _LINUX_MI_H_ */

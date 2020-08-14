@@ -28,7 +28,7 @@
 .\"     from: @(#)exp.3	6.12 (Berkeley) 7/31/91
 .\" $FreeBSD$
 .\"
-.Dd December 8, 2017
+.Dd April 1, 2020
 .Dt EXP 3
 .Os
 .Sh NAME
@@ -180,16 +180,9 @@ If 0**0 = 1, then
 then \*(Na**0 = 1 too because x**0 = 1 for all finite
 and infinite x, i.e., independently of x.
 .El
-.Sh BUGS
-To conform with newer C/C++ standards, a stub implementation for
-.Nm powl
-was committed to the math library, where
-.Nm powl
-is mapped to
-.Nm pow .
-Thus, the numerical accuracy is at most that of the 53-bit double
-precision implementation.
 .Sh SEE ALSO
+.Xr clog 3
+.Xr cpow 3
 .Xr fenv 3 ,
 .Xr ldexp 3 ,
 .Xr log 3 ,
@@ -197,3 +190,8 @@ precision implementation.
 .Sh STANDARDS
 These functions conform to
 .St -isoC-99 .
+.Sh HISTORY
+The
+.Fn exp
+function appeared in
+.At v1 .

@@ -97,6 +97,7 @@ extern "C" {
 #endif
 #include <sys/callo.h>
 #include <sys/disp.h>
+#include <machine/_inttypes.h>
 #include <machine/stdarg.h>
 
 #include <vm/vm.h>
@@ -104,15 +105,10 @@ extern "C" {
 #include <vm/vm_object.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_map.h>
-/* There is clash. vm_map.h defines the two below and vdev_cache.c use them. */
-#ifdef min_offset
-#undef min_offset
-#endif
-#ifdef max_offset
-#undef max_offset
-#endif
 #include <vm/vm_extern.h>
 #include <vm/vnode_pager.h>
+
+#define	boot_ncpus	(mp_ncpus)
 
 #define	CPU_SEQID	(curcpu)
 
@@ -143,5 +139,8 @@ extern struct mtx zfs_debug_mtx;
 } while (0)
 
 #define	sys_shutdown	rebooting
+
+#define	noinline	__attribute__((noinline))
+#define	likely(x)	__builtin_expect((x), 1)
 
 #endif	/* _SYS_ZFS_CONTEXT_H */

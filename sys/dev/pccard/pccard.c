@@ -35,13 +35,15 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
-#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
-#include <sys/kernel.h>
+#include <sys/mutex.h>
 #include <sys/queue.h>
+#include <sys/sbuf.h>
 #include <sys/sysctl.h>
-#include <sys/types.h>
+#include <sys/systm.h>
 
 #include <sys/bus.h>
 #include <machine/bus.h>
@@ -61,7 +63,8 @@ __FBSDID("$FreeBSD$");
 #define PCCARDDEBUG
 
 /* sysctl vars */
-static SYSCTL_NODE(_hw, OID_AUTO, pccard, CTLFLAG_RD, 0, "PCCARD parameters");
+static SYSCTL_NODE(_hw, OID_AUTO, pccard, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "PCCARD parameters");
 
 int	pccard_debug = 0;
 SYSCTL_INT(_hw_pccard, OID_AUTO, debug, CTLFLAG_RWTUN,
@@ -236,6 +239,7 @@ pccard_attach_card(device_t dev)
 	DEVPRINTF((dev, "Card has %d functions. pccard_mfc is %d\n", i + 1,
 	    pccard_mfc(sc)));
 
+	mtx_lock(&Giant);
 	STAILQ_FOREACH(pf, &sc->card.pf_head, pf_list) {
 		if (STAILQ_EMPTY(&pf->cfe_head))
 			continue;
@@ -248,6 +252,7 @@ pccard_attach_card(device_t dev)
 		pf->dev = child;
 		pccard_probe_and_attach_child(dev, child, pf);
 	}
+	mtx_unlock(&Giant);
 	return (0);
 }
 
@@ -262,7 +267,7 @@ pccard_probe_and_attach_child(device_t dev, device_t child,
 	 * In NetBSD, the drivers are responsible for activating each
 	 * function of a card and selecting the config to use.  In
 	 * FreeBSD, all that's done automatically in the typical lazy
-	 * way we do device resoruce allocation (except we pick the
+	 * way we do device resource allocation (except we pick the
 	 * cfe up front).  This is the biggest depature from the
 	 * inherited NetBSD model, apart from the FreeBSD resource code.
 	 *
@@ -1034,13 +1039,18 @@ pccard_child_pnpinfo_str(device_t bus, device_t child, char *buf,
 	struct pccard_ivar *devi = PCCARD_IVAR(child);
 	struct pccard_function *pf = devi->pf;
 	struct pccard_softc *sc = PCCARD_SOFTC(bus);
-	char cis0[128], cis1[128];
+	struct sbuf sb;
 
-	devctl_safe_quote(cis0, sc->card.cis1_info[0], sizeof(cis0));
-	devctl_safe_quote(cis1, sc->card.cis1_info[1], sizeof(cis1));
-	snprintf(buf, buflen, "manufacturer=0x%04x product=0x%04x "
-	    "cisvendor=\"%s\" cisproduct=\"%s\" function_type=%d",
-	    sc->card.manufacturer, sc->card.product, cis0, cis1, pf->function);
+	sbuf_new(&sb, buf, buflen, SBUF_FIXEDLEN | SBUF_INCLUDENUL);
+	sbuf_printf(&sb, "manufacturer=0x%04x product=0x%04x "
+	    "cisvendor=\"", sc->card.manufacturer, sc->card.product);
+	devctl_safe_quote_sb(&sb, sc->card.cis1_info[0]);
+	sbuf_printf(&sb, "\" cisproduct=\"");
+	devctl_safe_quote_sb(&sb, sc->card.cis1_info[1]);
+	sbuf_printf(&sb, "\" function_type=%d", pf->function);
+	sbuf_finish(&sb);
+	sbuf_delete(&sb);
+
 	return (0);
 }
 
@@ -1264,13 +1274,16 @@ pccard_setup_intr(device_t dev, device_t child, struct resource *irq,
 
 	if (pf->intr_filter != NULL || pf->intr_handler != NULL)
 		panic("Only one interrupt handler per function allowed");
-	err = bus_generic_setup_intr(dev, child, irq, flags, pccard_filter, 
-	    intr ? pccard_intr : NULL, pf, cookiep);
-	if (err != 0)
-		return (err);
 	pf->intr_filter = filt;
 	pf->intr_handler = intr;
 	pf->intr_handler_arg = arg;
+	err = bus_generic_setup_intr(dev, child, irq, flags, pccard_filter,
+	    intr ? pccard_intr : NULL, pf, cookiep);
+	if (err != 0) {
+		pf->intr_filter = NULL;
+		pf->intr_handler = NULL;
+		return (err);
+	}
 	pf->intr_handler_cookie = *cookiep;
 	if (pccard_mfc(sc)) {
 		pccard_ccr_write(pf, PCCARD_CCR_OPTION,

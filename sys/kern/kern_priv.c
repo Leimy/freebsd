@@ -54,7 +54,7 @@ __FBSDID("$FreeBSD$");
  * userland programs, and should not be done without careful consideration of
  * the consequences.
  */
-static int	suser_enabled = 1;
+static int __read_mostly 	suser_enabled = 1;
 SYSCTL_INT(_security_bsd, OID_AUTO, suser_enabled, CTLFLAG_RWTUN,
     &suser_enabled, 0, "processes with uid 0 have privilege");
 
@@ -62,31 +62,84 @@ static int	unprivileged_mlock = 1;
 SYSCTL_INT(_security_bsd, OID_AUTO, unprivileged_mlock, CTLFLAG_RWTUN,
     &unprivileged_mlock, 0, "Allow non-root users to call mlock(2)");
 
+static int	unprivileged_read_msgbuf = 1;
+SYSCTL_INT(_security_bsd, OID_AUTO, unprivileged_read_msgbuf,
+    CTLFLAG_RW, &unprivileged_read_msgbuf, 0,
+    "Unprivileged processes may read the kernel message buffer");
+
 SDT_PROVIDER_DEFINE(priv);
 SDT_PROBE_DEFINE1(priv, kernel, priv_check, priv__ok, "int");
 SDT_PROBE_DEFINE1(priv, kernel, priv_check, priv__err, "int");
+
+static __always_inline int
+priv_check_cred_pre(struct ucred *cred, int priv)
+{
+	int error;
+
+#ifdef MAC
+	error = mac_priv_check(cred, priv);
+#else
+	error = 0;
+#endif
+	return (error);
+}
+
+static __always_inline int
+priv_check_cred_post(struct ucred *cred, int priv, int error, bool handled)
+{
+
+	if (__predict_true(handled))
+		goto out;
+	/*
+	 * Now check with MAC, if enabled, to see if a policy module grants
+	 * privilege.
+	 */
+#ifdef MAC
+	if (mac_priv_grant(cred, priv) == 0) {
+		error = 0;
+		goto out;
+	}
+#endif
+
+	/*
+	 * The default is deny, so if no policies have granted it, reject
+	 * with a privilege error here.
+	 */
+	error = EPERM;
+out:
+	if (SDT_PROBES_ENABLED()) {
+		if (error)
+			SDT_PROBE1(priv, kernel, priv_check, priv__err, priv);
+		else
+			SDT_PROBE1(priv, kernel, priv_check, priv__ok, priv);
+	}
+	return (error);
+}
 
 /*
  * Check a credential for privilege.  Lots of good reasons to deny privilege;
  * only a few to grant it.
  */
 int
-priv_check_cred(struct ucred *cred, int priv, int flags)
+priv_check_cred(struct ucred *cred, int priv)
 {
 	int error;
 
 	KASSERT(PRIV_VALID(priv), ("priv_check_cred: invalid privilege %d",
 	    priv));
 
+	switch (priv) {
+	case PRIV_VFS_GENERATION:
+		return (priv_check_cred_vfs_generation(cred));
+	}
+
 	/*
 	 * We first evaluate policies that may deny the granting of
 	 * privilege unilaterally.
 	 */
-#ifdef MAC
-	error = mac_priv_check(cred, priv);
+	error = priv_check_cred_pre(cred, priv);
 	if (error)
 		goto out;
-#endif
 
 	/*
 	 * Jail policy will restrict certain privileges that may otherwise be
@@ -104,6 +157,17 @@ priv_check_cred(struct ucred *cred, int priv, int flags)
 		switch (priv) {
 		case PRIV_VM_MLOCK:
 		case PRIV_VM_MUNLOCK:
+			error = 0;
+			goto out;
+		}
+	}
+
+	if (unprivileged_read_msgbuf) {
+		/*
+		 * Allow an unprivileged user to read the kernel message
+		 * buffer.
+		 */
+		if (priv == PRIV_MSGBUF) {
 			error = 0;
 			goto out;
 		}
@@ -130,6 +194,14 @@ priv_check_cred(struct ucred *cred, int priv, int flags)
 				goto out;
 			}
 			break;
+		case PRIV_VFS_READ_DIR:
+			/*
+			 * Allow PRIV_VFS_READ_DIR for root if we're not in a
+			 * jail, otherwise deny unless a MAC policy grants it.
+			 */
+			if (jailed(cred))
+				break;
+			/* FALLTHROUGH */
 		default:
 			if (cred->cr_uid == 0) {
 				error = 0;
@@ -150,27 +222,20 @@ priv_check_cred(struct ucred *cred, int priv, int flags)
 	}
 
 	/*
-	 * Now check with MAC, if enabled, to see if a policy module grants
-	 * privilege.
+	 * Allow unprivileged process debugging on a per-jail basis.
+	 * Do this here instead of prison_priv_check(), so it can also
+	 * apply to prison0.
 	 */
-#ifdef MAC
-	if (mac_priv_grant(cred, priv) == 0) {
-		error = 0;
-		goto out;
+	if (priv == PRIV_DEBUG_UNPRIV) {
+		if (prison_allow(cred, PR_ALLOW_UNPRIV_DEBUG)) {
+			error = 0;
+			goto out;
+		}
 	}
-#endif
 
-	/*
-	 * The default is deny, so if no policies have granted it, reject
-	 * with a privilege error here.
-	 */
-	error = EPERM;
+	return (priv_check_cred_post(cred, priv, error, false));
 out:
-	if (error)
-		SDT_PROBE1(priv, kernel, priv_check, priv__err, priv);
-	else
-		SDT_PROBE1(priv, kernel, priv_check, priv__ok, priv);
-	return (error);
+	return (priv_check_cred_post(cred, priv, error, true));
 }
 
 int
@@ -179,5 +244,45 @@ priv_check(struct thread *td, int priv)
 
 	KASSERT(td == curthread, ("priv_check: td != curthread"));
 
-	return (priv_check_cred(td->td_ucred, priv, 0));
+	return (priv_check_cred(td->td_ucred, priv));
+}
+
+static int __noinline
+priv_check_cred_vfs_generation_slow(struct ucred *cred)
+{
+	int error;
+
+	error = priv_check_cred_pre(cred, PRIV_VFS_GENERATION);
+	if (error)
+		goto out;
+
+	if (jailed(cred)) {
+		error = EPERM;
+		goto out;
+	}
+
+	if (cred->cr_uid == 0 && suser_enabled) {
+		error = 0;
+		goto out;
+	}
+
+	return (priv_check_cred_post(cred, PRIV_VFS_GENERATION, error, false));
+out:
+	return (priv_check_cred_post(cred, PRIV_VFS_GENERATION, error, true));
+
+}
+
+int
+priv_check_cred_vfs_generation(struct ucred *cred)
+{
+	int error;
+
+	if (__predict_false(mac_priv_check_fp_flag ||
+	    mac_priv_grant_fp_flag || SDT_PROBES_ENABLED()))
+		return (priv_check_cred_vfs_generation_slow(cred));
+
+	error = EPERM;
+	if (!jailed(cred) && cred->cr_uid == 0 && suser_enabled)
+		error = 0;
+	return (error);
 }

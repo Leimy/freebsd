@@ -118,6 +118,7 @@ main(int argc, char **argv)
 
 	while (argc > 1) {
 		if (strcmp(argv[1], "-aout") == 0) {
+			warnx("aout support is deprecated");
 			is_aout = 1;
 			argc--;
 			argv++;
@@ -518,13 +519,6 @@ buildhints(void)
 		warn("%s", hints_file);
 		return -1;
 	}
-
-	/* Install it */
-	if (unlink(hints_file) != 0 && errno != ENOENT) {
-		warn("%s", hints_file);
-		return -1;
-	}
-
 	if (rename(tmpfilename, hints_file) != 0) {
 		warn("%s", hints_file);
 		return -1;

@@ -58,7 +58,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_sysvipc.h"
 
 #include <sys/param.h>
@@ -99,7 +98,6 @@ static int msg_prison_set(void *, void *);
 static int msg_prison_get(void *, void *);
 static int msg_prison_remove(void *, void *);
 static void msg_prison_cleanup(struct prison *);
-
 
 #ifdef MSG_DEBUG
 #define DPRINTF(a)	printf a
@@ -353,7 +351,6 @@ msgunload()
 	return (0);
 }
 
-
 static int
 sysvmsg_modload(struct module *module, int cmd, void *arg)
 {
@@ -387,8 +384,7 @@ DECLARE_MODULE(sysvmsg, sysvmsg_mod, SI_SUB_SYSV_MSG, SI_ORDER_FIRST);
 MODULE_VERSION(sysvmsg, 1);
 
 static void
-msg_freehdr(msghdr)
-	struct msg *msghdr;
+msg_freehdr(struct msg *msghdr)
 {
 	while (msghdr->msg_ts > 0) {
 		short next;
@@ -500,11 +496,7 @@ sys_msgctl(struct thread *td, struct msgctl_args *uap)
 }
 
 int
-kern_msgctl(td, msqid, cmd, msqbuf)
-	struct thread *td;
-	int msqid;
-	int cmd;
-	struct msqid_ds *msqbuf;
+kern_msgctl(struct thread *td, int msqid, int cmd, struct msqid_ds *msqbuf)
 {
 	int rval, error, msqix;
 	struct msqid_kernel *msqkptr;
@@ -621,6 +613,13 @@ kern_msgctl(td, msqid, cmd, msqbuf)
 		*msqbuf = msqkptr->u;
 		if (td->td_ucred->cr_prison != msqkptr->cred->cr_prison)
 			msqbuf->msg_perm.key = IPC_PRIVATE;
+
+		/*
+		 * Try to hide the fact that the structure layout is shared by
+		 * both the kernel and userland.  These pointers are not useful
+		 * to userspace.
+		 */
+		msqbuf->__msg_first = msqbuf->__msg_last = NULL;
 		break;
 
 	default:
@@ -777,7 +776,7 @@ kern_msgsnd(struct thread *td, int msqid, const void *msgp,
 	struct prison *rpr;
 	short next;
 #ifdef RACCT
-	size_t saved_msgsz;
+	size_t saved_msgsz = 0;
 #endif
 
 	rpr = msg_find_prison(td->td_ucred);

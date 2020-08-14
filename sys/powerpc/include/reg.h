@@ -4,10 +4,6 @@
 #ifndef _POWERPC_REG_H_
 #define	_POWERPC_REG_H_
 
-#if defined(_KERNEL) && !defined(KLD_MODULE) && !defined(_STANDALONE)
-#include "opt_compat.h"
-#endif
-
 /* Must match struct trapframe */
 struct reg {
 	register_t fixreg[32];
@@ -77,7 +73,7 @@ struct image_params;
 
 int	fill_regs32(struct thread *, struct reg32 *);
 int	set_regs32(struct thread *, struct reg32 *);
-void	ppc32_setregs(struct thread *, struct image_params *, u_long);
+void	ppc32_setregs(struct thread *, struct image_params *, uintptr_t);
 
 #define	fill_fpregs32(td, reg)	fill_fpregs(td,(struct fpreg *)reg)
 #define	set_fpregs32(td, reg)	set_fpregs(td,(struct fpreg *)reg)

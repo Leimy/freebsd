@@ -50,8 +50,8 @@ __FBSDID("$FreeBSD$");
 #define DHCP_OPTION_DATA
 #include "dhcpd.h"
 
-int bad_options = 0;
-int bad_options_max = 5;
+static int bad_options = 0;
+static int bad_options_max = 5;
 
 void	parse_options(struct packet *);
 void	parse_option_buffer(struct packet *, unsigned char *, int);
@@ -896,6 +896,5 @@ do_packet(struct interface_info *interface, struct dhcp_packet *packet,
 
 	/* Free the data associated with the options. */
 	for (i = 0; i < 256; i++)
-		if (tp.options[i].len && tp.options[i].data)
-			free(tp.options[i].data);
+		free(tp.options[i].data);
 }

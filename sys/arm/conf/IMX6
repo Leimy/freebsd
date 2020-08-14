@@ -22,8 +22,6 @@ ident		IMX6
 include 	"std.armv7"
 include 	"../freescale/imx/std.imx6"
 
-options 	INTRNG
-
 options 	SOC_IMX6
 
 options 	SCHED_ULE		# ULE scheduler
@@ -51,9 +49,8 @@ device		mpcore_timer
 
 # Pseudo devices.
 device		loop			# Network loopback
-device		random			# Entropy device
 device		vlan			# 802.1Q VLAN support
-device		tun			# Packet tunnel.
+device		tuntap			# Packet tunnel.
 device		md			# Memory "disks"
 #device		gif			# IPv6 and IPv4 tunneling
 #device		firmware		# firmware assist module
@@ -118,11 +115,13 @@ device		hdmi
 # Flattened Device Tree
 options 	FDT			# Configure using FDT/DTB data
 makeoptions	MODULES_EXTRA="dtb/imx6 imx"
+device  	fdt_pinctrl		# FDT pinmux driver
 
 # SoC-specific devices
 device		ffec			# Freescale Fast Ethernet Controller
 device		fsliic			# Freescale i2c/iic
 device		iic			# iic protocol
 device		iicbus			# iic bus
+device		imx6_snvs		# On-chip RTC
 device		imxwdt			# Watchdog. WARNING: can't be disabled!!!
 

@@ -66,6 +66,7 @@
 __FBSDID("$FreeBSD$");
 
 #include <sys/param.h>
+#include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 
@@ -1124,7 +1125,8 @@ restart:
 		}
 		if (space < resid &&
 		    (atomic || space < so->so_snd.sb_lowat)) {
-			if ((so->so_state & SS_NBIO) || (flags & MSG_NBIO)) {
+			if ((so->so_state & SS_NBIO) ||
+			    (flags & (MSG_NBIO | MSG_DONTWAIT)) != 0) {
 				SOCKBUF_UNLOCK(&so->so_snd);
 				error = EWOULDBLOCK;
 				goto release;
@@ -1810,6 +1812,7 @@ sdp_pcblist(SYSCTL_HANDLER_ARGS)
 	if (error != 0)
 		return (error);
 
+	bzero(&xig, sizeof(xig));
 	xig.xig_len = sizeof xig;
 	xig.xig_count = n;
 	xig.xig_gen = 0;
@@ -1878,10 +1881,12 @@ next:
 	return (error);
 }
 
-static SYSCTL_NODE(_net_inet, -1,  sdp,    CTLFLAG_RW, 0,  "SDP");
+SYSCTL_NODE(_net_inet, -1, sdp, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "SDP");
 
 SYSCTL_PROC(_net_inet_sdp, TCPCTL_PCBLIST, pcblist,
-    CTLFLAG_RD | CTLTYPE_STRUCT, 0, 0, sdp_pcblist, "S,xtcpcb",
+    CTLFLAG_RD | CTLTYPE_STRUCT | CTLFLAG_MPSAFE,
+    0, 0, sdp_pcblist, "S,xtcpcb",
     "List of active SDP connections");
 
 static void

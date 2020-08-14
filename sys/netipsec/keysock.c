@@ -71,7 +71,7 @@ struct key_cb {
 	int key_count;
 	int any_count;
 };
-static VNET_DEFINE(struct key_cb, key_cb);
+VNET_DEFINE_STATIC(struct key_cb, key_cb);
 #define	V_key_cb		VNET(key_cb)
 
 static struct sockaddr key_src = { 2, PF_KEY, };
@@ -431,7 +431,8 @@ struct pr_usrreqs key_usrreqs = {
 };
 
 /* sysctl */
-SYSCTL_NODE(_net, PF_KEY, key, CTLFLAG_RW, 0, "Key Family");
+SYSCTL_NODE(_net, PF_KEY, key, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "Key Family");
 
 /*
  * Definitions of protocols supported in the KEY domain.

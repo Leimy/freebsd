@@ -53,6 +53,7 @@
 
 #define	PMCSTAT_NHASH			256
 #define	PMCSTAT_HASH_MASK		0xFF
+#define	DEFAULT_SAMPLE_COUNT		65536
 
 typedef const void *pmcstat_interned_string;
 struct pmc_plugins;
@@ -106,6 +107,9 @@ struct pmcstat_args {
 #define	FLAGS_HAS_CPUMASK		0x00040000	/* -c */
 #define	FLAG_HAS_DURATION		0x00080000	/* -l secs */
 #define	FLAG_DO_WIDE_GPROF_HC		0x00100000	/* -e */
+#define	FLAG_SKIP_TOP_FN_RES		0x00200000	/* -A */
+#define	FLAG_FILTER_THREAD_ID		0x00400000	/* -L */
+#define	FLAG_SHOW_OFFSET		0x00800000	/* -I */
 
 	int	pa_required;		/* required features */
 	int	pa_pplugin;		/* pre-processing plugin */
@@ -130,6 +134,7 @@ struct pmcstat_args {
 	int	pa_topcolor;		/* terminal support color */
 	int	pa_mergepmc;		/* merge PMC with same name */
 	double	pa_duration;		/* time duration */
+	uint32_t pa_tid;
 	int	pa_argc;
 	char	**pa_argv;
 	STAILQ_HEAD(, pmcstat_ev) pa_events;
@@ -377,6 +382,7 @@ int pmcstat_analyze_log(struct pmcstat_args *args,
 
 int pmcstat_open_log(const char *_p, int _mode);
 int pmcstat_close_log(struct pmcstat_args *args);
+
 __END_DECLS
 
 #endif /* !_LIBPMCSTAT_H_ */

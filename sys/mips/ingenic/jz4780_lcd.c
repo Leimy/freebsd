@@ -1,6 +1,5 @@
 /*-
  * Copyright (c) 2016 Jared McNeill <jmcneill@invisible.ca>
- * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -36,6 +35,7 @@ __FBSDID("$FreeBSD$");
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/eventhandler.h>
 #include <sys/rman.h>
 #include <sys/condvar.h>
 #include <sys/kernel.h>
@@ -115,8 +115,8 @@ static struct resource_spec jzlcd_spec[] = {
 static int
 jzlcd_allocfb(struct jzlcd_softc *sc)
 {
-	sc->vaddr = kmem_alloc_contig(kernel_arena, sc->fbsize,
-	    M_NOWAIT | M_ZERO, 0, ~0, FB_ALIGN, 0, VM_MEMATTR_WRITE_COMBINING);
+	sc->vaddr = kmem_alloc_contig(sc->fbsize, M_NOWAIT | M_ZERO, 0, ~0,
+	    FB_ALIGN, 0, VM_MEMATTR_WRITE_COMBINING);
 	if (sc->vaddr == 0) {
 		device_printf(sc->dev, "failed to allocate FB memory\n");
 		return (ENOMEM);
@@ -129,7 +129,7 @@ jzlcd_allocfb(struct jzlcd_softc *sc)
 static void
 jzlcd_freefb(struct jzlcd_softc *sc)
 {
-	kmem_free(kernel_arena, sc->vaddr, sc->fbsize);
+	kmem_free(sc->vaddr, sc->fbsize);
 }
 
 static void

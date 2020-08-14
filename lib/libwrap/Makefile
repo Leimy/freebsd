@@ -4,7 +4,7 @@
 
 .include <src.opts.mk>
 
-PACKAGE=lib${LIB}
+CONFS=	hosts.allow
 LIB=	wrap
 SHLIB_MAJOR= 6
 INCS=	tcpd.h

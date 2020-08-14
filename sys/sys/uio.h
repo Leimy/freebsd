@@ -38,6 +38,7 @@
 #include <sys/cdefs.h>
 #include <sys/_types.h>
 #include <sys/_iovec.h>
+#include <sys/_uio.h>
 
 #ifndef _SSIZE_T_DECLARED
 typedef	__ssize_t	ssize_t;
@@ -47,17 +48,6 @@ typedef	__ssize_t	ssize_t;
 #ifndef _OFF_T_DECLARED
 typedef	__off_t	off_t;
 #define	_OFF_T_DECLARED
-#endif
-
-#if __BSD_VISIBLE
-enum	uio_rw { UIO_READ, UIO_WRITE };
-
-/* Segment flag values. */
-enum uio_seg {
-	UIO_USERSPACE,		/* from user data space */
-	UIO_SYSSPACE,		/* from system space */
-	UIO_NOCOPY		/* don't copy, already in object */
-};
 #endif
 
 #ifdef _KERNEL
@@ -90,12 +80,8 @@ struct vm_page;
 struct bus_dma_segment;
 
 struct uio *cloneuio(struct uio *uiop);
-int	copyinfrom(const void * __restrict src, void * __restrict dst,
-	    size_t len, int seg);
 int	copyiniov(const struct iovec *iovp, u_int iovcnt, struct iovec **iov,
 	    int error);
-int	copyinstrfrom(const void * __restrict src, void * __restrict dst,
-	    size_t len, size_t * __restrict copied, int seg);
 int	copyinuio(const struct iovec *iovp, u_int iovcnt, struct uio **uiop);
 int	copyout_map(struct thread *td, vm_offset_t *addr, size_t sz);
 int	copyout_unmap(struct thread *td, vm_offset_t addr, size_t sz);

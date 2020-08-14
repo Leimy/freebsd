@@ -70,6 +70,9 @@
 #define KTR_IW_CXGBE	KTR_SPARE3
 
 extern int c4iw_debug;
+extern int use_dsgl;
+extern int inline_threshold;
+
 #define PDBG(fmt, args...) \
 do { \
 	if (c4iw_debug) \
@@ -88,6 +91,7 @@ static inline void *cplhdr(struct mbuf *m)
 
 #define C4IW_ID_TABLE_F_RANDOM 1       /* Pseudo-randomize the id's returned */
 #define C4IW_ID_TABLE_F_EMPTY  2       /* Table is initially empty */
+#define C4IW_MAX_PAGE_SIZE 0x8000000
 
 struct c4iw_id_table {
 	u32 flags;
@@ -257,6 +261,7 @@ out:
 
 struct c4iw_dev {
 	struct ib_device ibdev;
+	struct pci_dev pdev;
 	struct c4iw_rdev rdev;
 	u32 device_cap_flags;
 	struct idr cqidr;
@@ -856,11 +861,9 @@ struct c4iw_ep {
 	unsigned int mpa_pkt_len;
 	u32 ird;
 	u32 ord;
-	u32 smac_idx;
 	u32 tx_chan;
 	u32 mtu;
 	u16 mss;
-	u16 emss;
 	u16 plen;
 	u16 rss_qid;
 	u16 txq_idx;
@@ -978,20 +981,4 @@ u32 c4iw_get_qpid(struct c4iw_rdev *rdev, struct c4iw_dev_ucontext *uctx);
 void c4iw_put_qpid(struct c4iw_rdev *rdev, u32 qid,
 		struct c4iw_dev_ucontext *uctx);
 void c4iw_ev_dispatch(struct c4iw_dev *dev, struct t4_cqe *err_cqe);
-void __iomem *c4iw_bar2_addrs(struct c4iw_rdev *rdev, unsigned int qid,
-		enum t4_bar2_qtype qtype,
-		unsigned int *pbar2_qid, u64 *pbar2_pa);
-extern struct cxgb4_client t4c_client;
-extern c4iw_handler_func c4iw_handlers[NUM_CPL_CMDS];
-
-#if defined(__i386__) || defined(__amd64__)
-#define L1_CACHE_BYTES 128
-#else
-#define L1_CACHE_BYTES 32
-#endif
-
-void your_reg_device(struct c4iw_dev *dev);
-
-#define SGE_CTRLQ_NUM	0
-
 #endif

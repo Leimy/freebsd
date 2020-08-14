@@ -31,6 +31,8 @@
 #ifndef	_VMM_DEV_H_
 #define	_VMM_DEV_H_
 
+struct vm_snapshot_meta;
+
 #ifdef _KERNEL
 void	vmmdev_init(void);
 int	vmmdev_cleanup(void);
@@ -51,8 +53,15 @@ struct vm_memmap {
 struct vm_memseg {
 	int		segid;
 	size_t		len;
-	char		name[SPECNAMELEN + 1];
+	char		name[VM_MAX_SUFFIXLEN + 1];
 };
+
+struct vm_memseg_fbsd12 {
+	int		segid;
+	size_t		len;
+	char		name[64];
+};
+_Static_assert(sizeof(struct vm_memseg_fbsd12) == 80, "COMPAT_FREEBSD12 ABI");
 
 struct vm_register {
 	int		cpuid;
@@ -209,6 +218,7 @@ struct vm_cpuset {
 };
 #define	VM_ACTIVE_CPUS		0
 #define	VM_SUSPENDED_CPUS	1
+#define	VM_DEBUG_CPUS		2
 
 struct vm_intinfo {
 	int		vcpuid;
@@ -224,6 +234,22 @@ struct vm_rtc_data {
 	int		offset;
 	uint8_t		value;
 };
+
+struct vm_cpu_topology {
+	uint16_t	sockets;
+	uint16_t	cores;
+	uint16_t	threads;
+	uint16_t	maxcpus;
+};
+
+struct vm_readwrite_kernemu_device {
+	int		vcpuid;
+	unsigned	access_width : 3;
+	unsigned	_unused : 29;
+	uint64_t	gpa;
+	uint64_t	value;
+};
+_Static_assert(sizeof(struct vm_readwrite_kernemu_device) == 24, "ABI");
 
 enum {
 	/* general routines */
@@ -252,6 +278,8 @@ enum {
 	IOCNUM_GET_SEGMENT_DESCRIPTOR = 23,
 	IOCNUM_SET_REGISTER_SET = 24,
 	IOCNUM_GET_REGISTER_SET = 25,
+	IOCNUM_GET_KERNEMU_DEV = 26,
+	IOCNUM_SET_KERNEMU_DEV = 27,
 
 	/* interrupt injection */
 	IOCNUM_GET_INTINFO = 28,
@@ -283,6 +311,10 @@ enum {
 	IOCNUM_GET_X2APIC_STATE = 61,
 	IOCNUM_GET_HPET_CAPABILITIES = 62,
 
+	/* CPU Topology */
+	IOCNUM_SET_TOPOLOGY = 63,
+	IOCNUM_GET_TOPOLOGY = 64,
+
 	/* legacy interrupt injection */
 	IOCNUM_ISA_ASSERT_IRQ = 80,
 	IOCNUM_ISA_DEASSERT_IRQ = 81,
@@ -292,12 +324,19 @@ enum {
 	/* vm_cpuset */
 	IOCNUM_ACTIVATE_CPU = 90,
 	IOCNUM_GET_CPUSET = 91,
+	IOCNUM_SUSPEND_CPU = 92,
+	IOCNUM_RESUME_CPU = 93,
 
 	/* RTC */
 	IOCNUM_RTC_READ = 100,
 	IOCNUM_RTC_WRITE = 101,
 	IOCNUM_RTC_SETTIME = 102,
 	IOCNUM_RTC_GETTIME = 103,
+
+	/* checkpoint */
+	IOCNUM_SNAPSHOT_REQ = 113,
+
+	IOCNUM_RESTORE_TIME = 115
 };
 
 #define	VM_RUN		\
@@ -306,8 +345,12 @@ enum {
 	_IOW('v', IOCNUM_SUSPEND, struct vm_suspend)
 #define	VM_REINIT	\
 	_IO('v', IOCNUM_REINIT)
+#define	VM_ALLOC_MEMSEG_FBSD12	\
+	_IOW('v', IOCNUM_ALLOC_MEMSEG, struct vm_memseg_fbsd12)
 #define	VM_ALLOC_MEMSEG	\
 	_IOW('v', IOCNUM_ALLOC_MEMSEG, struct vm_memseg)
+#define	VM_GET_MEMSEG_FBSD12	\
+	_IOWR('v', IOCNUM_GET_MEMSEG, struct vm_memseg_fbsd12)
 #define	VM_GET_MEMSEG	\
 	_IOWR('v', IOCNUM_GET_MEMSEG, struct vm_memseg)
 #define	VM_MMAP_MEMSEG	\
@@ -326,6 +369,12 @@ enum {
 	_IOW('v', IOCNUM_SET_REGISTER_SET, struct vm_register_set)
 #define	VM_GET_REGISTER_SET \
 	_IOWR('v', IOCNUM_GET_REGISTER_SET, struct vm_register_set)
+#define	VM_SET_KERNEMU_DEV \
+	_IOW('v', IOCNUM_SET_KERNEMU_DEV, \
+	    struct vm_readwrite_kernemu_device)
+#define	VM_GET_KERNEMU_DEV \
+	_IOWR('v', IOCNUM_GET_KERNEMU_DEV, \
+	    struct vm_readwrite_kernemu_device)
 #define	VM_INJECT_EXCEPTION	\
 	_IOW('v', IOCNUM_INJECT_EXCEPTION, struct vm_exception)
 #define	VM_LAPIC_IRQ 		\
@@ -376,6 +425,10 @@ enum {
 	_IOWR('v', IOCNUM_GET_X2APIC_STATE, struct vm_x2apic)
 #define	VM_GET_HPET_CAPABILITIES \
 	_IOR('v', IOCNUM_GET_HPET_CAPABILITIES, struct vm_hpet_cap)
+#define VM_SET_TOPOLOGY \
+	_IOW('v', IOCNUM_SET_TOPOLOGY, struct vm_cpu_topology)
+#define VM_GET_TOPOLOGY \
+	_IOR('v', IOCNUM_GET_TOPOLOGY, struct vm_cpu_topology)
 #define	VM_GET_GPA_PMAP \
 	_IOWR('v', IOCNUM_GET_GPA_PMAP, struct vm_gpa_pte)
 #define	VM_GLA2GPA	\
@@ -386,6 +439,10 @@ enum {
 	_IOW('v', IOCNUM_ACTIVATE_CPU, struct vm_activate_cpu)
 #define	VM_GET_CPUS	\
 	_IOW('v', IOCNUM_GET_CPUSET, struct vm_cpuset)
+#define	VM_SUSPEND_CPU \
+	_IOW('v', IOCNUM_SUSPEND_CPU, struct vm_activate_cpu)
+#define	VM_RESUME_CPU \
+	_IOW('v', IOCNUM_RESUME_CPU, struct vm_activate_cpu)
 #define	VM_SET_INTINFO	\
 	_IOW('v', IOCNUM_SET_INTINFO, struct vm_intinfo)
 #define	VM_GET_INTINFO	\
@@ -400,4 +457,8 @@ enum {
 	_IOR('v', IOCNUM_RTC_GETTIME, struct vm_rtc_time)
 #define	VM_RESTART_INSTRUCTION \
 	_IOW('v', IOCNUM_RESTART_INSTRUCTION, int)
+#define VM_SNAPSHOT_REQ \
+	_IOWR('v', IOCNUM_SNAPSHOT_REQ, struct vm_snapshot_meta)
+#define VM_RESTORE_TIME \
+	_IOWR('v', IOCNUM_RESTORE_TIME, int)
 #endif

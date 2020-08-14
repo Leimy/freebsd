@@ -92,7 +92,10 @@ expl(long double x)
 	t = SUM2P(hi, lo);
 
 	/* Scale by 2**k. */
-	/* XXX sparc64 multiplication is so slow that scalbnl() is faster. */
+	/*
+	 * XXX sparc64 multiplication was so slow that scalbnl() is faster,
+	 * but performance on aarch64 and riscv hasn't yet been quantified.
+	 */
 	if (k >= LDBL_MIN_EXP) {
 		if (k == LDBL_MAX_EXP)
 			RETURNI(t * 2 * 0x1p16383L);
@@ -268,13 +271,8 @@ expm1l(long double x)
 	}
 
 	/* Reduce x to (k*ln2 + endpoint[n2] + r1 + r2). */
-	/* Use a specialized rint() to get fn.  Assume round-to-nearest. */
-	fn = (double)x * INV_L + 0x1.8p52 - 0x1.8p52;
-#if defined(HAVE_EFFICIENT_IRINT)
+	fn = rnint((double)x * INV_L);
 	n = irint(fn);
-#else
-	n = (int)fn;
-#endif
 	n2 = (unsigned)n % INTERVALS;
 	k = n >> LOG2_INTERVALS;
 	r1 = x - fn * L1;

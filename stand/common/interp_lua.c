@@ -60,6 +60,9 @@ static struct interp_lua_softc lua_softc;
 #define	LDBG(...)
 #endif
 
+#define	LOADER_LUA	LUA_PATH "/loader.lua"
+
+INTERP_DEFINE("lua");
 
 static void *
 interp_lua_realloc(void *ud __unused, void *ptr, size_t osize __unused, size_t nsize)
@@ -119,12 +122,13 @@ interp_init(void)
 		lua_pop(luap, 1);  /* remove lib */
 	}
 
-	filename = "/boot/lua/loader.lua";
+	filename = LOADER_LUA;
 	if (interp_include(filename) != 0) {
-                const char *errstr = lua_tostring(luap, -1);
-                errstr = errstr == NULL ? "unknown" : errstr;
-                printf("Startup error in %s:\nLUA ERROR: %s.\n", filename, errstr);
-                lua_pop(luap, 1);
+		const char *errstr = lua_tostring(luap, -1);
+		errstr = errstr == NULL ? "unknown" : errstr;
+		printf("ERROR: %s.\n", errstr);
+		lua_pop(luap, 1);
+		setenv("autoboot_delay", "NO", 1);
 	}
 }
 
@@ -135,26 +139,28 @@ interp_run(const char *line)
 	char	**argv;
 	lua_State *luap;
 	struct interp_lua_softc	*softc = &lua_softc;
-	int status;
+	int status, ret;
 
 	luap = softc->luap;
 	LDBG("executing line...");
 	if ((status = luaL_dostring(luap, line)) != 0) {
-                lua_pop(luap, 1);
+		lua_pop(luap, 1);
 		/*
 		 * The line wasn't executable as lua; run it through parse to
 		 * to get consistent parsing of command line arguments, then
 		 * run it through cli_execute. If that fails, then we'll try it
 		 * as a builtin.
 		 */
+		command_errmsg = NULL;
 		if (parse(&argc, &argv, line) == 0) {
 			lua_getglobal(luap, "cli_execute");
 			for (nargc = 0; nargc < argc; ++nargc) {
 				lua_pushstring(luap, argv[nargc]);
 			}
 			status = lua_pcall(luap, argc, 1, 0);
+			ret = lua_tointeger(luap, 1);
 			lua_pop(luap, 1);
-			if (status != 0) {
+			if (status != 0 || ret != 0) {
 				/*
 				 * Lua cli_execute will pass the function back
 				 * through loader.command, which is a proxy to
@@ -166,7 +172,10 @@ interp_run(const char *line)
 				status = interp_builtin_cmd(argc, argv);
 			}
 			if (status != 0) {
-				printf("Command failed\n");
+				if (command_errmsg != NULL)
+					printf("%s\n", command_errmsg);
+				else
+					printf("Command failed\n");
 				status = CMD_ERROR;
 			}
 			free(argv);

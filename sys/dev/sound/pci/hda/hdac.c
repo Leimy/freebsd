@@ -41,6 +41,7 @@
 #include <dev/pci/pcivar.h>
 
 #include <sys/ctype.h>
+#include <sys/endian.h>
 #include <sys/taskqueue.h>
 
 #include <dev/sound/pci/hda/hdac_private.h>
@@ -55,7 +56,6 @@ SND_DECLARE_FILE("$FreeBSD$");
 #define hdac_lock(sc)		snd_mtxlock((sc)->lock)
 #define hdac_unlock(sc)		snd_mtxunlock((sc)->lock)
 #define hdac_lockassert(sc)	snd_mtxassert((sc)->lock)
-#define hdac_lockowned(sc)	mtx_owned((sc)->lock)
 
 #define HDAC_QUIRK_64BIT	(1 << 0)
 #define HDAC_QUIRK_DMAPOS	(1 << 1)
@@ -65,7 +65,7 @@ static const struct {
 	const char *key;
 	uint32_t value;
 } hdac_quirks_tab[] = {
-	{ "64bit", HDAC_QUIRK_DMAPOS },
+	{ "64bit", HDAC_QUIRK_64BIT },
 	{ "dmapos", HDAC_QUIRK_DMAPOS },
 	{ "msi", HDAC_QUIRK_MSI },
 };
@@ -79,15 +79,19 @@ static const struct {
 	char		quirks_off;
 } hdac_devices[] = {
 	{ HDA_INTEL_OAK,     "Intel Oaktrail",	0, 0 },
+	{ HDA_INTEL_CMLKLP,  "Intel Comet Lake-LP",	0, 0 },
+	{ HDA_INTEL_CMLKH,   "Intel Comet Lake-H",	0, 0 },
 	{ HDA_INTEL_BAY,     "Intel BayTrail",	0, 0 },
 	{ HDA_INTEL_HSW1,    "Intel Haswell",	0, 0 },
 	{ HDA_INTEL_HSW2,    "Intel Haswell",	0, 0 },
 	{ HDA_INTEL_HSW3,    "Intel Haswell",	0, 0 },
 	{ HDA_INTEL_BDW1,    "Intel Broadwell",	0, 0 },
 	{ HDA_INTEL_BDW2,    "Intel Broadwell",	0, 0 },
+	{ HDA_INTEL_BXTNT,   "Intel Broxton-T",	0, 0 },
 	{ HDA_INTEL_CPT,     "Intel Cougar Point",	0, 0 },
 	{ HDA_INTEL_PATSBURG,"Intel Patsburg",  0, 0 },
 	{ HDA_INTEL_PPT1,    "Intel Panther Point",	0, 0 },
+	{ HDA_INTEL_BR,      "Intel Braswell",	0, 0 },
 	{ HDA_INTEL_LPT1,    "Intel Lynx Point",	0, 0 },
 	{ HDA_INTEL_LPT2,    "Intel Lynx Point",	0, 0 },
 	{ HDA_INTEL_WCPT,    "Intel Wildcat Point",	0, 0 },
@@ -96,20 +100,31 @@ static const struct {
 	{ HDA_INTEL_LPTLP1,  "Intel Lynx Point-LP",	0, 0 },
 	{ HDA_INTEL_LPTLP2,  "Intel Lynx Point-LP",	0, 0 },
 	{ HDA_INTEL_SRPTLP,  "Intel Sunrise Point-LP",	0, 0 },
-	{ HDA_INTEL_KBLKLP,  "Intel Kabylake-LP",	0, 0 },
+	{ HDA_INTEL_KBLKLP,  "Intel Kaby Lake-LP",	0, 0 },
 	{ HDA_INTEL_SRPT,    "Intel Sunrise Point",	0, 0 },
-	{ HDA_INTEL_KBLK,    "Intel Kabylake",	0, 0 },
-	{ HDA_INTEL_KBLKH,   "Intel Kabylake-H",	0, 0 },
-	{ HDA_INTEL_CFLK,    "Intel Coffelake",	0, 0 },
+	{ HDA_INTEL_KBLK,    "Intel Kaby Lake",	0, 0 },
+	{ HDA_INTEL_KBLKH,   "Intel Kaby Lake-H",	0, 0 },
+	{ HDA_INTEL_CFLK,    "Intel Coffee Lake",	0, 0 },
+	{ HDA_INTEL_CMLKS,   "Intel Comet Lake-S",	0, 0 },
+	{ HDA_INTEL_CNLK,    "Intel Cannon Lake",	0, 0 },
+	{ HDA_INTEL_ICLK,    "Intel Ice Lake",		0, 0 },
+	{ HDA_INTEL_CMLKLP,  "Intel Comet Lake-LP",	0, 0 },
+	{ HDA_INTEL_CMLKH,   "Intel Comet Lake-H",	0, 0 },
+	{ HDA_INTEL_TGLK,    "Intel Tiger Lake",	0, 0 },
+	{ HDA_INTEL_GMLK,    "Intel Gemini Lake",	0, 0 },
 	{ HDA_INTEL_82801F,  "Intel 82801F",	0, 0 },
 	{ HDA_INTEL_63XXESB, "Intel 631x/632xESB",	0, 0 },
 	{ HDA_INTEL_82801G,  "Intel 82801G",	0, 0 },
 	{ HDA_INTEL_82801H,  "Intel 82801H",	0, 0 },
 	{ HDA_INTEL_82801I,  "Intel 82801I",	0, 0 },
+	{ HDA_INTEL_JLK,     "Intel Jasper Lake",	0, 0 },
 	{ HDA_INTEL_82801JI, "Intel 82801JI",	0, 0 },
 	{ HDA_INTEL_82801JD, "Intel 82801JD",	0, 0 },
 	{ HDA_INTEL_PCH,     "Intel Ibex Peak",	0, 0 },
 	{ HDA_INTEL_PCH2,    "Intel Ibex Peak",	0, 0 },
+	{ HDA_INTEL_ELLK,    "Intel Elkhart Lake",	0, 0 },
+	{ HDA_INTEL_JLK2,    "Intel Jasper Lake",	0, 0 },
+	{ HDA_INTEL_BXTNP,   "Intel Broxton-P",	0, 0 },
 	{ HDA_INTEL_SCH,     "Intel SCH",	0, 0 },
 	{ HDA_NVIDIA_MCP51,  "NVIDIA MCP51",	0, HDAC_QUIRK_MSI },
 	{ HDA_NVIDIA_MCP55,  "NVIDIA MCP55",	0, HDAC_QUIRK_MSI },
@@ -167,10 +182,14 @@ static const struct {
 	{ HDA_ATI_RV940,     "ATI RV940",	0, 0 },
 	{ HDA_ATI_RV970,     "ATI RV970",	0, 0 },
 	{ HDA_ATI_R1000,     "ATI R1000",	0, 0 },
+	{ HDA_AMD_X370,      "AMD X370",	0, 0 },
+	{ HDA_AMD_X570,      "AMD X570",	0, 0 },
+	{ HDA_AMD_STONEY,    "AMD Stoney",	0, 0 },
+	{ HDA_AMD_RAVEN,     "AMD Raven",	0, 0 },
 	{ HDA_AMD_HUDSON2,   "AMD Hudson-2",	0, 0 },
 	{ HDA_RDC_M3010,     "RDC M3010",	0, 0 },
 	{ HDA_VIA_VT82XX,    "VIA VT8251/8237A",0, 0 },
-	{ HDA_SIS_966,       "SiS 966",		0, 0 },
+	{ HDA_SIS_966,       "SiS 966/968",	0, 0 },
 	{ HDA_ULI_M5461,     "ULI M5461",	0, 0 },
 	/* Unknown */
 	{ HDA_INTEL_ALL,  "Intel",		0, 0 },
@@ -191,6 +210,7 @@ static const struct {
 } hdac_pcie_snoop[] = {
 	{  INTEL_VENDORID, 0x00, 0x00, 0x00 },
 	{    ATI_VENDORID, 0x42, 0xf8, 0x02 },
+	{    AMD_VENDORID, 0x42, 0xf8, 0x02 },
 	{ NVIDIA_VENDORID, 0x4e, 0xf0, 0x0f },
 };
 
@@ -198,7 +218,7 @@ static const struct {
  * Function prototypes
  ****************************************************************************/
 static void	hdac_intr_handler(void *);
-static int	hdac_reset(struct hdac_softc *, int);
+static int	hdac_reset(struct hdac_softc *, bool);
 static int	hdac_get_capabilities(struct hdac_softc *);
 static void	hdac_dma_cb(void *, bus_dma_segment_t *, int, int);
 static int	hdac_dma_alloc(struct hdac_softc *,
@@ -225,9 +245,6 @@ static int	hdac_resume(device_t);
 
 static int	hdac_rirb_flush(struct hdac_softc *sc);
 static int	hdac_unsolq_flush(struct hdac_softc *sc);
-
-#define hdac_command(a1, a2, a3)	\
-		hdac_send_command(a1, a3, a2)
 
 /* This function surely going to make its way into upper level someday. */
 static void
@@ -275,10 +292,10 @@ hdac_config_fetch(struct hdac_softc *sc, uint32_t *on, uint32_t *off)
 			);
 			if (inv == 0) {
 				*on |= hdac_quirks_tab[k].value;
-				*on &= ~hdac_quirks_tab[k].value;
+				*off &= ~hdac_quirks_tab[k].value;
 			} else if (inv != 0) {
 				*off |= hdac_quirks_tab[k].value;
-				*off &= ~hdac_quirks_tab[k].value;
+				*on &= ~hdac_quirks_tab[k].value;
 			}
 			break;
 		}
@@ -286,34 +303,36 @@ hdac_config_fetch(struct hdac_softc *sc, uint32_t *on, uint32_t *off)
 	}
 }
 
-/****************************************************************************
- * void hdac_intr_handler(void *)
- *
- * Interrupt handler. Processes interrupts received from the hdac.
- ****************************************************************************/
 static void
-hdac_intr_handler(void *context)
+hdac_one_intr(struct hdac_softc *sc, uint32_t intsts)
 {
-	struct hdac_softc *sc;
 	device_t dev;
-	uint32_t intsts;
 	uint8_t rirbsts;
 	int i;
 
-	sc = (struct hdac_softc *)context;
-	hdac_lock(sc);
-
-	/* Do we have anything to do? */
-	intsts = HDAC_READ_4(&sc->mem, HDAC_INTSTS);
-	if ((intsts & HDAC_INTSTS_GIS) == 0) {
-		hdac_unlock(sc);
-		return;
-	}
-
 	/* Was this a controller interrupt? */
 	if (intsts & HDAC_INTSTS_CIS) {
-		rirbsts = HDAC_READ_1(&sc->mem, HDAC_RIRBSTS);
+		/*
+		 * Placeholder: if we ever enable any bits in HDAC_WAKEEN, then
+		 * we will need to check and clear HDAC_STATESTS.
+		 * That event is used to report codec status changes such as
+		 * a reset or a wake-up event.
+		 */
+		/*
+		 * Placeholder: if we ever enable HDAC_CORBCTL_CMEIE, then we
+		 * will need to check and clear HDAC_CORBSTS_CMEI in
+		 * HDAC_CORBSTS.
+		 * That event is used to report CORB memory errors.
+		 */
+		/*
+		 * Placeholder: if we ever enable HDAC_RIRBCTL_RIRBOIC, then we
+		 * will need to check and clear HDAC_RIRBSTS_RIRBOIS in
+		 * HDAC_RIRBSTS.
+		 * That event is used to report response FIFO overruns.
+		 */
+
 		/* Get as many responses that we can */
+		rirbsts = HDAC_READ_1(&sc->mem, HDAC_RIRBSTS);
 		while (rirbsts & HDAC_RIRBSTS_RINTFL) {
 			HDAC_WRITE_1(&sc->mem,
 			    HDAC_RIRBSTS, HDAC_RIRBSTS_RINTFL);
@@ -329,16 +348,45 @@ hdac_intr_handler(void *context)
 			if ((intsts & (1 << i)) == 0)
 				continue;
 			HDAC_WRITE_1(&sc->mem, (i << 5) + HDAC_SDSTS,
-			    HDAC_SDSTS_DESE | HDAC_SDSTS_FIFOE | HDAC_SDSTS_BCIS );
+			    HDAC_SDSTS_DESE | HDAC_SDSTS_FIFOE | HDAC_SDSTS_BCIS);
 			if ((dev = sc->streams[i].dev) != NULL) {
 				HDAC_STREAM_INTR(dev,
 				    sc->streams[i].dir, sc->streams[i].stream);
 			}
 		}
 	}
+}
 
-	HDAC_WRITE_4(&sc->mem, HDAC_INTSTS, intsts);
-	hdac_unlock(sc);
+/****************************************************************************
+ * void hdac_intr_handler(void *)
+ *
+ * Interrupt handler. Processes interrupts received from the hdac.
+ ****************************************************************************/
+static void
+hdac_intr_handler(void *context)
+{
+	struct hdac_softc *sc;
+	uint32_t intsts;
+
+	sc = (struct hdac_softc *)context;
+
+	/*
+	 * Loop until HDAC_INTSTS_GIS gets clear.
+	 * It is plausible that hardware interrupts a host only when GIS goes
+	 * from zero to one.  GIS is formed by OR-ing multiple hardware
+	 * statuses, so it's possible that a previously cleared status gets set
+	 * again while another status has not been cleared yet.  Thus, there
+	 * will be no new interrupt as GIS always stayed set.  If we don't
+	 * re-examine GIS then we can leave it set and never get an interrupt
+	 * again.
+	 */
+	intsts = HDAC_READ_4(&sc->mem, HDAC_INTSTS);
+	while ((intsts & HDAC_INTSTS_GIS) != 0) {
+		hdac_lock(sc);
+		hdac_one_intr(sc, intsts);
+		hdac_unlock(sc);
+		intsts = HDAC_READ_4(&sc->mem, HDAC_INTSTS);
+	}
 }
 
 static void
@@ -354,20 +402,19 @@ hdac_poll_callback(void *arg)
 		hdac_unlock(sc);
 		return;
 	}
-	callout_reset(&sc->poll_callout, sc->poll_ival,
-	    hdac_poll_callback, sc);
+	callout_reset(&sc->poll_callout, sc->poll_ival, hdac_poll_callback, sc);
 	hdac_unlock(sc);
 
 	hdac_intr_handler(sc);
 }
 
 /****************************************************************************
- * int hdac_reset(hdac_softc *, int)
+ * int hdac_reset(hdac_softc *, bool)
  *
  * Reset the hdac to a quiescent and known state.
  ****************************************************************************/
 static int
-hdac_reset(struct hdac_softc *sc, int wakeup)
+hdac_reset(struct hdac_softc *sc, bool wakeup)
 {
 	uint32_t gctl;
 	int count, i;
@@ -406,7 +453,7 @@ hdac_reset(struct hdac_softc *sc, int wakeup)
 		if (!(gctl & HDAC_GCTL_CRST))
 			break;
 		DELAY(10);
-	} while	(--count);
+	} while (--count);
 	if (gctl & HDAC_GCTL_CRST) {
 		device_printf(sc->dev, "Unable to put hdac in reset\n");
 		return (ENXIO);
@@ -433,15 +480,12 @@ hdac_reset(struct hdac_softc *sc, int wakeup)
 
 	/*
 	 * Wait for codecs to finish their own reset sequence. The delay here
-	 * should be of 250us but for some reasons, it's not enough on my
-	 * computer. Let's use twice as much as necessary to make sure that
-	 * it's reset properly.
+	 * must be at least 521us (HDA 1.0a section 4.3 Codec Discovery).
 	 */
 	DELAY(1000);
 
 	return (0);
 }
-
 
 /****************************************************************************
  * int hdac_get_capabilities(struct hdac_softc *);
@@ -569,7 +613,7 @@ hdac_dma_alloc(struct hdac_softc *sc, struct hdac_dma *dma, bus_size_t size)
 	    NULL,				/* lockfuncarg */
 	    &dma->dma_tag);			/* dmat */
 	if (result != 0) {
-		device_printf(sc->dev, "%s: bus_dma_tag_create failed (%x)\n",
+		device_printf(sc->dev, "%s: bus_dma_tag_create failed (%d)\n",
 		    __func__, result);
 		goto hdac_dma_alloc_fail;
 	}
@@ -579,10 +623,11 @@ hdac_dma_alloc(struct hdac_softc *sc, struct hdac_dma *dma, bus_size_t size)
 	 */
 	result = bus_dmamem_alloc(dma->dma_tag, (void **)&dma->dma_vaddr,
 	    BUS_DMA_NOWAIT | BUS_DMA_ZERO |
-	    ((sc->flags & HDAC_F_DMA_NOCACHE) ? BUS_DMA_NOCACHE : 0),
+	    ((sc->flags & HDAC_F_DMA_NOCACHE) ? BUS_DMA_NOCACHE :
+	     BUS_DMA_COHERENT),
 	    &dma->dma_map);
 	if (result != 0) {
-		device_printf(sc->dev, "%s: bus_dmamem_alloc failed (%x)\n",
+		device_printf(sc->dev, "%s: bus_dmamem_alloc failed (%d)\n",
 		    __func__, result);
 		goto hdac_dma_alloc_fail;
 	}
@@ -597,7 +642,7 @@ hdac_dma_alloc(struct hdac_softc *sc, struct hdac_dma *dma, bus_size_t size)
 	if (result != 0 || dma->dma_paddr == 0) {
 		if (result == 0)
 			result = ENOMEM;
-		device_printf(sc->dev, "%s: bus_dmamem_load failed (%x)\n",
+		device_printf(sc->dev, "%s: bus_dmamem_load failed (%d)\n",
 		    __func__, result);
 		goto hdac_dma_alloc_fail;
 	}
@@ -615,22 +660,19 @@ hdac_dma_alloc_fail:
 	return (result);
 }
 
-
 /****************************************************************************
  * void hdac_dma_free(struct hdac_softc *, struct hdac_dma *)
  *
- * Free a struct dhac_dma that has been previously allocated via the
+ * Free a struct hdac_dma that has been previously allocated via the
  * hdac_dma_alloc function.
  ****************************************************************************/
 static void
 hdac_dma_free(struct hdac_softc *sc, struct hdac_dma *dma)
 {
 	if (dma->dma_paddr != 0) {
-#if 0
 		/* Flush caches */
 		bus_dmamap_sync(dma->dma_tag, dma->dma_map,
 		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
-#endif
 		bus_dmamap_unload(dma->dma_tag, dma->dma_map);
 		dma->dma_paddr = 0;
 	}
@@ -718,7 +760,7 @@ hdac_irq_alloc(struct hdac_softc *sc)
 	    NULL, hdac_intr_handler, sc, &irq->irq_handle);
 	if (result != 0) {
 		device_printf(sc->dev,
-		    "%s: Unable to setup interrupt handler (%x)\n",
+		    "%s: Unable to setup interrupt handler (%d)\n",
 		    __func__, result);
 		goto hdac_irq_alloc_fail;
 	}
@@ -853,7 +895,6 @@ hdac_rirb_init(struct hdac_softc *sc)
 	HDAC_WRITE_1(&sc->mem, HDAC_RIRBCTL, HDAC_RIRBCTL_RINTCTL);
 #endif
 
-#if 0
 	/*
 	 * Make sure that the Host CPU cache doesn't contain any dirty
 	 * cache lines that falls in the rirb. If I understood correctly, it
@@ -862,7 +903,6 @@ hdac_rirb_init(struct hdac_softc *sc)
 	 */
 	bus_dmamap_sync(sc->rirb_dma.dma_tag, sc->rirb_dma.dma_map,
 	    BUS_DMASYNC_PREREAD);
-#endif
 }
 
 /****************************************************************************
@@ -900,25 +940,24 @@ hdac_rirb_flush(struct hdac_softc *sc)
 {
 	struct hdac_rirb *rirb_base, *rirb;
 	nid_t cad;
-	uint32_t resp;
+	uint32_t resp, resp_ex;
 	uint8_t rirbwp;
 	int ret;
 
 	rirb_base = (struct hdac_rirb *)sc->rirb_dma.dma_vaddr;
 	rirbwp = HDAC_READ_1(&sc->mem, HDAC_RIRBWP);
-#if 0
 	bus_dmamap_sync(sc->rirb_dma.dma_tag, sc->rirb_dma.dma_map,
 	    BUS_DMASYNC_POSTREAD);
-#endif
 
 	ret = 0;
 	while (sc->rirb_rp != rirbwp) {
 		sc->rirb_rp++;
 		sc->rirb_rp %= sc->rirb_size;
 		rirb = &rirb_base[sc->rirb_rp];
-		cad = HDAC_RIRB_RESPONSE_EX_SDATA_IN(rirb->response_ex);
-		resp = rirb->response;
-		if (rirb->response_ex & HDAC_RIRB_RESPONSE_EX_UNSOLICITED) {
+		resp = le32toh(rirb->response);
+		resp_ex = le32toh(rirb->response_ex);
+		cad = HDAC_RIRB_RESPONSE_EX_SDATA_IN(resp_ex);
+		if (resp_ex & HDAC_RIRB_RESPONSE_EX_UNSOLICITED) {
 			sc->unsolq[sc->unsolq_wp++] = resp;
 			sc->unsolq_wp %= HDAC_UNSOLQ_MAX;
 			sc->unsolq[sc->unsolq_wp++] = cad;
@@ -932,6 +971,9 @@ hdac_rirb_flush(struct hdac_softc *sc)
 		}
 		ret++;
 	}
+
+	bus_dmamap_sync(sc->rirb_dma.dma_tag, sc->rirb_dma.dma_map,
+	    BUS_DMASYNC_PREREAD);
 	return (ret);
 }
 
@@ -961,7 +1003,7 @@ hdac_unsolq_flush(struct hdac_softc *sc)
 }
 
 /****************************************************************************
- * uint32_t hdac_command_sendone_internal
+ * uint32_t hdac_send_command
  *
  * Wrapper function that sends only one command to a given codec
  ****************************************************************************/
@@ -971,8 +1013,7 @@ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
 	int timeout;
 	uint32_t *corb;
 
-	if (!hdac_lockowned(sc))
-		device_printf(sc->dev, "WARNING!!!! mtx not owned!!!!\n");
+	hdac_lockassert(sc);
 	verb &= ~HDA_CMD_CAD_MASK;
 	verb |= ((uint32_t)cad) << HDA_CMD_CAD_SHIFT;
 	sc->codecs[cad].response = HDA_INVALID;
@@ -981,15 +1022,11 @@ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
 	sc->corb_wp++;
 	sc->corb_wp %= sc->corb_size;
 	corb = (uint32_t *)sc->corb_dma.dma_vaddr;
-#if 0
 	bus_dmamap_sync(sc->corb_dma.dma_tag,
 	    sc->corb_dma.dma_map, BUS_DMASYNC_PREWRITE);
-#endif
-	corb[sc->corb_wp] = verb;
-#if 0
+	corb[sc->corb_wp] = htole32(verb);
 	bus_dmamap_sync(sc->corb_dma.dma_tag,
 	    sc->corb_dma.dma_map, BUS_DMASYNC_POSTWRITE);
-#endif
 	HDAC_WRITE_2(&sc->mem, HDAC_CORBWP, sc->corb_wp);
 
 	timeout = 10000;
@@ -999,7 +1036,8 @@ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
 	} while (sc->codecs[cad].pending != 0 && --timeout);
 
 	if (sc->codecs[cad].pending != 0) {
-		device_printf(sc->dev, "Command timeout on address %d\n", cad);
+		device_printf(sc->dev, "Command 0x%08x timeout on address %d\n",
+		    verb, cad);
 		sc->codecs[cad].pending = 0;
 	}
 
@@ -1042,8 +1080,7 @@ hdac_probe(device_t dev)
 		if (HDA_DEV_MATCH(hdac_devices[i].model, model) &&
 		    class == PCIC_MULTIMEDIA &&
 		    subclass == PCIS_MULTIMEDIA_HDA) {
-			snprintf(desc, sizeof(desc),
-			    "%s (0x%04x)",
+			snprintf(desc, sizeof(desc), "%s (0x%04x)",
 			    hdac_devices[i].desc, pci_get_device(dev));
 			result = BUS_PROBE_GENERIC;
 			break;
@@ -1285,7 +1322,7 @@ hdac_attach(device_t dev)
 	    NULL,				/* lockfuncarg */
 	    &sc->chan_dmat);			/* dmat */
 	if (result != 0) {
-		device_printf(dev, "%s: bus_dma_tag_create failed (%x)\n",
+		device_printf(dev, "%s: bus_dma_tag_create failed (%d)\n",
 		     __func__, result);
 		goto hdac_attach_fail;
 	}
@@ -1294,7 +1331,7 @@ hdac_attach(device_t dev)
 	HDA_BOOTHVERBOSE(
 		device_printf(dev, "Reset controller...\n");
 	);
-	hdac_reset(sc, 1);
+	hdac_reset(sc, true);
 
 	/* Initialize the CORB and RIRB */
 	hdac_corb_init(sc);
@@ -1312,8 +1349,9 @@ hdac_attach(device_t dev)
 
 hdac_attach_fail:
 	hdac_irq_free(sc);
-	for (i = 0; i < sc->num_ss; i++)
-		hdac_dma_free(sc, &sc->streams[i].bdl);
+	if (sc->streams != NULL)
+		for (i = 0; i < sc->num_ss; i++)
+			hdac_dma_free(sc, &sc->streams[i].bdl);
 	free(sc->streams, M_HDAC);
 	hdac_dma_free(sc, &sc->rirb_dma);
 	hdac_dma_free(sc, &sc->corb_dma);
@@ -1410,21 +1448,11 @@ hdac_poll_reinit(struct hdac_softc *sc)
 		pollticks >>= 1;
 		if (pollticks > hz)
 			pollticks = hz;
-		if (pollticks < 1) {
-			HDA_BOOTVERBOSE(
-				device_printf(sc->dev,
-				    "poll interval < 1 tick !\n");
-			);
+		if (pollticks < 1)
 			pollticks = 1;
-		}
 		if (min > pollticks)
 			min = pollticks;
 	}
-	HDA_BOOTVERBOSE(
-		device_printf(sc->dev,
-		    "poll interval %d -> %d ticks\n",
-		    sc->poll_ival, min);
-	);
 	sc->poll_ival = min;
 	if (min == 1000000)
 		callout_stop(&sc->poll_callout);
@@ -1505,6 +1533,24 @@ hdac_attach2(void *arg)
 		device_printf(sc->dev, "Starting RIRB Engine...\n");
 	);
 	hdac_rirb_start(sc);
+
+	/*
+	 * Clear HDAC_WAKEEN as at present we have no use for SDI wake
+	 * (status change) interrupts.  The documentation says that we
+	 * should not make any assumptions about the state of this register
+	 * and set it explicitly.
+	 * NB: this needs to be done before the interrupt is enabled as
+	 * the handler does not expect this interrupt source.
+	 */
+	HDAC_WRITE_2(&sc->mem, HDAC_WAKEEN, 0);
+
+	/*
+	 * Read and clear post-reset SDI wake status.
+	 * Each set bit corresponds to a codec that came out of reset.
+	 */
+	statests = HDAC_READ_2(&sc->mem, HDAC_STATESTS);
+	HDAC_WRITE_2(&sc->mem, HDAC_STATESTS, statests);
+
 	HDA_BOOTHVERBOSE(
 		device_printf(sc->dev,
 		    "Enabling controller interrupt...\n");
@@ -1520,7 +1566,6 @@ hdac_attach2(void *arg)
 	HDA_BOOTHVERBOSE(
 		device_printf(sc->dev, "Scanning HDA codecs ...\n");
 	);
-	statests = HDAC_READ_2(&sc->mem, HDAC_STATESTS);
 	hdac_unlock(sc);
 	for (i = 0; i < HDAC_CODEC_MAX; i++) {
 		if (HDAC_STATESTS_SDIWAKE(statests, i)) {
@@ -1537,7 +1582,7 @@ hdac_attach2(void *arg)
 			if (vendorid == HDA_INVALID &&
 			    revisionid == HDA_INVALID) {
 				device_printf(sc->dev,
-				    "CODEC is not responding!\n");
+				    "CODEC at address %d not responding!\n", i);
 				continue;
 			}
 			sc->codecs[i].vendor_id =
@@ -1562,12 +1607,12 @@ hdac_attach2(void *arg)
 
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
-	    "pindump", CTLTYPE_INT | CTLFLAG_RW, sc->dev, sizeof(sc->dev),
-	    sysctl_hdac_pindump, "I", "Dump pin states/data");
+	    "pindump", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc->dev,
+	    sizeof(sc->dev), sysctl_hdac_pindump, "I", "Dump pin states/data");
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(sc->dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO,
-	    "polling", CTLTYPE_INT | CTLFLAG_RW, sc->dev, sizeof(sc->dev),
-	    sysctl_hdac_polling, "I", "Enable polling mode");
+	    "polling", CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_NEEDGIANT, sc->dev,
+	    sizeof(sc->dev), sysctl_hdac_polling, "I", "Enable polling mode");
 }
 
 /****************************************************************************
@@ -1590,7 +1635,7 @@ hdac_suspend(device_t dev)
 		device_printf(dev, "Reset controller...\n");
 	);
 	callout_stop(&sc->poll_callout);
-	hdac_reset(sc, 0);
+	hdac_reset(sc, false);
 	hdac_unlock(sc);
 	callout_drain(&sc->poll_callout);
 	taskqueue_drain(taskqueue_thread, &sc->unsolq_task);
@@ -1620,7 +1665,7 @@ hdac_resume(device_t dev)
 	HDA_BOOTHVERBOSE(
 		device_printf(dev, "Reset controller...\n");
 	);
-	hdac_reset(sc, 1);
+	hdac_reset(sc, true);
 
 	/* Initialize the CORB and RIRB */
 	hdac_corb_init(sc);
@@ -1634,6 +1679,19 @@ hdac_resume(device_t dev)
 		device_printf(dev, "Starting RIRB Engine...\n");
 	);
 	hdac_rirb_start(sc);
+
+	/*
+	 * Clear HDAC_WAKEEN as at present we have no use for SDI wake
+	 * (status change) events.  The documentation says that we should
+	 * not make any assumptions about the state of this register and
+	 * set it explicitly.
+	 * Also, clear HDAC_STATESTS.
+	 * NB: this needs to be done before the interrupt is enabled as
+	 * the handler does not expect this interrupt source.
+	 */
+	HDAC_WRITE_2(&sc->mem, HDAC_WAKEEN, 0);
+	HDAC_WRITE_2(&sc->mem, HDAC_STATESTS, HDAC_STATESTS_SDIWAKE_MASK);
+
 	HDA_BOOTHVERBOSE(
 		device_printf(dev, "Enabling controller interrupt...\n");
 	);
@@ -1676,7 +1734,7 @@ hdac_detach(device_t dev)
 	free(devlist, M_TEMP);
 
 	hdac_lock(sc);
-	hdac_reset(sc, 0);
+	hdac_reset(sc, false);
 	hdac_unlock(sc);
 	taskqueue_drain(taskqueue_thread, &sc->unsolq_task);
 	hdac_irq_free(sc);
@@ -1710,20 +1768,17 @@ hdac_print_child(device_t dev, device_t child)
 	int retval;
 
 	retval = bus_print_child_header(dev, child);
-	retval += printf(" at cad %d",
-	    (int)(intptr_t)device_get_ivars(child));
+	retval += printf(" at cad %d", (int)(intptr_t)device_get_ivars(child));
 	retval += bus_print_child_footer(dev, child);
 
 	return (retval);
 }
 
 static int
-hdac_child_location_str(device_t dev, device_t child, char *buf,
-    size_t buflen)
+hdac_child_location_str(device_t dev, device_t child, char *buf, size_t buflen)
 {
 
-	snprintf(buf, buflen, "cad=%d",
-	    (int)(intptr_t)device_get_ivars(child));
+	snprintf(buf, buflen, "cad=%d", (int)(intptr_t)device_get_ivars(child));
 	return (0);
 }
 
@@ -1734,8 +1789,8 @@ hdac_child_pnpinfo_str_method(device_t dev, device_t child, char *buf,
 	struct hdac_softc *sc = device_get_softc(dev);
 	nid_t cad = (uintptr_t)device_get_ivars(child);
 
-	snprintf(buf, buflen, "vendor=0x%04x device=0x%04x revision=0x%02x "
-	    "stepping=0x%02x",
+	snprintf(buf, buflen,
+	    "vendor=0x%04x device=0x%04x revision=0x%02x stepping=0x%02x",
 	    sc->codecs[cad].vendor_id, sc->codecs[cad].device_id,
 	    sc->codecs[cad].revision_id, sc->codecs[cad].stepping_id);
 	return (0);
@@ -1911,8 +1966,8 @@ hdac_stream_free(device_t dev, device_t child, int dir, int stream)
 }
 
 static int
-hdac_stream_start(device_t dev, device_t child,
-    int dir, int stream, bus_addr_t buf, int blksz, int blkcnt)
+hdac_stream_start(device_t dev, device_t child, int dir, int stream,
+    bus_addr_t buf, int blksz, int blkcnt)
 {
 	struct hdac_softc *sc = device_get_softc(dev);
 	struct hdac_bdle *bdle;
@@ -1927,12 +1982,15 @@ hdac_stream_start(device_t dev, device_t child,
 	addr = (uint64_t)buf;
 	bdle = (struct hdac_bdle *)sc->streams[ss].bdl.dma_vaddr;
 	for (i = 0; i < blkcnt; i++, bdle++) {
-		bdle->addrl = (uint32_t)addr;
-		bdle->addrh = (uint32_t)(addr >> 32);
-		bdle->len = blksz;
-		bdle->ioc = 1;
+		bdle->addrl = htole32((uint32_t)addr);
+		bdle->addrh = htole32((uint32_t)(addr >> 32));
+		bdle->len = htole32(blksz);
+		bdle->ioc = htole32(1);
 		addr += blksz;
 	}
+
+	bus_dmamap_sync(sc->streams[ss].bdl.dma_tag,
+	    sc->streams[ss].bdl.dma_map, BUS_DMASYNC_PREWRITE);
 
 	off = ss << 5;
 	HDAC_WRITE_4(&sc->mem, off + HDAC_SDCBL, blksz * blkcnt);
@@ -1981,6 +2039,9 @@ hdac_stream_stop(device_t dev, device_t child, int dir, int stream)
 	ss = hdac_find_stream(sc, dir, stream);
 	KASSERT(ss >= 0,
 	    ("Stop for not allocated stream (%d/%d)\n", dir, stream));
+
+	bus_dmamap_sync(sc->streams[ss].bdl.dma_tag,
+	    sc->streams[ss].bdl.dma_map, BUS_DMASYNC_POSTWRITE);
 
 	off = ss << 5;
 	ctl = HDAC_READ_1(&sc->mem, off + HDAC_SDCTL0);

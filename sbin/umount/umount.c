@@ -136,10 +136,6 @@ main(int argc, char *argv[])
 	if ((fflag & MNT_FORCE) != 0 && (fflag & MNT_NONBUSY) != 0)
 		err(1, "-f and -n are mutually exclusive");
 
-	/* Start disks transferring immediately. */
-	if ((fflag & (MNT_FORCE | MNT_NONBUSY)) == 0 && nfsforce == 0)
-		sync();
-
 	if ((argc == 0 && !all) || (argc != 0 && all))
 		usage();
 
@@ -509,8 +505,7 @@ getmntentry(const char *fromname, const char *onname, fsid_t *fsid, dowhat what)
 			continue;
 		if (onname != NULL && strcmp(sfs->f_mntonname, onname) != 0)
 			continue;
-		if (fsid != NULL && bcmp(&sfs->f_fsid, fsid,
-		    sizeof(*fsid)) != 0)
+		if (fsid != NULL && fsidcmp(&sfs->f_fsid, fsid) != 0)
 			continue;
 
 		switch (what) {

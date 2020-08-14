@@ -1,10 +1,9 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2005 M. Warner Losh
- * Copyright (c) 2005 Olivier Houchard
- * Copyright (c) 2012 Thomas Skibo
- * All rights reserved.
+ * Copyright (c) 2005 Olivier Houchard All rights reserved.
+ * Copyright (c) 2012 Thomas Skibo All rights reserved.
+ * Copyright (c) 2005 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -45,7 +44,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/bus.h>
 #include <sys/conf.h>
 #include <sys/cons.h>
-#include <sys/tty.h>
 #include <machine/bus.h>
 
 #include <dev/uart/uart.h>
@@ -711,6 +709,8 @@ static struct uart_class uart_cdnc_class = {
 
 static struct ofw_compat_data compat_data[] = {
 	{"cadence,uart",	(uintptr_t)&uart_cdnc_class},
+	{"cdns,uart-r1p12",	(uintptr_t)&uart_cdnc_class},
+	{"xlnx,xuartps",	(uintptr_t)&uart_cdnc_class},
 	{NULL,			(uintptr_t)NULL},
 };
 UART_FDT_CLASS_AND_DEVICE(compat_data);

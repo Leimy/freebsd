@@ -28,7 +28,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd September 23, 2016
+.Dd May 5, 2020
 .Dt THR_WAKE 2
 .Os
 .Sh NAME
@@ -67,7 +67,7 @@ of that thread in the kernel to fail immediately with the
 .Er EINTR
 error.
 The flag is cleared by an interruptible sleep attempt or by a call to
-.Xr thr_suspend 2.
+.Xr thr_suspend 2 .
 This is used by the system threading library to implement cancellation.
 .Pp
 If
@@ -96,7 +96,7 @@ of the calling thread.
 .El
 .Sh SEE ALSO
 .Xr ps 1 ,
-.Xr thr_self 2
+.Xr thr_self 2 ,
 .Xr thr_suspend 2 ,
 .Xr pthread_cancel 3 ,
 .Xr pthread_resume_np 3 ,
@@ -110,3 +110,8 @@ to implement
 .St -p1003.1-2001
 .Xr pthread 3
 functionality.
+.Sh HISTORY
+The
+.Fn thr_suspend
+system call first appeared in
+.Fx 5.2 .

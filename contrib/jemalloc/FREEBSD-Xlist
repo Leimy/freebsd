@@ -1,12 +1,14 @@
 $FreeBSD$
 .appveyor.yml
 .autom4te.cfg
+.cirrus.yml
 .git*
 .travis.yml
 FREEBSD-*
 INSTALL.md
 Makefile*
 README
+TUNING.md
 autogen.sh
 autom4te.cache/
 bin/

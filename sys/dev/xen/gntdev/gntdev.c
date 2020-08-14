@@ -278,7 +278,7 @@ gref_list_dtor(struct cleanup_data_struct *cleanup_data)
 					continue;
 				gnttab_free_grant_reference(gref->gref_id);
 			}
-			vm_page_unwire(gref->page, PQ_NONE);
+			vm_page_unwire_noq(gref->page);
 			vm_page_free(gref->page);
 			gref->page = NULL;
 		}
@@ -414,7 +414,7 @@ gntdev_alloc_gref(struct ioctl_gntdev_alloc_gref *arg)
 	/* Copy the output values. */
 	arg->index = file_offset;
 	for (i = 0; i < arg->count; i++)
-		arg->gref_ids[i] = grefs[i].gref_id;
+		suword32(&arg->gref_ids[i], grefs[i].gref_id);
 
 	/* Modify the per user private data. */
 	mtx_lock(&priv_user->user_data_lock);
@@ -606,7 +606,7 @@ retry:
 		m = vm_page_lookup(gmap->map->mem, i);
 		if (m == NULL)
 			continue;
-		if (vm_page_sleep_if_busy(m, "pcmdum"))
+		if (vm_page_busy_acquire(m, VM_ALLOC_WAITFAIL) == 0)
 			goto retry;
 		cdev_pager_free_page(gmap->map->mem, m);
 	}
@@ -659,16 +659,27 @@ gntdev_map_grant_ref(struct ioctl_gntdev_map_grant_ref *arg)
 	gmap->grant_map_ops =
 	    malloc(sizeof(struct gnttab_map_grant_ref) * arg->count,
 	        M_GNTDEV, M_WAITOK | M_ZERO);
-	
-	error = get_file_offset(priv_user, arg->count, &gmap->file_index);
-	if (error != 0)
-		return (error);
 
 	for (i = 0; i < arg->count; i++) {
-		gmap->grant_map_ops[i].dom = arg->refs[i].domid;
-		gmap->grant_map_ops[i].ref = arg->refs[i].ref;
+		struct ioctl_gntdev_grant_ref ref;
+
+		error = copyin(&arg->refs[i], &ref, sizeof(ref));
+		if (error != 0) {
+			free(gmap->grant_map_ops, M_GNTDEV);
+			free(gmap, M_GNTDEV);
+			return (error);
+		}
+		gmap->grant_map_ops[i].dom = ref.domid;
+		gmap->grant_map_ops[i].ref = ref.ref;
 		gmap->grant_map_ops[i].handle = -1;
 		gmap->grant_map_ops[i].flags = GNTMAP_host_map;
+	}
+
+	error = get_file_offset(priv_user, arg->count, &gmap->file_index);
+	if (error != 0) {
+		free(gmap->grant_map_ops, M_GNTDEV);
+		free(gmap, M_GNTDEV);
+		return (error);
 	}
 
 	mtx_lock(&priv_user->user_data_lock);
@@ -795,7 +806,7 @@ gntdev_gmap_pg_fault(vm_object_t object, vm_ooffset_t offset, int prot,
 {
 	struct gntdev_gmap *gmap = object->handle;
 	vm_pindex_t pidx, ridx;
-	vm_page_t page, oldm;
+	vm_page_t page;
 	vm_ooffset_t relative_offset;
 
 	if (gmap->map == NULL)
@@ -803,8 +814,8 @@ gntdev_gmap_pg_fault(vm_object_t object, vm_ooffset_t offset, int prot,
 
 	relative_offset = offset - gmap->file_index;
 
-	pidx = UOFF_TO_IDX(offset);
-	ridx = UOFF_TO_IDX(relative_offset);
+	pidx = OFF_TO_IDX(offset);
+	ridx = OFF_TO_IDX(relative_offset);
 	if (ridx >= gmap->count ||
 	    gmap->grant_map_ops[ridx].status != GNTST_okay)
 		return (VM_PAGER_FAIL);
@@ -815,20 +826,15 @@ gntdev_gmap_pg_fault(vm_object_t object, vm_ooffset_t offset, int prot,
 
 	KASSERT((page->flags & PG_FICTITIOUS) != 0,
 	    ("not fictitious %p", page));
-	KASSERT(page->wire_count == 1, ("wire_count not 1 %p", page));
-	KASSERT(vm_page_busied(page) == 0, ("page %p is busy", page));
+	KASSERT(vm_page_wired(page), ("page %p is not wired", page));
+	KASSERT(!vm_page_busied(page), ("page %p is busy", page));
 
-	if (*mres != NULL) {
-		oldm = *mres;
-		vm_page_lock(oldm);
-		vm_page_free(oldm);
-		vm_page_unlock(oldm);
-		*mres = NULL;
-	}
-
-	vm_page_insert(page, object, pidx);
-	page->valid = VM_PAGE_BITS_ALL;
-	vm_page_xbusy(page);
+	vm_page_busy_acquire(page, 0);
+	vm_page_valid(page);
+	if (*mres != NULL)
+		vm_page_replace(page, object, pidx, *mres);
+	else
+		vm_page_insert(page, object, pidx);
 	*mres = page;
 	return (VM_PAGER_OK);
 }
@@ -1074,7 +1080,7 @@ mmap_gref(struct per_user_data *priv_user, struct gntdev_gref *gref_start,
 			break;
 
 		vm_page_insert(gref->page, mem_obj,
-		    UOFF_TO_IDX(gref->file_index));
+		    OFF_TO_IDX(gref->file_index));
 
 		count--;
 	}
@@ -1214,7 +1220,7 @@ gntdev_mmap_single(struct cdev *cdev, vm_ooffset_t *offset, vm_size_t size,
 	if (error != 0)
 		return (EINVAL);
 
-	count = UOFF_TO_IDX(size);
+	count = OFF_TO_IDX(size);
 
 	gref_start = gntdev_find_grefs(priv_user, *offset, count);
 	if (gref_start) {

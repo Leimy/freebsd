@@ -45,10 +45,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/endian.h>
 #include <sys/kdb.h>
 
-#include <machine/bus.h>
-#include <machine/resource.h>
-#include <sys/rman.h>
-
 #include <net/bpf.h>
 #include <net/if.h>
 #include <net/if_var.h>
@@ -84,7 +80,8 @@ __FBSDID("$FreeBSD$");
 #ifdef USB_DEBUG
 static int ural_debug = 0;
 
-static SYSCTL_NODE(_hw_usb, OID_AUTO, ural, CTLFLAG_RW, 0, "USB ural");
+static SYSCTL_NODE(_hw_usb, OID_AUTO, ural, CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
+    "USB ural");
 SYSCTL_INT(_hw_usb_ural, OID_AUTO, debug, CTLFLAG_RWTUN, &ural_debug, 0,
     "Debug level");
 #endif
@@ -360,9 +357,6 @@ static const struct {
 	{ 157, 0x08808, 0x0242d, 0x00281 },
 	{ 161, 0x08808, 0x0242f, 0x00281 }
 };
-
-static const uint8_t ural_chan_2ghz[] =
-	{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 
 static const uint8_t ural_chan_5ghz[] =
 	{ 36, 40, 44, 48, 52, 56, 60, 64,
@@ -858,6 +852,7 @@ ural_bulk_read_callback(struct usb_xfer *xfer, usb_error_t error)
 	struct ural_softc *sc = usbd_xfer_softc(xfer);
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211_node *ni;
+	struct epoch_tracker et;
 	struct mbuf *m = NULL;
 	struct usb_page_cache *pc;
 	uint32_t flags;
@@ -938,11 +933,13 @@ tr_setup:
 		if (m) {
 			ni = ieee80211_find_rxnode(ic,
 			    mtod(m, struct ieee80211_frame_min *));
+			NET_EPOCH_ENTER(et);
 			if (ni != NULL) {
 				(void) ieee80211_input(ni, m, rssi, nf);
 				ieee80211_free_node(ni);
 			} else
 				(void) ieee80211_input_all(ic, m, rssi, nf);
+			NET_EPOCH_EXIT(et);
 		}
 		RAL_LOCK(sc);
 		ural_start(sc);
@@ -1591,8 +1588,7 @@ ural_getradiocaps(struct ieee80211com *ic,
 	memset(bands, 0, sizeof(bands));
 	setbit(bands, IEEE80211_MODE_11B);
 	setbit(bands, IEEE80211_MODE_11G);
-	ieee80211_add_channel_list_2ghz(chans, maxchans, nchans,
-	    ural_chan_2ghz, nitems(ural_chan_2ghz), bands, 0);
+	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans, bands, 0);
 
 	if (sc->rf_rev == RAL_RF_5222) {
 		setbit(bands, IEEE80211_MODE_11A);

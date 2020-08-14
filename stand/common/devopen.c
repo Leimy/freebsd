@@ -32,6 +32,10 @@ __FBSDID("$FreeBSD$");
 
 #include "bootstrap.h"
 
+#ifdef LOADER_GELI_SUPPORT
+#include "geliboot.h"
+#endif
+
 int
 devopen(struct open_file *f, const char *fname, const char **file) 
 {
@@ -43,16 +47,27 @@ devopen(struct open_file *f, const char *fname, const char **file)
 		return (result);
 
 	/* point to device-specific data so that device open can use it */
+	f->f_dev = dev->d_dev;
 	f->f_devdata = dev;
 	result = dev->d_dev->dv_open(f, dev);
 	if (result != 0) {
 		f->f_devdata = NULL;
+		f->f_dev = NULL;
 		free(dev);
 		return (result);
 	}
 
-	/* reference the devsw entry from the open_file structure */
-	f->f_dev = dev->d_dev;
+#ifdef LOADER_GELI_SUPPORT
+	/*
+	 * If f->f_dev is geli-encrypted and we can decrypt it (will prompt for
+	 * pw if needed), this will attach the geli code to the open_file by
+	 * replacing f->f_dev and f_devdata with pointers to a geli_devdesc.
+	 */
+	if (f->f_dev->dv_type == DEVT_DISK) {
+		geli_probe_and_attach(f);
+	}
+#endif
+
 	return (0);
 }
 
@@ -60,8 +75,6 @@ int
 devclose(struct open_file *f)
 {
 
-	if (f->f_devdata != NULL) {
-		free(f->f_devdata);
-	}
+	free(f->f_devdata);
 	return (0);
 }

@@ -62,7 +62,6 @@ __FBSDID("$FreeBSD$");
 #include <net/if_dl.h>
 #include <net/if_types.h>
 #include <net/route.h>
-#include <net/iso88025.h>
 
 #include <netinet/in.h>
 #include <netinet/if_ether.h>
@@ -303,7 +302,6 @@ valid_type(int type)
 	case IFT_INFINIBAND:
 	case IFT_ISO88023:
 	case IFT_ISO88024:
-	case IFT_ISO88025:
 	case IFT_L2VLAN:
 	case IFT_BRIDGE:
 		return (1);
@@ -592,9 +590,7 @@ print_entry(struct sockaddr_dl *sdl,
 {
 	const char *host;
 	struct hostent *hp;
-	struct iso88025_sockaddr_dl_data *trld;
 	struct if_nameindex *p;
-	int seg;
 
 	if (ifnameindex == NULL)
 		if ((ifnameindex = if_nameindex()) == NULL)
@@ -631,8 +627,7 @@ print_entry(struct sockaddr_dl *sdl,
 	} else
 		xo_emit("{d:/(incomplete)}{en:incomplete/true}");
 
-	for (p = ifnameindex; p && ifnameindex->if_index &&
-	    ifnameindex->if_name; p++) {
+	for (p = ifnameindex; p && p->if_index && p->if_name; p++) {
 		if (p->if_index == sdl->sdl_index) {
 			xo_emit(" on {:interface/%s}", p->if_name);
 			break;
@@ -659,17 +654,6 @@ print_entry(struct sockaddr_dl *sdl,
 	case IFT_ETHER:
 		xo_emit(" [{:type/ethernet}]");
 		break;
-	case IFT_ISO88025:
-		xo_emit(" [{:type/token-ring}]");
-		trld = SDL_ISO88025(sdl);
-		if (trld->trld_rcf != 0) {
-			xo_emit(" rt=%x", ntohs(trld->trld_rcf));
-			for (seg = 0;
-			     seg < ((TR_RCF_RIFLEN(trld->trld_rcf) - 2 ) / 2);
-			     seg++)
-				xo_emit(":%x", ntohs(*(trld->trld_route[seg])));
-		}
-                break;
 	case IFT_FDDI:
 		xo_emit(" [{:type/fddi}]");
 		break;

@@ -66,9 +66,7 @@ options 	SC_DFLT_FONT    	# compile font in
 makeoptions	SC_DFLT_FONT=cp437
 
 device		md
-device		random			# Entropy device
 
-options 	INTRNG
 options 	PLATFORM
 
 # Flattened Device Tree

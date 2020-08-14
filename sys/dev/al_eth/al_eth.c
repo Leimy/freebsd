@@ -603,7 +603,7 @@ al_dma_free_coherent(bus_dma_tag_t tag, bus_dmamap_t map, void *vaddr)
 
 static void
 al_eth_mac_table_unicast_add(struct al_eth_adapter *adapter,
-    uint8_t idx, uint8_t *addr, uint8_t udma_mask)
+    uint8_t idx, uint8_t udma_mask)
 {
 	struct al_eth_fwd_mac_table_entry entry = { { 0 } };
 
@@ -1202,8 +1202,12 @@ al_eth_tx_csum(struct al_eth_ring *tx_ring, struct al_eth_tx_buffer *tx_info,
 	uint32_t mss = m->m_pkthdr.tso_segsz;
 	struct ether_vlan_header *eh;
 	uint16_t etype;
+#ifdef INET
 	struct ip *ip;
+#endif
+#ifdef INET6
 	struct ip6_hdr *ip6;
+#endif
 	struct tcphdr *th = NULL;
 	int	ehdrlen, ip_hlen = 0;
 	uint8_t	ipproto = 0;
@@ -1243,6 +1247,7 @@ al_eth_tx_csum(struct al_eth_ring *tx_ring, struct al_eth_tx_buffer *tx_info,
 		}
 
 		switch (etype) {
+#ifdef INET
 		case ETHERTYPE_IP:
 			ip = (struct ip *)(m->m_data + ehdrlen);
 			ip_hlen = ip->ip_hl << 2;
@@ -1256,6 +1261,8 @@ al_eth_tx_csum(struct al_eth_ring *tx_ring, struct al_eth_tx_buffer *tx_info,
 			else
 				hal_pkt->l4_proto_idx = AL_ETH_PROTO_ID_UDP;
 			break;
+#endif /* INET */
+#ifdef INET6
 		case ETHERTYPE_IPV6:
 			ip6 = (struct ip6_hdr *)(m->m_data + ehdrlen);
 			hal_pkt->l3_proto_idx = AL_ETH_PROTO_ID_IPv6;
@@ -1267,6 +1274,7 @@ al_eth_tx_csum(struct al_eth_ring *tx_ring, struct al_eth_tx_buffer *tx_info,
 			else
 				hal_pkt->l4_proto_idx = AL_ETH_PROTO_ID_UDP;
 			break;
+#endif /* INET6 */
 		default:
 			break;
 		}
@@ -1631,10 +1639,8 @@ al_eth_rx_recv_work(void *arg, int pending)
 			al_eth_rx_checksum(rx_ring->adapter, hal_pkt, mbuf);
 		}
 
-#if __FreeBSD_version >= 800000
 		mbuf->m_pkthdr.flowid = qid;
 		M_HASHTYPE_SET(mbuf, M_HASHTYPE_OPAQUE);
-#endif
 
 		/*
 		 * LRO is only for IP/TCP packets and TCP checksum of the packet
@@ -2504,7 +2510,7 @@ al_eth_setup_rx_resources(struct al_eth_adapter *adapter, unsigned int qid)
 		return (ENOMEM);
 
 	/* Allocate taskqueues */
-	TASK_INIT(&rx_ring->enqueue_task, 0, al_eth_rx_recv_work, rx_ring);
+	NET_TASK_INIT(&rx_ring->enqueue_task, 0, al_eth_rx_recv_work, rx_ring);
 	rx_ring->enqueue_tq = taskqueue_create_fast("al_rx_enque", M_NOWAIT,
 	    taskqueue_thread_enqueue, &rx_ring->enqueue_tq);
 	taskqueue_start_threads(&rx_ring->enqueue_tq, 1, PI_NET, "%s rxeq",
@@ -2868,6 +2874,30 @@ al_get_counter(struct ifnet *ifp, ift_counter cnt)
 	}
 }
 
+static u_int
+al_count_maddr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	unsigned char *mac;
+
+	mac = LLADDR(sdl);
+	/* default mc address inside mac address */
+	if (mac[3] != 0 && mac[4] != 0 && mac[5] != 1)
+		return (1);
+	else
+		return (0);
+}
+
+static u_int
+al_program_addr(void *arg, struct sockaddr_dl *sdl, u_int cnt)
+{
+	struct al_eth_adapter *adapter = arg;
+
+	al_eth_mac_table_unicast_add(adapter,
+	    AL_ETH_MAC_TABLE_UNICAST_IDX_BASE + 1 + cnt, 1);
+
+	return (1);
+}
+
 /*
  *  Unicast, Multicast and Promiscuous mode set
  *
@@ -2876,43 +2906,16 @@ al_get_counter(struct ifnet *ifp, ift_counter cnt)
  *  responsible for configuring the hardware for proper unicast, multicast,
  *  promiscuous mode, and all-multi behavior.
  */
-#define	MAX_NUM_MULTICAST_ADDRESSES 32
-#define	MAX_NUM_ADDRESSES           32
-
 static void
 al_eth_set_rx_mode(struct al_eth_adapter *adapter)
 {
 	struct ifnet *ifp = adapter->netdev;
-	struct ifmultiaddr *ifma; /* multicast addresses configured */
-	struct ifaddr *ifua; /* unicast address */
-	int mc = 0;
-	int uc = 0;
+	int mc, uc;
 	uint8_t i;
-	unsigned char *mac;
 
-	if_maddr_rlock(ifp);
-	TAILQ_FOREACH(ifma, &ifp->if_multiaddrs, ifma_link) {
-		if (ifma->ifma_addr->sa_family != AF_LINK)
-			continue;
-		if (mc == MAX_NUM_MULTICAST_ADDRESSES)
-			break;
-
-		mac = LLADDR((struct sockaddr_dl *) ifma->ifma_addr);
-		/* default mc address inside mac address */
-		if (mac[3] != 0 && mac[4] != 0 && mac[5] != 1)
-			mc++;
-	}
-	if_maddr_runlock(ifp);
-
-	if_addr_rlock(ifp);
-	TAILQ_FOREACH(ifua, &ifp->if_addrhead, ifa_link) {
-		if (ifua->ifa_addr->sa_family != AF_LINK)
-			continue;
-		if (uc == MAX_NUM_ADDRESSES)
-			break;
-		uc++;
-	}
-	if_addr_runlock(ifp);
+	/* XXXGL: why generic count won't work? */
+	mc = if_foreach_llmaddr(ifp, al_count_maddr, NULL);
+	uc = if_lladdr_count(ifp);
 
 	if ((ifp->if_flags & IFF_PROMISC) != 0) {
 		al_eth_mac_table_promiscuous_set(adapter, true);
@@ -2949,18 +2952,7 @@ al_eth_set_rx_mode(struct al_eth_adapter *adapter)
 			}
 
 			/* set new addresses */
-			i = AL_ETH_MAC_TABLE_UNICAST_IDX_BASE + 1;
-			if_addr_rlock(ifp);
-			TAILQ_FOREACH(ifua, &ifp->if_addrhead, ifa_link) {
-				if (ifua->ifa_addr->sa_family != AF_LINK) {
-					continue;
-				}
-				al_eth_mac_table_unicast_add(adapter, i,
-				    (unsigned char *)ifua->ifa_addr, 1);
-				i++;
-			}
-			if_addr_runlock(ifp);
-
+			if_foreach_lladdr(ifp, al_program_addr, adapter);
 		}
 		al_eth_mac_table_promiscuous_set(adapter, false);
 	}
@@ -2993,7 +2985,7 @@ al_eth_config_rx_fwd(struct al_eth_adapter *adapter)
 	 * MAC address and all broadcast. all the rest will be dropped.
 	 */
 	al_eth_mac_table_unicast_add(adapter, AL_ETH_MAC_TABLE_UNICAST_IDX_BASE,
-	    adapter->mac_addr, 1);
+	    1);
 	al_eth_mac_table_broadcast_add(adapter, AL_ETH_MAC_TABLE_BROADCAST_IDX, 1);
 	al_eth_mac_table_promiscuous_set(adapter, false);
 

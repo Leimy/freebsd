@@ -1,8 +1,7 @@
 /*-
  * SPDX-License-Identifier: BSD-2-Clause-FreeBSD
  *
- * Copyright (c) 2002-2003 M. Warner Losh.
- * All rights reserved.
+ * Copyright (c) 2002-2003 M. Warner Losh <imp@FreeBSD.org>
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -172,7 +171,8 @@ protected:
 	void sort_vector(std::vector<event_proc *> &);
 	void parse_one_file(const char *fn);
 	void parse_files_in_dir(const char *dirname);
-	void expand_one(const char *&src, std::string &dst);
+	void expand_one(const char *&src, std::string &dst, bool is_shell);
+	std::string shell_quote(const std::string &s);
 	bool is_id_char(char) const;
 	bool chop_var(char *&buffer, char *&lhs, char *&rhs) const;
 private:

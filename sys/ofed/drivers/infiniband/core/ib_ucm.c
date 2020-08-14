@@ -31,9 +31,10 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $FreeBSD$
  */
+
+#include <sys/cdefs.h>
+__FBSDID("$FreeBSD$");
 
 #include <linux/completion.h>
 #include <linux/fs.h>
@@ -1370,5 +1371,5 @@ static void __exit ib_ucm_cleanup(void)
 	idr_destroy(&ctx_id_table);
 }
 
-module_init_order(ib_ucm_init, SI_ORDER_THIRD);
-module_exit(ib_ucm_cleanup);
+module_init_order(ib_ucm_init, SI_ORDER_FIFTH);
+module_exit_order(ib_ucm_cleanup, SI_ORDER_FIFTH);

@@ -214,12 +214,6 @@ static driver_t oce_driver = {
 static devclass_t oce_devclass;
 
 
-DRIVER_MODULE(oce, pci, oce_driver, oce_devclass, 0, 0);
-MODULE_DEPEND(oce, pci, 1, 1, 1);
-MODULE_DEPEND(oce, ether, 1, 1, 1);
-MODULE_VERSION(oce, 1);
-
-
 /* global vars */
 const char component_revision[32] = {"///" COMPONENT_REVISION "///"};
 
@@ -241,6 +235,15 @@ static uint32_t supportedDevices[] =  {
 	(PCI_VENDOR_EMULEX << 16) | PCI_PRODUCT_XE201_VF,
 	(PCI_VENDOR_EMULEX << 16) | PCI_PRODUCT_SH
 };
+
+
+DRIVER_MODULE(oce, pci, oce_driver, oce_devclass, 0, 0);
+MODULE_PNP_INFO("W32:vendor/device", pci, oce, supportedDevices,
+    nitems(supportedDevices));
+MODULE_DEPEND(oce, pci, 1, 1, 1);
+MODULE_DEPEND(oce, ether, 1, 1, 1);
+MODULE_VERSION(oce, 1);
+
 
 POCE_SOFTC softc_head = NULL;
 POCE_SOFTC softc_tail = NULL;
@@ -472,6 +475,8 @@ oce_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 {
 	struct ifreq *ifr = (struct ifreq *)data;
 	POCE_SOFTC sc = ifp->if_softc;
+	struct ifi2creq i2c;
+	uint8_t	offset = 0;
 	int rc = 0;
 	uint32_t u;
 
@@ -534,6 +539,7 @@ oce_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 			
 			if (IFCAP_TSO & ifp->if_capenable &&
 			    !(IFCAP_TXCSUM & ifp->if_capenable)) {
+				u &= ~IFCAP_TSO;
 				ifp->if_capenable &= ~IFCAP_TSO;
 				ifp->if_hwassist &= ~CSUM_TSO;
 				if_printf(ifp,
@@ -583,7 +589,41 @@ oce_ioctl(struct ifnet *ifp, u_long command, caddr_t data)
 
 		break;
 
+	case SIOCGI2C:
+		rc = copyin(ifr_data_get_ptr(ifr), &i2c, sizeof(i2c));
+		if (rc)
+			break;
+
+		if (i2c.dev_addr == PAGE_NUM_A0) {
+			offset = i2c.offset;
+		} else if (i2c.dev_addr == PAGE_NUM_A2) {
+			offset = TRANSCEIVER_A0_SIZE + i2c.offset;
+		} else {
+			rc = EINVAL;
+			break;
+		}
+
+		if (i2c.len > sizeof(i2c.data) ||
+		    i2c.len + offset > sizeof(sfp_vpd_dump_buffer)) {
+			rc = EINVAL;
+			break;
+		}
+
+		rc = oce_mbox_read_transrecv_data(sc, i2c.dev_addr);
+		if (rc) {
+			rc = -rc;
+			break;
+		}
+
+		memcpy(&i2c.data[0], &sfp_vpd_dump_buffer[offset], i2c.len);
+
+		rc = copyout(&i2c, ifr_data_get_ptr(ifr), sizeof(i2c));
+		break;
+
 	case SIOCGPRIVATE_0:
+		rc = priv_check(curthread, PRIV_DRIVER);
+		if (rc != 0)
+			break;
 		rc = oce_handle_passthrough(ifp, data);
 		break;
 	default:
@@ -799,11 +839,13 @@ oce_fast_isr(void *arg)
 static int
 oce_alloc_intr(POCE_SOFTC sc, int vector, void (*isr) (void *arg, int pending))
 {
-	POCE_INTR_INFO ii = &sc->intrs[vector];
+	POCE_INTR_INFO ii;
 	int rc = 0, rr;
 
 	if (vector >= OCE_MAX_EQ)
 		return (EINVAL);
+
+	ii = &sc->intrs[vector];
 
 	/* Set the resource id for the interrupt.
 	 * MSIx is vector + 1 for the resource id,
@@ -1183,6 +1225,11 @@ retry:
 		 */
 		oce_is_pkt_dest_bmc(sc, m, &os2bmc, &m_new);
 
+		if_inc_counter(sc->ifp, IFCOUNTER_OBYTES, m->m_pkthdr.len);
+		if (m->m_flags & M_MCAST)
+			if_inc_counter(sc->ifp, IFCOUNTER_OMCASTS, 1);
+		ETHER_BPF_MTAP(sc->ifp, m);
+
 		OCE_WRITE_REG32(sc, db, wq->db_offset, reg_value);
 
 	} else if (rc == EFBIG)	{
@@ -1250,11 +1297,7 @@ oce_tx_restart(POCE_SOFTC sc, struct oce_wq *wq)
 	if ((sc->ifp->if_drv_flags & IFF_DRV_RUNNING) != IFF_DRV_RUNNING)
 		return;
 
-#if __FreeBSD_version >= 800000
 	if (!drbr_empty(sc->ifp, wq->br))
-#else
-	if (!IFQ_DRV_IS_EMPTY(&sc->ifp->if_snd))
-#endif
 		taskqueue_enqueue(taskqueue_swi, &wq->txtask);
 
 }
@@ -1337,7 +1380,6 @@ oce_tx_task(void *arg, int npending)
 	struct ifnet *ifp = sc->ifp;
 	int rc = 0;
 
-#if __FreeBSD_version >= 800000
 	LOCK(&wq->tx_lock);
 	rc = oce_multiq_transmit(ifp, NULL, wq);
 	if (rc) {
@@ -1345,10 +1387,6 @@ oce_tx_task(void *arg, int npending)
 				"TX[%d] restart failed\n", wq->queue_index);
 	}
 	UNLOCK(&wq->tx_lock);
-#else
-	oce_start(ifp);
-#endif
-
 }
 
 
@@ -1367,7 +1405,7 @@ oce_start(struct ifnet *ifp)
 	if (!sc->link_status)
 		return;
 	
-	do {
+	while (true) {
 		IF_DEQUEUE(&sc->ifp->if_snd, m);
 		if (m == NULL)
 			break;
@@ -1384,12 +1422,7 @@ oce_start(struct ifnet *ifp)
 			}
 			break;
 		}
-		if (m != NULL)
-			ETHER_BPF_MTAP(ifp, m);
-
-	} while (TRUE);
-
-	return;
+	}
 }
 
 
@@ -1467,10 +1500,6 @@ oce_multiq_transmit(struct ifnet *ifp, struct mbuf *m, struct oce_wq *wq)
 			break;
 		}
 		drbr_advance(ifp, br);
-		if_inc_counter(ifp, IFCOUNTER_OBYTES, next->m_pkthdr.len);
-		if (next->m_flags & M_MCAST)
-			if_inc_counter(ifp, IFCOUNTER_OMCASTS, 1);
-		ETHER_BPF_MTAP(ifp, next);
 	}
 
 	return 0;
@@ -1635,13 +1664,12 @@ oce_rx_lro(struct oce_rq *rq, struct nic_hwlro_singleton_cqe *cqe, struct nic_hw
 		}
 
 		m->m_pkthdr.rcvif = sc->ifp;
-#if __FreeBSD_version >= 800000
 		if (rq->queue_index)
 			m->m_pkthdr.flowid = (rq->queue_index - 1);
 		else
 			m->m_pkthdr.flowid = rq->queue_index;
 		M_HASHTYPE_SET(m, M_HASHTYPE_OPAQUE);
-#endif
+
 		/* This deternies if vlan tag is Valid */
 		if (cq_info.vtp) {
 			if (sc->function_mode & FNM_FLEX10_MODE) {
@@ -1713,13 +1741,12 @@ oce_rx(struct oce_rq *rq, struct oce_nic_rx_cqe *cqe)
 
 	if (m) {
 		m->m_pkthdr.rcvif = sc->ifp;
-#if __FreeBSD_version >= 800000
 		if (rq->queue_index)
 			m->m_pkthdr.flowid = (rq->queue_index - 1);
 		else
 			m->m_pkthdr.flowid = rq->queue_index;
 		M_HASHTYPE_SET(m, M_HASHTYPE_OPAQUE);
-#endif
+
 		/* This deternies if vlan tag is Valid */
 		if (oce_cqe_vtp_valid(sc, cqe)) { 
 			if (sc->function_mode & FNM_FLEX10_MODE) {
@@ -2141,10 +2168,8 @@ oce_attach_ifp(POCE_SOFTC sc)
 	sc->ifp->if_init = oce_init;
 	sc->ifp->if_mtu = ETHERMTU;
 	sc->ifp->if_softc = sc;
-#if __FreeBSD_version >= 800000
 	sc->ifp->if_transmit = oce_multiq_start;
 	sc->ifp->if_qflush = oce_multiq_flush;
-#endif
 
 	if_initname(sc->ifp,
 		    device_get_name(sc->dev), device_get_unit(sc->dev));
@@ -2170,11 +2195,9 @@ oce_attach_ifp(POCE_SOFTC sc)
 	sc->ifp->if_capenable = sc->ifp->if_capabilities;
 	sc->ifp->if_baudrate = IF_Gbps(10);
 
-#if __FreeBSD_version >= 1000000
 	sc->ifp->if_hw_tsomax = 65536 - (ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN);
 	sc->ifp->if_hw_tsomaxsegcount = OCE_MAX_TX_ELEMENTS;
 	sc->ifp->if_hw_tsomaxsegsize = 4096;
-#endif
 
 	ether_ifattach(sc->ifp, sc->macaddr.mac_addr);
 	
@@ -2276,7 +2299,7 @@ oce_handle_passthrough(struct ifnet *ifp, caddr_t data)
 	struct ifreq *ifr = (struct ifreq *)data;
 	int rc = ENXIO;
 	char cookie[32] = {0};
-	void *priv_data = (void *)ifr->ifr_data;
+	void *priv_data = ifr_data_get_ptr(ifr);
 	void *ioctl_ptr;
 	uint32_t req_size;
 	struct mbx_hdr req;
@@ -2357,10 +2380,20 @@ oce_eqd_set_periodic(POCE_SOFTC sc)
 			goto modify_eqd;
 		}
 
-		rq = sc->rq[i];
-		rxpkts = rq->rx_stats.rx_pkts;
-		wq = sc->wq[i];
-		tx_reqs = wq->tx_stats.tx_reqs;
+		if (i == 0) {
+			rq = sc->rq[0];
+			rxpkts = rq->rx_stats.rx_pkts;
+		} else
+			rxpkts = 0;
+		if (i + 1 < sc->nrqs) {
+			rq = sc->rq[i + 1];
+			rxpkts += rq->rx_stats.rx_pkts;
+		}
+		if (i < sc->nwqs) {
+			wq = sc->wq[i];
+			tx_reqs = wq->tx_stats.tx_reqs;
+		} else
+			tx_reqs = 0;
 		now = ticks;
 
 		if (!aic->ticks || now < aic->ticks ||

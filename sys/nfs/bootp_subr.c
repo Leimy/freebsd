@@ -68,9 +68,7 @@ __FBSDID("$FreeBSD$");
 #include <net/if.h>
 #include <net/if_var.h>
 #include <net/route.h>
-#ifdef BOOTP_DEBUG
-#include <net/route_var.h>
-#endif
+#include <net/route/route_ctl.h>
 
 #include <netinet/in.h>
 #include <netinet/in_var.h>
@@ -83,7 +81,6 @@ __FBSDID("$FreeBSD$");
 #include <nfs/nfsdiskless.h>
 #include <nfs/krpc.h>
 #include <nfs/xdr_subs.h>
-
 
 #define BOOTP_MIN_LEN		300	/* Minimum size of bootp udp packet */
 
@@ -264,10 +261,6 @@ static void bootpc_tag_helper(struct bootpc_tagcontext *tctx,
 		    unsigned char *start, int len, int tag);
 
 #ifdef BOOTP_DEBUG
-void bootpboot_p_sa(struct sockaddr *sa, struct sockaddr *ma);
-void bootpboot_p_rtentry(struct rtentry *rt);
-void bootpboot_p_tree(struct radix_node *rn);
-void bootpboot_p_rtlist(void);
 void bootpboot_p_if(struct ifnet *ifp, struct ifaddr *ifa);
 void bootpboot_p_iflist(void);
 #endif
@@ -301,94 +294,6 @@ static __inline int bootpc_ifctx_isfailed(struct bootpc_ifcontext *ifctx);
 
 #ifdef BOOTP_DEBUG
 void
-bootpboot_p_sa(struct sockaddr *sa, struct sockaddr *ma)
-{
-
-	if (sa == NULL) {
-		printf("(sockaddr *) <null>");
-		return;
-	}
-	switch (sa->sa_family) {
-	case AF_INET:
-	{
-		struct sockaddr_in *sin;
-
-		sin = (struct sockaddr_in *) sa;
-		printf("inet ");
-		print_sin_addr(sin);
-		if (ma != NULL) {
-			sin = (struct sockaddr_in *) ma;
-			printf(" mask ");
-			print_sin_addr(sin);
-		}
-	}
-	break;
-	case AF_LINK:
-	{
-		struct sockaddr_dl *sli;
-		int i;
-
-		sli = (struct sockaddr_dl *) sa;
-		printf("link %.*s ", sli->sdl_nlen, sli->sdl_data);
-		for (i = 0; i < sli->sdl_alen; i++) {
-			if (i > 0)
-				printf(":");
-			printf("%x", ((unsigned char *) LLADDR(sli))[i]);
-		}
-	}
-	break;
-	default:
-		printf("af%d", sa->sa_family);
-	}
-}
-
-void
-bootpboot_p_rtentry(struct rtentry *rt)
-{
-
-	bootpboot_p_sa(rt_key(rt), rt_mask(rt));
-	printf(" ");
-	bootpboot_p_sa(rt->rt_gateway, NULL);
-	printf(" ");
-	printf("flags %x", (unsigned short) rt->rt_flags);
-	printf(" %d", (int) rt->rt_expire);
-	printf(" %s\n", rt->rt_ifp->if_xname);
-}
-
-void
-bootpboot_p_tree(struct radix_node *rn)
-{
-
-	while (rn != NULL) {
-		if (rn->rn_bit < 0) {
-			if ((rn->rn_flags & RNF_ROOT) != 0) {
-			} else {
-				bootpboot_p_rtentry((struct rtentry *) rn);
-			}
-			rn = rn->rn_dupedkey;
-		} else {
-			bootpboot_p_tree(rn->rn_left);
-			bootpboot_p_tree(rn->rn_right);
-			return;
-		}
-	}
-}
-
-void
-bootpboot_p_rtlist(void)
-{
-	struct rib_head *rnh;
-
-	printf("Routing table:\n");
-	rnh = rt_tables_get_rnh(0, AF_INET);
-	if (rnh == NULL)
-		return;
-	RIB_RLOCK(rnh);	/* could sleep XXX */
-	bootpboot_p_tree(rnh->rnh_treetop);
-	RIB_RUNLOCK(rnh);
-}
-
-void
 bootpboot_p_if(struct ifnet *ifp, struct ifaddr *ifa)
 {
 
@@ -410,12 +315,12 @@ bootpboot_p_iflist(void)
 
 	printf("Interface list:\n");
 	IFNET_RLOCK();
-	for (ifp = TAILQ_FIRST(&V_ifnet);
+	for (ifp = CK_STAILQ_FIRST(&V_ifnet);
 	     ifp != NULL;
-	     ifp = TAILQ_NEXT(ifp, if_link)) {
-		for (ifa = TAILQ_FIRST(&ifp->if_addrhead);
+	     ifp = CK_STAILQ_NEXT(ifp, if_link)) {
+		for (ifa = CK_STAILQ_FIRST(&ifp->if_addrhead);
 		     ifa != NULL;
-		     ifa = TAILQ_NEXT(ifa, ifa_link))
+		     ifa = CK_STAILQ_NEXT(ifa, ifa_link))
 			if (ifa->ifa_addr->sa_family == AF_INET)
 				bootpboot_p_if(ifp, ifa);
 	}
@@ -1075,6 +980,8 @@ bootpc_add_default_route(struct bootpc_ifcontext *ifctx)
 	int error;
 	struct sockaddr_in defdst;
 	struct sockaddr_in defmask;
+	struct rt_addrinfo info;
+	struct rib_cmd_info rc;
 
 	if (ifctx->gw.sin_addr.s_addr == htonl(INADDR_ANY))
 		return;
@@ -1082,9 +989,14 @@ bootpc_add_default_route(struct bootpc_ifcontext *ifctx)
 	clear_sinaddr(&defdst);
 	clear_sinaddr(&defmask);
 
-	error = rtrequest_fib(RTM_ADD, (struct sockaddr *)&defdst,
-	    (struct sockaddr *) &ifctx->gw, (struct sockaddr *)&defmask,
-	    (RTF_UP | RTF_GATEWAY | RTF_STATIC), NULL, RT_DEFAULT_FIB);
+	bzero((caddr_t)&info, sizeof(info));
+	info.rti_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+	info.rti_info[RTAX_DST] = (struct sockaddr *)&defdst;
+	info.rti_info[RTAX_NETMASK] = (struct sockaddr *)&defmask;
+	info.rti_info[RTAX_GATEWAY] = (struct sockaddr *)&ifctx->gw;
+
+	error = rib_action(RT_DEFAULT_FIB, RTM_ADD, &info, &rc);
+
 	if (error != 0) {
 		printf("%s: RTM_ADD, error=%d\n", __func__, error);
 	}
@@ -1096,6 +1008,8 @@ bootpc_remove_default_route(struct bootpc_ifcontext *ifctx)
 	int error;
 	struct sockaddr_in defdst;
 	struct sockaddr_in defmask;
+	struct rt_addrinfo info;
+	struct rib_cmd_info rc;
 
 	if (ifctx->gw.sin_addr.s_addr == htonl(INADDR_ANY))
 		return;
@@ -1103,9 +1017,13 @@ bootpc_remove_default_route(struct bootpc_ifcontext *ifctx)
 	clear_sinaddr(&defdst);
 	clear_sinaddr(&defmask);
 
-	error = rtrequest_fib(RTM_DELETE, (struct sockaddr *)&defdst,
-	    (struct sockaddr *) &ifctx->gw, (struct sockaddr *)&defmask,
-	    (RTF_UP | RTF_GATEWAY | RTF_STATIC), NULL, RT_DEFAULT_FIB);
+	bzero((caddr_t)&info, sizeof(info));
+	info.rti_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+	info.rti_info[RTAX_DST] = (struct sockaddr *)&defdst;
+	info.rti_info[RTAX_NETMASK] = (struct sockaddr *)&defmask;
+	info.rti_info[RTAX_GATEWAY] = (struct sockaddr *)&ifctx->gw;
+
+	error = rib_action(RT_DEFAULT_FIB, RTM_DELETE, &info, &rc);
 	if (error != 0) {
 		printf("%s: RTM_DELETE, error=%d\n", __func__, error);
 	}
@@ -1638,15 +1556,13 @@ bootpc_init(void)
 	 */
 	ifcnt = 0;
 	IFNET_RLOCK();
-	TAILQ_FOREACH(ifp, &V_ifnet, if_link) {
+	CK_STAILQ_FOREACH(ifp, &V_ifnet, if_link) {
 		if ((ifp->if_flags &
 		     (IFF_LOOPBACK | IFF_POINTOPOINT | IFF_BROADCAST)) !=
 		    IFF_BROADCAST)
 			continue;
 		switch (ifp->if_alloctype) {
 			case IFT_ETHER:
-			case IFT_FDDI:
-			case IFT_ISO88025:
 				break;
 			default:
 				continue;
@@ -1663,7 +1579,7 @@ bootpc_init(void)
 retry:
 	ifctx = STAILQ_FIRST(&gctx->interfaces);
 	IFNET_RLOCK();
-	TAILQ_FOREACH(ifp, &V_ifnet, if_link) {
+	CK_STAILQ_FOREACH(ifp, &V_ifnet, if_link) {
 		if (ifctx == NULL)
 			break;
 #ifdef BOOTP_WIRED_TO
@@ -1676,8 +1592,6 @@ retry:
 			continue;
 		switch (ifp->if_alloctype) {
 			case IFT_ETHER:
-			case IFT_FDDI:
-			case IFT_ISO88025:
 				break;
 			default:
 				continue;
@@ -1689,7 +1603,7 @@ retry:
 
 		/* Get HW address */
 		sdl = NULL;
-		TAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link)
+		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link)
 			if (ifa->ifa_addr->sa_family == AF_LINK) {
 				sdl = (struct sockaddr_dl *)ifa->ifa_addr;
 				if (sdl->sdl_type == IFT_ETHER)
@@ -1764,14 +1678,17 @@ retry:
 		goto out;
 
 	if (gctx->gotrootpath != 0) {
+		struct epoch_tracker et;
 
 		kern_setenv("boot.netif.name", ifctx->ifp->if_xname);
 
+		NET_EPOCH_ENTER(et);
 		bootpc_add_default_route(ifctx);
 		error = md_mount(&nd->root_saddr, nd->root_hostnam,
 				 nd->root_fh, &nd->root_fhsize,
 				 &nd->root_args, td);
 		bootpc_remove_default_route(ifctx);
+		NET_EPOCH_EXIT(et);
 		if (error != 0) {
 			if (gctx->any_root_overrides == 0)
 				panic("nfs_boot: mount root, error=%d", error);

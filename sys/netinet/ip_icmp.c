@@ -52,6 +52,8 @@ __FBSDID("$FreeBSD$");
 #include <net/if_var.h>
 #include <net/if_types.h>
 #include <net/route.h>
+#include <net/route/route_ctl.h>
+#include <net/route/nhop.h>
 #include <net/vnet.h>
 
 #include <netinet/in.h>
@@ -69,6 +71,7 @@ __FBSDID("$FreeBSD$");
 #include <netinet/tcpip.h>
 #include <netinet/icmp_var.h>
 
+
 #ifdef INET
 
 #include <machine/in_cksum.h>
@@ -81,13 +84,13 @@ __FBSDID("$FreeBSD$");
  * routines to turnaround packets back to the originator, and
  * host table maintenance routines.
  */
-static VNET_DEFINE(int, icmplim) = 200;
+VNET_DEFINE_STATIC(int, icmplim) = 200;
 #define	V_icmplim			VNET(icmplim)
 SYSCTL_INT(_net_inet_icmp, ICMPCTL_ICMPLIM, icmplim, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmplim), 0,
 	"Maximum number of ICMP responses per second");
 
-static VNET_DEFINE(int, icmplim_output) = 1;
+VNET_DEFINE_STATIC(int, icmplim_output) = 1;
 #define	V_icmplim_output		VNET(icmplim_output)
 SYSCTL_INT(_net_inet_icmp, OID_AUTO, icmplim_output, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmplim_output), 0,
@@ -103,13 +106,13 @@ SYSCTL_VNET_PCPUSTAT(_net_inet_icmp, ICMPCTL_STATS, stats, struct icmpstat,
 VNET_PCPUSTAT_SYSUNINIT(icmpstat);
 #endif /* VIMAGE */
 
-static VNET_DEFINE(int, icmpmaskrepl) = 0;
+VNET_DEFINE_STATIC(int, icmpmaskrepl) = 0;
 #define	V_icmpmaskrepl			VNET(icmpmaskrepl)
 SYSCTL_INT(_net_inet_icmp, ICMPCTL_MASKREPL, maskrepl, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmpmaskrepl), 0,
 	"Reply to ICMP Address Mask Request packets");
 
-static VNET_DEFINE(u_int, icmpmaskfake) = 0;
+VNET_DEFINE_STATIC(u_int, icmpmaskfake) = 0;
 #define	V_icmpmaskfake			VNET(icmpmaskfake)
 SYSCTL_UINT(_net_inet_icmp, OID_AUTO, maskfake, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmpmaskfake), 0,
@@ -121,41 +124,53 @@ SYSCTL_INT(_net_inet_icmp, OID_AUTO, drop_redirect, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(drop_redirect), 0,
 	"Ignore ICMP redirects");
 
-static VNET_DEFINE(int, log_redirect) = 0;
+VNET_DEFINE_STATIC(int, log_redirect) = 0;
 #define	V_log_redirect			VNET(log_redirect)
 SYSCTL_INT(_net_inet_icmp, OID_AUTO, log_redirect, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(log_redirect), 0,
 	"Log ICMP redirects to the console");
 
-static VNET_DEFINE(char, reply_src[IFNAMSIZ]);
+VNET_DEFINE_STATIC(int, redirtimeout) = 60 * 10; /* 10 minutes */
+#define	V_redirtimeout			VNET(redirtimeout)
+SYSCTL_INT(_net_inet_icmp, OID_AUTO, redirtimeout, CTLFLAG_VNET | CTLFLAG_RW,
+	&VNET_NAME(redirtimeout), 0,
+	"Delay in seconds before expiring redirect route");
+
+VNET_DEFINE_STATIC(char, reply_src[IFNAMSIZ]);
 #define	V_reply_src			VNET(reply_src)
 SYSCTL_STRING(_net_inet_icmp, OID_AUTO, reply_src, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(reply_src), IFNAMSIZ,
 	"ICMP reply source for non-local packets");
 
-static VNET_DEFINE(int, icmp_rfi) = 0;
+VNET_DEFINE_STATIC(int, icmp_rfi) = 0;
 #define	V_icmp_rfi			VNET(icmp_rfi)
 SYSCTL_INT(_net_inet_icmp, OID_AUTO, reply_from_interface, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmp_rfi), 0,
 	"ICMP reply from incoming interface for non-local packets");
-
-static VNET_DEFINE(int, icmp_quotelen) = 8;
+/* Router requirements RFC 1812 section 4.3.2.3 requires 576 - 28. */
+VNET_DEFINE_STATIC(int, icmp_quotelen) = 548;
 #define	V_icmp_quotelen			VNET(icmp_quotelen)
 SYSCTL_INT(_net_inet_icmp, OID_AUTO, quotelen, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmp_quotelen), 0,
 	"Number of bytes from original packet to quote in ICMP reply");
 
-static VNET_DEFINE(int, icmpbmcastecho) = 0;
+VNET_DEFINE_STATIC(int, icmpbmcastecho) = 0;
 #define	V_icmpbmcastecho		VNET(icmpbmcastecho)
 SYSCTL_INT(_net_inet_icmp, OID_AUTO, bmcastecho, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmpbmcastecho), 0,
 	"Reply to multicast ICMP Echo Request and Timestamp packets");
 
-static VNET_DEFINE(int, icmptstamprepl) = 1;
+VNET_DEFINE_STATIC(int, icmptstamprepl) = 1;
 #define	V_icmptstamprepl		VNET(icmptstamprepl)
-SYSCTL_INT(_net_inet_icmp, OID_AUTO, tstamprepl, CTLFLAG_RW,
+SYSCTL_INT(_net_inet_icmp, OID_AUTO, tstamprepl, CTLFLAG_VNET | CTLFLAG_RW,
 	&VNET_NAME(icmptstamprepl), 0,
 	"Respond to ICMP Timestamp packets");
+
+VNET_DEFINE_STATIC(int, error_keeptags) = 0;
+#define	V_error_keeptags		VNET(error_keeptags)
+SYSCTL_INT(_net_inet_icmp, OID_AUTO, error_keeptags, CTLFLAG_VNET | CTLFLAG_RW,
+	&VNET_NAME(error_keeptags), 0,
+	"ICMP error response keeps copy of mbuf_tags of original packet");
 
 #ifdef ICMPPRINTFS
 int	icmpprintfs = 0;
@@ -163,6 +178,8 @@ int	icmpprintfs = 0;
 
 static void	icmp_reflect(struct mbuf *);
 static void	icmp_send(struct mbuf *, struct mbuf *);
+static int	icmp_verify_redirect_gateway(struct sockaddr_in *,
+    struct sockaddr_in *, struct sockaddr_in *, u_int);
 
 extern	struct protosw inetsw[];
 
@@ -257,6 +274,7 @@ icmp_error(struct mbuf *n, int type, int code, uint32_t dest, int mtu)
 		if (n->m_len < oiphlen + tcphlen &&
 		    (n = m_pullup(n, oiphlen + tcphlen)) == NULL)
 			goto freeit;
+		oip = mtod(n, struct ip *);
 		icmpelen = max(tcphlen, min(V_icmp_quotelen,
 		    ntohs(oip->ip_len) - oiphlen));
 	} else if (oip->ip_p == IPPROTO_SCTP) {
@@ -312,7 +330,8 @@ stdreply:	icmpelen = max(8, min(V_icmp_quotelen, ntohs(oip->ip_len) -
 #endif
 	icmplen = min(icmplen, M_TRAILINGSPACE(m) -
 	    sizeof(struct ip) - ICMP_MINLEN);
-	m_align(m, ICMP_MINLEN + icmplen);
+	m_align(m, sizeof(struct ip) + ICMP_MINLEN + icmplen);
+	m->m_data += sizeof(struct ip);
 	m->m_len = ICMP_MINLEN + icmplen;
 
 	/* XXX MRT  make the outgoing packet use the same FIB
@@ -354,6 +373,8 @@ stdreply:	icmpelen = max(8, min(V_icmp_quotelen, ntohs(oip->ip_len) -
 	 * reply should bypass as well.
 	 */
 	m->m_flags |= n->m_flags & M_SKIP_FIREWALL;
+	KASSERT(M_LEADINGSPACE(m) >= sizeof(struct ip),
+	    ("insufficient space for ip header"));
 	m->m_data -= sizeof(struct ip);
 	m->m_len += sizeof(struct ip);
 	m->m_pkthdr.len = m->m_len;
@@ -366,6 +387,10 @@ stdreply:	icmpelen = max(8, min(V_icmp_quotelen, ntohs(oip->ip_len) -
 	nip->ip_p = IPPROTO_ICMP;
 	nip->ip_tos = 0;
 	nip->ip_off = 0;
+
+	if (V_error_keeptags)
+		m_tag_copy_chain(m, n, M_NOWAIT);
+
 	icmp_reflect(m);
 
 freeit:
@@ -388,6 +413,8 @@ icmp_input(struct mbuf **mp, int *offp, int proto)
 	int i, code;
 	void (*ctlfunc)(int, struct sockaddr *, void *);
 	int fibnum;
+
+	NET_EPOCH_ASSERT();
 
 	*mp = NULL;
 
@@ -538,7 +565,7 @@ icmp_input(struct mbuf **mp, int *offp, int proto)
 		 * - The outer IP header has no options.
 		 * - The outer IP header, the ICMP header, the inner IP header,
 		 *   and the first n bytes of the inner payload are contiguous.
-		 *   n is at least 8, but might be larger based on 
+		 *   n is at least 8, but might be larger based on
 		 *   ICMP_ADVLENPREF. See its definition in ip_icmp.h.
 		 */
 		ctlfunc = inetsw[ip_protox[icp->icmp_ip.ip_p]].pr_ctlinput;
@@ -604,10 +631,8 @@ icmp_input(struct mbuf **mp, int *offp, int proto)
 			    (struct sockaddr *)&icmpdst, m->m_pkthdr.rcvif);
 		if (ia == NULL)
 			break;
-		if (ia->ia_ifp == NULL) {
-			ifa_free(&ia->ia_ifa);
+		if (ia->ia_ifp == NULL)
 			break;
-		}
 		icp->icmp_type = ICMP_MASKREPLY;
 		if (V_icmpmaskfake == 0)
 			icp->icmp_mask = ia->ia_sockmask.sin_addr.s_addr;
@@ -619,7 +644,6 @@ icmp_input(struct mbuf **mp, int *offp, int proto)
 			else if (ia->ia_ifp->if_flags & IFF_POINTOPOINT)
 			    ip->ip_src = satosin(&ia->ia_dstaddr)->sin_addr;
 		}
-		ifa_free(&ia->ia_ifa);
 reflect:
 		ICMPSTAT_INC(icps_reflect);
 		ICMPSTAT_INC(icps_outhist[icp->icmp_type]);
@@ -675,11 +699,31 @@ reflect:
 		}
 #endif
 		icmpsrc.sin_addr = icp->icmp_ip.ip_dst;
+
+		/*
+		 * RFC 1122 says network (code 0,2) redirects SHOULD
+		 * be treated identically to the host redirects.
+		 * Given that, ignore network masks.
+		 */
+
+		/*
+		 * Variable values:
+		 * icmpsrc: route destination
+		 * icmpdst: route gateway
+		 * icmpgw: message source
+		 */
+
+		if (icmp_verify_redirect_gateway(&icmpgw, &icmpsrc, &icmpdst,
+		    M_GETFIB(m)) != 0) {
+			/* TODO: increment bad redirects here */
+			break;
+		}
+
 		for ( fibnum = 0; fibnum < rt_numfibs; fibnum++) {
-			in_rtredirect((struct sockaddr *)&icmpsrc,
-			  (struct sockaddr *)&icmpdst,
-			  (struct sockaddr *)0, RTF_GATEWAY | RTF_HOST,
-			  (struct sockaddr *)&icmpgw, fibnum);
+			rib_add_redirect(fibnum, (struct sockaddr *)&icmpsrc,
+			    (struct sockaddr *)&icmpdst,
+			    (struct sockaddr *)&icmpgw, m->m_pkthdr.rcvif,
+			    RTF_GATEWAY, V_redirtimeout);
 		}
 		pfctlinput(PRC_REDIRECT_HOST, (struct sockaddr *)&icmpsrc);
 		break;
@@ -721,9 +765,11 @@ icmp_reflect(struct mbuf *m)
 	struct ifnet *ifp;
 	struct in_ifaddr *ia;
 	struct in_addr t;
-	struct nhop4_extended nh_ext;
+	struct nhop_object *nh;
 	struct mbuf *opts = NULL;
 	int optlen = (ip->ip_hl << 2) - sizeof(struct ip);
+
+	NET_EPOCH_ASSERT();
 
 	if (IN_MULTICAST(ntohl(ip->ip_src.s_addr)) ||
 	    IN_EXPERIMENTAL(ntohl(ip->ip_src.s_addr)) ||
@@ -759,19 +805,16 @@ icmp_reflect(struct mbuf *m)
 	 */
 	ifp = m->m_pkthdr.rcvif;
 	if (ifp != NULL && ifp->if_flags & IFF_BROADCAST) {
-		IF_ADDR_RLOCK(ifp);
-		TAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
+		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != AF_INET)
 				continue;
 			ia = ifatoia(ifa);
 			if (satosin(&ia->ia_broadaddr)->sin_addr.s_addr ==
 			    t.s_addr) {
 				t = IA_SIN(ia)->sin_addr;
-				IF_ADDR_RUNLOCK(ifp);
 				goto match;
 			}
 		}
-		IF_ADDR_RUNLOCK(ifp);
 	}
 	/*
 	 * If the packet was transiting through us, use the address of
@@ -780,16 +823,13 @@ icmp_reflect(struct mbuf *m)
 	 * criteria apply.
 	 */
 	if (V_icmp_rfi && ifp != NULL) {
-		IF_ADDR_RLOCK(ifp);
-		TAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
+		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != AF_INET)
 				continue;
 			ia = ifatoia(ifa);
 			t = IA_SIN(ia)->sin_addr;
-			IF_ADDR_RUNLOCK(ifp);
 			goto match;
 		}
-		IF_ADDR_RUNLOCK(ifp);
 	}
 	/*
 	 * If the incoming packet was not addressed directly to us, use
@@ -798,16 +838,13 @@ icmp_reflect(struct mbuf *m)
 	 * with normal source selection.
 	 */
 	if (V_reply_src[0] != '\0' && (ifp = ifunit(V_reply_src))) {
-		IF_ADDR_RLOCK(ifp);
-		TAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
+		CK_STAILQ_FOREACH(ifa, &ifp->if_addrhead, ifa_link) {
 			if (ifa->ifa_addr->sa_family != AF_INET)
 				continue;
 			ia = ifatoia(ifa);
 			t = IA_SIN(ia)->sin_addr;
-			IF_ADDR_RUNLOCK(ifp);
 			goto match;
 		}
-		IF_ADDR_RUNLOCK(ifp);
 	}
 	/*
 	 * If the packet was transiting through us, use the address of
@@ -815,12 +852,13 @@ icmp_reflect(struct mbuf *m)
 	 * When we don't have a route back to the packet source, stop here
 	 * and drop the packet.
 	 */
-	if (fib4_lookup_nh_ext(M_GETFIB(m), ip->ip_dst, 0, 0, &nh_ext) != 0) {
+	nh = fib4_lookup(M_GETFIB(m), ip->ip_dst, 0, NHR_NONE, 0);
+	if (nh == NULL) {
 		m_freem(m);
 		ICMPSTAT_INC(icps_noroute);
 		goto done;
 	}
-	t = nh_ext.nh_src;
+	t = IA_SIN(ifatoia(nh->nh_ifa))->sin_addr;
 match:
 #ifdef MAC
 	mac_netinet_icmp_replyinplace(m);
@@ -896,6 +934,59 @@ done:
 	if (opts)
 		(void)m_free(opts);
 }
+
+/*
+ * Verifies if redirect message is valid, according to RFC 1122
+ *
+ * @src: sockaddr with address of redirect originator
+ * @dst: sockaddr with destination in question
+ * @gateway: new proposed gateway
+ *
+ * Returns 0 on success.
+ */
+static int
+icmp_verify_redirect_gateway(struct sockaddr_in *src, struct sockaddr_in *dst,
+    struct sockaddr_in *gateway, u_int fibnum)
+{
+	struct nhop_object *nh;
+	struct ifaddr *ifa;
+
+	NET_EPOCH_ASSERT();
+
+	/* Verify the gateway is directly reachable. */
+	if ((ifa = ifa_ifwithnet((struct sockaddr *)gateway, 0, fibnum))==NULL)
+		return (ENETUNREACH);
+
+	/* TODO: fib-aware. */
+	if (ifa_ifwithaddr_check((struct sockaddr *)gateway))
+		return (EHOSTUNREACH);
+
+	nh = fib4_lookup(fibnum, dst->sin_addr, 0, NHR_NONE, 0);
+	if (nh == NULL)
+		return (EINVAL);
+
+	/*
+	 * If the redirect isn't from our current router for this dst,
+	 * it's either old or wrong.  If it redirects us to ourselves,
+	 * we have a routing loop, perhaps as a result of an interface
+	 * going down recently.
+	 */
+	if (!sa_equal((struct sockaddr *)src, &nh->gw_sa))
+		return (EINVAL);
+	if (nh->nh_ifa != ifa && ifa->ifa_addr->sa_family != AF_LINK)
+		return (EINVAL);
+
+	/* If host route already exists, ignore redirect. */
+	if (nh->nh_flags & NHF_HOST)
+		return (EEXIST);
+
+	/* If the prefix is directly reachable, ignore redirect. */
+	if (!(nh->nh_flags & NHF_GATEWAY))
+		return (EEXIST);
+
+	return (0);
+}
+
 
 /*
  * Send an icmp packet back to the ip level,
@@ -997,7 +1088,7 @@ struct icmp_rate {
 	const char *descr;
 	struct counter_rate cr;
 };
-static VNET_DEFINE(struct icmp_rate, icmp_rates[BANDLIM_MAX]) = {
+VNET_DEFINE_STATIC(struct icmp_rate, icmp_rates[BANDLIM_MAX]) = {
 	{ "icmp unreach response" },
 	{ "icmp ping response" },
 	{ "icmp tstamp response" },

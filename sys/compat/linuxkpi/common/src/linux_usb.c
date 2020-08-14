@@ -418,11 +418,11 @@ usb_submit_urb(struct urb *urb, uint16_t mem_flags)
 	}
 
 	/*
-         * Check to see if the urb is in the process of being killed
-         * and stop a urb that is in the process of being killed from
-         * being re-submitted (e.g. from its completion callback
-         * function).
-         */
+	 * Check to see if the urb is in the process of being killed
+	 * and stop a urb that is in the process of being killed from
+	 * being re-submitted (e.g. from its completion callback
+	 * function).
+	 */
 	if (urb->kill_count != 0) {
 		err = -EPERM;
 		goto done;
@@ -707,8 +707,6 @@ usb_control_msg(struct usb_device *dev, struct usb_host_endpoint *uhe,
 	 * 0xFFFF is a FreeBSD specific magic value.
 	 */
 	urb = usb_alloc_urb(0xFFFF, size);
-	if (urb == NULL)
-		return (-ENOMEM);
 
 	urb->dev = dev;
 	urb->endpoint = uhe;
@@ -1008,16 +1006,14 @@ usb_alloc_urb(uint16_t iso_packets, uint16_t mem_flags)
 	}
 
 	urb = malloc(size, M_USBDEV, M_WAITOK | M_ZERO);
-	if (urb) {
 
-		cv_init(&urb->cv_wait, "URBWAIT");
-		if (iso_packets == 0xFFFF) {
-			urb->setup_packet = (void *)(urb + 1);
-			urb->transfer_buffer = (void *)(urb->setup_packet +
-			    sizeof(struct usb_device_request));
-		} else {
-			urb->number_of_packets = iso_packets;
-		}
+	cv_init(&urb->cv_wait, "URBWAIT");
+	if (iso_packets == 0xFFFF) {
+		urb->setup_packet = (void *)(urb + 1);
+		urb->transfer_buffer = (void *)(urb->setup_packet +
+		    sizeof(struct usb_device_request));
+	} else {
+		urb->number_of_packets = iso_packets;
 	}
 	return (urb);
 }
@@ -1593,9 +1589,9 @@ tr_setup:
 		if (xfer->flags_int.control_xfr) {
 
 			/*
-		         * USB control transfers need special handling.
-		         * First copy in the header, then copy in data!
-		         */
+			 * USB control transfers need special handling.
+			 * First copy in the header, then copy in data!
+			 */
 			if (!xfer->flags.ext_buffer) {
 				usbd_copy_in(xfer->frbuffers, 0,
 				    urb->setup_packet, REQ_SIZE);
@@ -1722,10 +1718,8 @@ usb_bulk_msg(struct usb_device *udev, struct usb_host_endpoint *uhe,
 		return (err);
 
 	urb = usb_alloc_urb(0, 0);
-	if (urb == NULL)
-		return (-ENOMEM);
 
-        usb_fill_bulk_urb(urb, udev, uhe, data, len,
+	usb_fill_bulk_urb(urb, udev, uhe, data, len,
 	    usb_linux_wait_complete, NULL);
 
 	err = usb_start_wait_urb(urb, timeout, pactlen);

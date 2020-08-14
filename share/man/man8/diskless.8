@@ -26,7 +26,7 @@
 .\"
 .\" $FreeBSD$
 .\"
-.Dd March 6, 2018
+.Dd May 3, 2020
 .Dt DISKLESS 8
 .Os
 .Sh NAME
@@ -124,7 +124,7 @@ the
 .Nm
 machine, which may not be what you want to have happen.
 .Bd -literal -offset indent
-cd /usr/src/stand/i386
+cd /usr/src/stand
 make clean; make; make install
 cp /boot/pxeboot /tftpdir/
 .Ed
@@ -453,6 +453,11 @@ Be warned that using unencrypted
 to mount root and user
 partitions may expose information such as
 encryption keys.
+.Sh HISTORY
+The
+.Nm
+environment first appeared in
+.Fx 2.2.5 .
 .Sh SEE ALSO
 .Xr ethers 5 ,
 .Xr exports 5 ,

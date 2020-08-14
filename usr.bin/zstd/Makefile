@@ -1,10 +1,14 @@
 # $FreeBSD$
 
 PROG=	zstd
-SRCS=	bench.c \
+SRCS=	\
+	benchfn.c \
+	benchzstd.c \
 	datagen.c \
 	dibio.c \
 	fileio.c \
+	timefn.c \
+	util.c \
 	zstdcli.c
 
 CFLAGS+=	-I${SRCTOP}/sys/contrib/zstd/programs \
@@ -15,7 +19,6 @@ CFLAGS+=	-I${SRCTOP}/sys/contrib/zstd/programs \
 		-DXXH_NAMESPACE=ZSTD_ \
 		-DHAVE_THREAD=1 \
 		-DZSTD_MULTITHREAD=1
-SCRIPTS=	zstdgrep
 LINKS=	${BINDIR}/zstd ${BINDIR}/unzstd \
 	${BINDIR}/zstd ${BINDIR}/zstdcat \
 	${BINDIR}/zstd ${BINDIR}/zstdmt

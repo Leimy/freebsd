@@ -28,7 +28,7 @@
  * SUCH DAMAGE.
  */
 
-#include "assym.s"
+#include "assym.inc"
 #include <sys/syscall.h>
 #include <machine/asm.h>
 #include <machine/asmacros.h>
@@ -38,7 +38,7 @@
 
 __FBSDID("$FreeBSD$");
 
-/* We map 64MB of kernel unless overridden in assym.s by the kernel option. */
+/* We map 64MB of kernel unless overridden in assym.inc by the kernel option. */
 #ifndef LOCORE_MAP_MB
 #define	LOCORE_MAP_MB	64
 #endif
@@ -58,6 +58,9 @@ __FBSDID("$FreeBSD$");
 
 	.text
 	.align	2
+
+	.globl kernbase
+	.set kernbase,KERNVIRTADDR
 
 #if __ARM_ARCH >= 7
 #define	HANDLE_HYP							\

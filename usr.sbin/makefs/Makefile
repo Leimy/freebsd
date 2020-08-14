@@ -8,8 +8,10 @@ PROG=	makefs
 
 CFLAGS+=-I${SRCDIR}
 
-SRCS=	cd9660.c ffs.c \
+SRCS=	cd9660.c \
+	ffs.c \
 	makefs.c \
+	msdos.c \
 	mtree.c \
 	walk.c
 MAN=	makefs.8
@@ -18,6 +20,7 @@ WARNS?=	2
 
 .include "${SRCDIR}/cd9660/Makefile.inc"
 .include "${SRCDIR}/ffs/Makefile.inc"
+.include "${SRCDIR}/msdos/Makefile.inc"
 
 CFLAGS+=-DHAVE_STRUCT_STAT_ST_FLAGS=1
 
@@ -28,9 +31,6 @@ SRCS+=	getid.c misc.c spec.c
 .PATH: ${SRCTOP}/contrib/mknod
 CFLAGS+=-I${SRCTOP}/contrib/mknod
 SRCS+=	pack_dev.c
-
-.PATH:	${SRCTOP}/sys/ufs/ffs
-SRCS+=	ffs_tables.c
 
 CFLAGS+=	-I${SRCTOP}/lib/libnetbsd
 LIBADD=		netbsd util sbuf

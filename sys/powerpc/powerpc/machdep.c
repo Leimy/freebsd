@@ -57,7 +57,6 @@
 #include <sys/cdefs.h>
 __FBSDID("$FreeBSD$");
 
-#include "opt_compat.h"
 #include "opt_ddb.h"
 #include "opt_kstack_pages.h"
 #include "opt_platform.h"
@@ -101,6 +100,7 @@ __FBSDID("$FreeBSD$");
 #include <vm/vm_extern.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_page.h>
+#include <vm/vm_phys.h>
 #include <vm/vm_map.h>
 #include <vm/vm_object.h>
 #include <vm/vm_pager.h>
@@ -113,6 +113,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/elf.h>
 #include <machine/fpu.h>
 #include <machine/hid.h>
+#include <machine/ifunc.h>
 #include <machine/kdb.h>
 #include <machine/md_var.h>
 #include <machine/metadata.h>
@@ -138,9 +139,13 @@ int cacheline_size = 32;
 #endif
 int hw_direct_map = 1;
 
+#ifdef BOOKE
+extern vm_paddr_t kernload;
+#endif
+
 extern void *ap_pcpu;
 
-struct pcpu __pcpu[MAXCPU];
+struct pcpu __pcpu[MAXCPU] __aligned(PAGE_SIZE);
 static char init_kenv[2048];
 
 static struct trapframe frame0;
@@ -156,6 +161,8 @@ SYSCTL_INT(_machdep, CPU_CACHELINE, cacheline_size,
 
 uintptr_t	powerpc_init(vm_offset_t, vm_offset_t, vm_offset_t, void *,
 		    uint32_t);
+
+static void	fake_preload_metadata(void);
 
 long		Maxmem = 0;
 long		realmem = 0;
@@ -242,6 +249,10 @@ void aim_early_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry,
 void aim_cpu_init(vm_offset_t toc);
 void booke_cpu_init(void);
 
+#ifdef DDB
+static void	load_external_symtab(void);
+#endif
+
 uintptr_t
 powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
     uint32_t mdp_cookie)
@@ -250,10 +261,13 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	struct cpuref	bsp;
 	vm_offset_t	startkernel, endkernel;
 	char		*env;
+	void		*kmdp = NULL;
         bool		ofw_bootargs = false;
+	bool		symbols_provided = false;
 #ifdef DDB
 	vm_offset_t ksym_start;
 	vm_offset_t ksym_end;
+	vm_offset_t ksym_sz;
 #endif
 
 	/* First guess at start/end kernel positions */
@@ -276,9 +290,20 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	bzero(__bss_start, _end - __bss_start);
 #endif
 
+	cpu_feature_setup();
+
 #ifdef AIM
 	aim_early_init(fdt, toc, ofentry, mdp, mdp_cookie);
 #endif
+
+	/*
+	 * At this point, we are executing in our correct memory space.
+	 * Book-E started there, and AIM has done an rfi and restarted
+	 * execution from _start.
+	 *
+	 * We may still be in real mode, however. If we are running out of
+	 * the direct map on 64 bit, this is possible to do.
+	 */
 
 	/*
 	 * Parse metadata if present and fetch parameters.  Must be done
@@ -286,18 +311,26 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	 * boothowto.
 	 */
 	if (mdp != NULL) {
-		void *kmdp = NULL;
+		/*
+		 * Starting up from loader.
+		 *
+		 * Full metadata has been provided, but we need to figure
+		 * out the correct address to relocate it to.
+		 */
 		char *envp = NULL;
 		uintptr_t md_offset = 0;
-		vm_paddr_t kernelendphys;
+		vm_paddr_t kernelstartphys, kernelendphys;
 
 #ifdef AIM
 		if ((uintptr_t)&powerpc_init > DMAP_BASE_ADDRESS)
 			md_offset = DMAP_BASE_ADDRESS;
+#else /* BOOKE */
+		md_offset = VM_MIN_KERNEL_ADDRESS - kernload;
 #endif
 
 		preload_metadata = mdp;
 		if (md_offset > 0) {
+			/* Translate phys offset into DMAP offset. */
 			preload_metadata += md_offset;
 			preload_bootstrap_relocate(md_offset);
 		}
@@ -308,6 +341,14 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 			if (envp != NULL)
 				envp += md_offset;
 			init_static_kenv(envp, 0);
+			if (fdt == 0) {
+				fdt = MD_FETCH(kmdp, MODINFOMD_DTBP, uintptr_t);
+				if (fdt != 0)
+					fdt += md_offset;
+			}
+			kernelstartphys = MD_FETCH(kmdp, MODINFO_ADDR,
+			    vm_offset_t);
+			/* kernelstartphys is already relocated. */
 			kernelendphys = MD_FETCH(kmdp, MODINFOMD_KERNEND,
 			    vm_offset_t);
 			if (kernelendphys != 0)
@@ -316,13 +357,27 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 #ifdef DDB
 			ksym_start = MD_FETCH(kmdp, MODINFOMD_SSYM, uintptr_t);
 			ksym_end = MD_FETCH(kmdp, MODINFOMD_ESYM, uintptr_t);
-			db_fetch_ksymtab(ksym_start, ksym_end);
+			ksym_sz = *(Elf_Size*)ksym_start;
+
+			db_fetch_ksymtab(ksym_start, ksym_end, md_offset);
+			/* Symbols provided by loader. */
+			symbols_provided = true;
 #endif
 		}
 	} else {
+		/*
+		 * Self-loading kernel, we have to fake up metadata.
+		 *
+		 * Since we are creating the metadata from the final
+		 * memory space, we don't need to call
+		 * preload_boostrap_relocate().
+		 */
+		fake_preload_metadata();
+		kmdp = preload_search_by_type("elf kernel");
 		init_static_kenv(init_kenv, sizeof(init_kenv));
 		ofw_bootargs = true;
 	}
+
 	/* Store boot environment state */
 	OF_initial_setup((void *)fdt, NULL, (int (*)(void *))ofentry);
 
@@ -351,6 +406,11 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	 * Install the OF client interface
 	 */
 	OF_bootstrap();
+
+#ifdef DDB
+	if (!symbols_provided && hw_direct_map)
+		load_external_symtab();
+#endif
 
 	if (ofw_bootargs)
 		ofw_parse_bootargs();
@@ -382,12 +442,12 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	if (platform_smp_get_bsp(&bsp) != 0)
 		bsp.cr_cpuid = 0;
 	pc = &__pcpu[bsp.cr_cpuid];
+	__asm __volatile("mtsprg 0, %0" :: "r"(pc));
 	pcpu_init(pc, bsp.cr_cpuid, sizeof(struct pcpu));
 	pc->pc_curthread = &thread0;
 	thread0.td_oncpu = bsp.cr_cpuid;
 	pc->pc_cpuid = bsp.cr_cpuid;
 	pc->pc_hwref = bsp.cr_hwref;
-	__asm __volatile("mtsprg 0, %0" :: "r"(pc));
 
 	/*
 	 * Init KDB
@@ -397,6 +457,8 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 	/*
 	 * Bring up MMU
 	 */
+	pmap_mmu_init();
+	link_elf_ireloc(kmdp);
 	pmap_bootstrap(startkernel, endkernel);
 	mtmsr(psl_kernset & ~PSL_EE);
 
@@ -434,6 +496,186 @@ powerpc_init(vm_offset_t fdt, vm_offset_t toc, vm_offset_t ofentry, void *mdp,
 
 	return (((uintptr_t)thread0.td_pcb -
 	    (sizeof(struct callframe) - 3*sizeof(register_t))) & ~15UL);
+}
+
+#ifdef DDB
+/*
+ * On powernv and some booke systems, we might not have symbols loaded via
+ * loader. However, if the user passed the kernel in as the initrd as well,
+ * we can manually load it via reinterpreting the initrd copy of the kernel.
+ *
+ * In the BOOKE case, we don't actually have a DMAP yet, so we have to use
+ * temporary maps to inspect the memory, but write DMAP addresses to the
+ * configuration variables.
+ */
+static void
+load_external_symtab(void) {
+	phandle_t chosen;
+	vm_paddr_t start, end;
+	pcell_t cell[2];
+	ssize_t size;
+	u_char *kernelimg;		/* Temporary map */
+	u_char *kernelimg_final;	/* Final location */
+
+	int i;
+
+	Elf_Ehdr *ehdr;
+	Elf_Phdr *phdr;
+	Elf_Shdr *shdr;
+
+	vm_offset_t ksym_start, ksym_sz, kstr_start, kstr_sz,
+	    ksym_start_final, kstr_start_final;
+
+	if (!hw_direct_map)
+		return;
+
+	chosen = OF_finddevice("/chosen");
+	if (chosen <= 0)
+		return;
+
+	if (!OF_hasprop(chosen, "linux,initrd-start") ||
+	    !OF_hasprop(chosen, "linux,initrd-end"))
+		return;
+
+	size = OF_getencprop(chosen, "linux,initrd-start", cell, sizeof(cell));
+	if (size == 4)
+		start = cell[0];
+	else if (size == 8)
+		start = (uint64_t)cell[0] << 32 | cell[1];
+	else
+		return;
+
+	size = OF_getencprop(chosen, "linux,initrd-end", cell, sizeof(cell));
+	if (size == 4)
+		end = cell[0];
+	else if (size == 8)
+		end = (uint64_t)cell[0] << 32 | cell[1];
+	else
+		return;
+
+	if (!(end - start > 0))
+		return;
+
+	kernelimg_final = (u_char *) PHYS_TO_DMAP(start);
+#ifdef	AIM
+	kernelimg = kernelimg_final;
+#else	/* BOOKE */
+	kernelimg = (u_char *)pmap_early_io_map(start, PAGE_SIZE);
+#endif
+	ehdr = (Elf_Ehdr *)kernelimg;
+
+	if (!IS_ELF(*ehdr)) {
+#ifdef	BOOKE
+		pmap_early_io_unmap(start, PAGE_SIZE);
+#endif
+		return;
+	}
+
+#ifdef	BOOKE
+	pmap_early_io_unmap(start, PAGE_SIZE);
+	kernelimg = (u_char *)pmap_early_io_map(start, (end - start));
+#endif
+
+	phdr = (Elf_Phdr *)(kernelimg + ehdr->e_phoff);
+	shdr = (Elf_Shdr *)(kernelimg + ehdr->e_shoff);
+
+	ksym_start = 0;
+	ksym_sz = 0;
+	ksym_start_final = 0;
+	kstr_start = 0;
+	kstr_sz = 0;
+	kstr_start_final = 0;
+	for (i = 0; i < ehdr->e_shnum; i++) {
+		if (shdr[i].sh_type == SHT_SYMTAB) {
+			ksym_start = (vm_offset_t)(kernelimg +
+			    shdr[i].sh_offset);
+			ksym_start_final = (vm_offset_t)
+			    (kernelimg_final + shdr[i].sh_offset);
+			ksym_sz = (vm_offset_t)(shdr[i].sh_size);
+			kstr_start = (vm_offset_t)(kernelimg +
+			    shdr[shdr[i].sh_link].sh_offset);
+			kstr_start_final = (vm_offset_t)
+			    (kernelimg_final +
+			    shdr[shdr[i].sh_link].sh_offset);
+
+			kstr_sz = (vm_offset_t)
+			    (shdr[shdr[i].sh_link].sh_size);
+		}
+	}
+
+	if (ksym_start != 0 && kstr_start != 0 && ksym_sz != 0 &&
+	    kstr_sz != 0 && ksym_start < kstr_start) {
+		/*
+		 * We can't use db_fetch_ksymtab() here, because we need to
+		 * feed in DMAP addresses that are not mapped yet on booke.
+		 *
+		 * Write the variables directly, where db_init() will pick
+		 * them up later, after the DMAP is up.
+		 */
+		ksymtab = ksym_start_final;
+		ksymtab_size = ksym_sz;
+		kstrtab = kstr_start_final;
+		ksymtab_relbase = (__startkernel - KERNBASE);
+	}
+
+#ifdef	BOOKE
+	pmap_early_io_unmap(start, (end - start));
+#endif
+
+};
+#endif
+
+/*
+ * When not being loaded from loader, we need to create our own metadata
+ * so we can interact with the kernel linker.
+ */
+static void
+fake_preload_metadata(void) {
+	/* We depend on dword alignment here. */
+	static uint32_t fake_preload[36] __aligned(8);
+	int i = 0;
+
+	fake_preload[i++] = MODINFO_NAME;
+	fake_preload[i++] = strlen("kernel") + 1;
+	strcpy((char*)&fake_preload[i], "kernel");
+	/* ['k' 'e' 'r' 'n'] ['e' 'l' '\0' ..] */
+	i += 2;
+
+	fake_preload[i++] = MODINFO_TYPE;
+	fake_preload[i++] = strlen("elf kernel") + 1;
+	strcpy((char*)&fake_preload[i], "elf kernel");
+	/* ['e' 'l' 'f' ' '] ['k' 'e' 'r' 'n'] ['e' 'l' '\0' ..] */
+	i += 3;
+
+#ifdef __powerpc64__
+	/* Padding -- Fields start on u_long boundaries */
+	fake_preload[i++] = 0;
+#endif
+
+	fake_preload[i++] = MODINFO_ADDR;
+	fake_preload[i++] = sizeof(vm_offset_t);
+	*(vm_offset_t *)&fake_preload[i] =
+	    (vm_offset_t)(__startkernel);
+	i += (sizeof(vm_offset_t) / 4);
+
+	fake_preload[i++] = MODINFO_SIZE;
+	fake_preload[i++] = sizeof(vm_offset_t);
+	*(vm_offset_t *)&fake_preload[i] =
+	    (vm_offset_t)(__endkernel) - (vm_offset_t)(__startkernel);
+	i += (sizeof(vm_offset_t) / 4);
+
+	/*
+	 * MODINFOMD_SSYM and MODINFOMD_ESYM cannot be provided here,
+	 * as the memory comes from outside the loaded ELF sections.
+	 *
+	 * If the symbols are being provided by other means (MFS), the
+	 * tables will be loaded into the debugger directly.
+	 */
+
+	/* Null field at end to mark end of data. */
+	fake_preload[i++] = 0;
+	fake_preload[i] = 0;
+	preload_metadata = (void*)fake_preload;
 }
 
 /*
@@ -482,13 +724,13 @@ spinlock_enter(void)
 
 	td = curthread;
 	if (td->td_md.md_spinlock_count == 0) {
-		__asm __volatile("or 2,2,2"); /* Set high thread priority */
+		nop_prio_mhigh();
 		msr = intr_disable();
 		td->td_md.md_spinlock_count = 1;
 		td->td_md.md_saved_msr = msr;
+		critical_enter();
 	} else
 		td->td_md.md_spinlock_count++;
-	critical_enter();
 }
 
 void
@@ -498,12 +740,12 @@ spinlock_exit(void)
 	register_t msr;
 
 	td = curthread;
-	critical_exit();
 	msr = td->td_md.md_saved_msr;
 	td->td_md.md_spinlock_count--;
 	if (td->td_md.md_spinlock_count == 0) {
+		critical_exit();
 		intr_restore(msr);
-		__asm __volatile("or 6,6,6"); /* Set normal thread priority */
+		nop_prio_medium();
 	}
 }
 
@@ -529,12 +771,64 @@ DB_SHOW_COMMAND(spr, db_show_spr)
 	saved_sprno = sprno = (intptr_t) addr;
 	sprno = ((sprno & 0x3e0) >> 5) | ((sprno & 0x1f) << 5);
 	p = (uint32_t *)(void *)&get_spr;
+#ifdef __powerpc64__
+#if defined(_CALL_ELF) && _CALL_ELF == 2
+	/* Account for ELFv2 function prologue. */
+	p += 2;
+#else
+	p = *(volatile uint32_t * volatile *)p;
+#endif
+#endif
 	*p = (*p & ~0x001ff800) | (sprno << 11);
-	__syncicache(get_spr, cacheline_size);
+	__syncicache(__DEVOLATILE(uint32_t *, p), cacheline_size);
 	spr = get_spr(sprno);
 
 	db_printf("SPR %d(%x): %lx\n", saved_sprno, saved_sprno,
 	    (unsigned long)spr);
+}
+
+DB_SHOW_COMMAND(frame, db_show_frame)
+{
+	struct trapframe *tf;
+	long reg;
+	int i;
+
+	tf = have_addr ? (struct trapframe *)addr : curthread->td_frame;
+
+	/*
+	 * Everything casts through long to simplify the printing.
+	 * 'long' is native register size anyway.
+	 */
+	db_printf("trap frame %p\n", tf);
+	for (i = 0; i < nitems(tf->fixreg); i++) {
+		reg = tf->fixreg[i];
+		db_printf("  r%d:\t%#lx (%ld)\n", i, reg, reg);
+	}
+	reg = tf->lr;
+	db_printf("  lr:\t%#lx\n", reg);
+	reg = tf->cr;
+	db_printf("  cr:\t%#lx\n", reg);
+	reg = tf->xer;
+	db_printf("  xer:\t%#lx\n", reg);
+	reg = tf->ctr;
+	db_printf("  ctr:\t%#lx (%ld)\n", reg, reg);
+	reg = tf->srr0;
+	db_printf("  srr0:\t%#lx\n", reg);
+	reg = tf->srr1;
+	db_printf("  srr1:\t%#lx\n", reg);
+	reg = tf->exc;
+	db_printf("  exc:\t%#lx\n", reg);
+	reg = tf->dar;
+	db_printf("  dar:\t%#lx\n", reg);
+#ifdef AIM
+	reg = tf->cpu.aim.dsisr;
+	db_printf("  dsisr:\t%#lx\n", reg);
+#else
+	reg = tf->cpu.booke.esr;
+	db_printf("  esr:\t%#lx\n", reg);
+	reg = tf->cpu.booke.dbcr0;
+	db_printf("  dbcr0:\t%#lx\n", reg);
+#endif
 }
 #endif
 
@@ -575,3 +869,16 @@ bzero(void *buf, size_t len)
 		len--;
 	}
 }
+
+/* __stack_chk_fail_local() is called in secure-plt (32-bit). */
+#if !defined(__powerpc64__)
+extern void __stack_chk_fail(void);
+void __stack_chk_fail_local(void);
+
+void
+__stack_chk_fail_local(void)
+{
+
+	__stack_chk_fail();
+}
+#endif

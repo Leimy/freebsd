@@ -48,6 +48,7 @@
 #include <sys/mouse.h>
 #include <sys/terminal.h>
 #include <sys/sysctl.h>
+#include <sys/font.h>
 
 #include "opt_syscons.h"
 #include "opt_splash.h"
@@ -93,7 +94,7 @@ struct vt_driver;
 void vt_allocate(const struct vt_driver *, void *);
 void vt_deallocate(const struct vt_driver *, void *);
 
-typedef unsigned int 	vt_axis_t;
+typedef unsigned int	vt_axis_t;
 
 /*
  * List of locks
@@ -156,11 +157,15 @@ struct vt_device {
 #define	VDF_INITIALIZED	0x20	/* vtterm_cnprobe already done. */
 #define	VDF_MOUSECURSOR	0x40	/* Mouse cursor visible. */
 #define	VDF_QUIET_BELL	0x80	/* Disable bell. */
+#define	VDF_SUSPENDED	0x100	/* Device has been suspended. */
 #define	VDF_DOWNGRADE	0x8000	/* The driver is being downgraded. */
-	int			 vd_keyboard;	/* (G) Keyboard index. */
+	struct keyboard		*vd_keyboard;	/* (G) Keyboard. */
 	unsigned int		 vd_kbstate;	/* (?) Device unit. */
 	unsigned int		 vd_unit;	/* (c) Device unit. */
 	int			 vd_altbrk;	/* (?) Alt break seq. state */
+	term_char_t		*vd_drawn;	/* (?) Most recent char drawn. */
+	term_color_t		*vd_drawnfg;	/* (?) Most recent fg color drawn. */
+	term_color_t		*vd_drawnbg;	/* (?) Most recent bg color drawn. */
 };
 
 #define	VD_PASTEBUF(vd)	((vd)->vd_pastebuf.vpb_buf)
@@ -172,7 +177,7 @@ struct vt_device {
 #define	VT_LOCK_ASSERT(vd, what)	mtx_assert(&(vd)->vd_lock, what)
 
 void vt_resume(struct vt_device *vd);
-void vt_resume_flush_timer(struct vt_device *vd, int ms);
+void vt_resume_flush_timer(struct vt_window *vw, int ms);
 void vt_suspend(struct vt_device *vd);
 
 /*
@@ -188,6 +193,7 @@ void vt_suspend(struct vt_device *vd);
 
 struct vt_buf {
 	struct mtx		 vb_lock;	/* Buffer lock. */
+	struct terminal		*vb_terminal;
 	term_pos_t		 vb_scr_size;	/* (b) Screen dimensions. */
 	int			 vb_flags;	/* (b) Flags. */
 #define	VBF_CURSOR	0x1	/* Cursor visible. */
@@ -213,8 +219,10 @@ struct vt_buf {
 #define	VBF_DEFAULT_HISTORY_SIZE	500
 #endif
 
+void vtbuf_lock(struct vt_buf *);
+void vtbuf_unlock(struct vt_buf *);
 void vtbuf_copy(struct vt_buf *, const term_rect_t *, const term_pos_t *);
-void vtbuf_fill_locked(struct vt_buf *, const term_rect_t *, term_char_t);
+void vtbuf_fill(struct vt_buf *, const term_rect_t *, term_char_t);
 void vtbuf_init_early(struct vt_buf *);
 void vtbuf_init(struct vt_buf *, const term_pos_t *);
 void vtbuf_grow(struct vt_buf *, const term_pos_t *, unsigned int);
@@ -224,6 +232,7 @@ void vtbuf_scroll_mode(struct vt_buf *vb, int yes);
 void vtbuf_dirty(struct vt_buf *vb, const term_rect_t *area);
 void vtbuf_undirty(struct vt_buf *, term_rect_t *);
 void vtbuf_sethistory_size(struct vt_buf *, unsigned int);
+void vtbuf_clearhistory(struct vt_buf *);
 int vtbuf_iscursor(const struct vt_buf *vb, int row, int col);
 void vtbuf_cursor_visibility(struct vt_buf *, int);
 #ifndef SC_NO_CUTPASTE
@@ -318,6 +327,8 @@ typedef void vd_postswitch_t(struct vt_device *vd);
 typedef void vd_blank_t(struct vt_device *vd, term_color_t color);
 typedef void vd_bitblt_text_t(struct vt_device *vd, const struct vt_window *vw,
     const term_rect_t *area);
+typedef void vd_invalidate_text_t(struct vt_device *vd,
+    const term_rect_t *area);
 typedef void vd_bitblt_bmp_t(struct vt_device *vd, const struct vt_window *vw,
     const uint8_t *pattern, const uint8_t *mask,
     unsigned int width, unsigned int height,
@@ -343,6 +354,7 @@ struct vt_driver {
 	vd_drawrect_t	*vd_drawrect;
 	vd_setpixel_t	*vd_setpixel;
 	vd_bitblt_text_t *vd_bitblt_text;
+	vd_invalidate_text_t *vd_invalidate_text;
 	vd_bitblt_bmp_t	*vd_bitblt_bmp;
 
 	/* Framebuffer ioctls, if present. */
@@ -388,30 +400,6 @@ void vt_upgrade(struct vt_device *vd);
 
 /* name argument is not used yet. */
 #define VT_DRIVER_DECLARE(name, drv) DATA_SET(vt_drv_set, drv)
-
-/*
- * Fonts.
- *
- * Remapping tables are used to map Unicode points to glyphs.  They need
- * to be sorted, because vtfont_lookup() performs a binary search.  Each
- * font has two remapping tables, for normal and bold.  When a character
- * is not present in bold, it uses a normal glyph.  When no glyph is
- * available, it uses glyph 0, which is normally equal to U+FFFD.
- */
-
-struct vt_font_map {
-	uint32_t		 vfm_src;
-	uint16_t		 vfm_dst;
-	uint16_t		 vfm_len;
-};
-
-struct vt_font {
-	struct vt_font_map	*vf_map[VFNT_MAPS];
-	uint8_t			*vf_bytes;
-	unsigned int		 vf_height, vf_width;
-	unsigned int		 vf_map_count[VFNT_MAPS];
-	unsigned int		 vf_refcount;
-};
 
 #ifndef SC_NO_CUTPASTE
 struct vt_mouse_cursor {

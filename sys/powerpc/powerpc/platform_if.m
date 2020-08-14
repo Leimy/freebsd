@@ -32,6 +32,7 @@
 #include <sys/systm.h>
 #include <sys/smp.h>
 
+#include <machine/ofw_machdep.h>
 #include <machine/platform.h>
 #include <machine/platformvar.h>
 #include <machine/smp.h>
@@ -84,6 +85,15 @@ CODE {
 	{
 		return;
 	}
+	static void platform_null_smp_probe_threads(void)
+	{
+		return;
+	}
+	static int platform_null_node_numa_domain(platform_t plat,
+	    phandle_t node)
+	{
+		return (0);
+	}
 };
 
 /**
@@ -124,6 +134,22 @@ METHOD void mem_regions {
 	int		   *_memsz;
 	struct mem_region  *_availp;
 	int		   *_availsz;
+};
+
+
+/**
+ * @brief Return the system's physical memory map.
+ *
+ * It shall provide the total RAM with the corresponding domains.
+ *
+ * @param _memp		Array of physical memory chunks
+ * @param _memsz	Number of physical memory chunks
+ */
+
+METHOD void numa_mem_regions {
+	platform_t	    _plat;
+	struct numa_mem_region  *_memp;
+	int		   *_memsz;
 };
 
 /**
@@ -197,6 +223,13 @@ METHOD void smp_ap_init {
 } DEFAULT platform_null_smp_ap_init;
 
 /**
+ * @brief Probe mp_ncores and smp_threads_per_core for early MI code
+ */
+METHOD void smp_probe_threads {
+	platform_t	_plat;
+} DEFAULT platform_null_smp_probe_threads;
+
+/**
  * @brief Return SMP topology
  */
 METHOD cpu_group_t smp_topo {
@@ -228,3 +261,12 @@ METHOD void smp_timebase_sync {
 	int		_ap;
 };
 
+/**
+ * @brief Return the NUMA domain for the given device tree node.  Always returns
+ * a valid domain.
+ *
+ */
+METHOD int node_numa_domain {
+	platform_t	_plat;
+	phandle_t	_node;
+} DEFAULT platform_null_node_numa_domain;

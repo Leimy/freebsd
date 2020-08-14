@@ -68,7 +68,7 @@ static d_ioctl_t g_ctl_ioctl;
 
 static struct cdevsw g_ctl_cdevsw = {
 	.d_version =	D_VERSION,
-	.d_flags =	D_NEEDGIANT,
+	.d_flags =	0,
 	.d_ioctl =	g_ctl_ioctl,
 	.d_name =	"g_ctl",
 };
@@ -138,6 +138,12 @@ gctl_copyin(struct gctl_req *req)
 	struct gctl_req_arg *ap;
 	char *p;
 	u_int i;
+
+	if (req->narg > GEOM_CTL_ARG_MAX) {
+		gctl_error(req, "too many arguments");
+		req->arg = NULL;
+		return;
+	}
 
 	ap = geom_alloc_copyin(req, req->arg, req->narg * sizeof(*ap));
 	if (ap == NULL) {
@@ -359,18 +365,27 @@ gctl_get_asciiparam(struct gctl_req *req, const char *param)
 }
 
 void *
-gctl_get_paraml(struct gctl_req *req, const char *param, int len)
+gctl_get_paraml_opt(struct gctl_req *req, const char *param, int len)
 {
 	int i;
 	void *p;
 
 	p = gctl_get_param(req, param, &i);
-	if (p == NULL)
-		gctl_error(req, "Missing %s argument", param);
-	else if (i != len) {
+	if (i != len) {
 		p = NULL;
 		gctl_error(req, "Wrong length %s argument", param);
 	}
+	return (p);
+}
+
+void *
+gctl_get_paraml(struct gctl_req *req, const char *param, int len)
+{
+	void *p;
+
+	p = gctl_get_paraml_opt(req, param, len);
+	if (p == NULL)
+		gctl_error(req, "Missing %s argument", param);
 	return (p);
 }
 
@@ -381,33 +396,33 @@ gctl_get_class(struct gctl_req *req, char const *arg)
 	struct g_class *cp;
 
 	p = gctl_get_asciiparam(req, arg);
-	if (p == NULL)
+	if (p == NULL) {
+		gctl_error(req, "Missing %s argument", arg);
 		return (NULL);
+	}
 	LIST_FOREACH(cp, &g_classes, class) {
 		if (!strcmp(p, cp->name))
 			return (cp);
 	}
+	gctl_error(req, "Class not found: \"%s\"", p);
 	return (NULL);
 }
 
 struct g_geom *
-gctl_get_geom(struct gctl_req *req, struct g_class *mpr, char const *arg)
+gctl_get_geom(struct gctl_req *req, struct g_class *mp, char const *arg)
 {
 	char const *p;
-	struct g_class *mp;
 	struct g_geom *gp;
 
+	MPASS(mp != NULL);
 	p = gctl_get_asciiparam(req, arg);
-	if (p == NULL)
+	if (p == NULL) {
+		gctl_error(req, "Missing %s argument", arg);
 		return (NULL);
-	LIST_FOREACH(mp, &g_classes, class) {
-		if (mpr != NULL && mpr != mp)
-			continue;
-		LIST_FOREACH(gp, &mp->geom, geom) {
-			if (!strcmp(p, gp->name))
-				return (gp);
-		}
 	}
+	LIST_FOREACH(gp, &mp->geom, geom)
+		if (!strcmp(p, gp->name))
+			return (gp);
 	gctl_error(req, "Geom not found: \"%s\"", p);
 	return (NULL);
 }
@@ -419,8 +434,10 @@ gctl_get_provider(struct gctl_req *req, char const *arg)
 	struct g_provider *pp;
 
 	p = gctl_get_asciiparam(req, arg);
-	if (p == NULL)
+	if (p == NULL) {
+		gctl_error(req, "Missing '%s' argument", arg);
 		return (NULL);
+	}
 	pp = g_provider_by_name(p);
 	if (pp != NULL)
 		return (pp);
@@ -438,10 +455,8 @@ g_ctl_req(void *arg, int flag __unused)
 	g_topology_assert();
 	req = arg;
 	mp = gctl_get_class(req, "class");
-	if (mp == NULL) {
-		gctl_error(req, "Class not found");
+	if (mp == NULL)
 		return;
-	}
 	if (mp->ctlreq == NULL) {
 		gctl_error(req, "Class takes no requests");
 		return;
